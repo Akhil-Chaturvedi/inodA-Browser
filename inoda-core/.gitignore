@@ -1,0 +1,26 @@
+# Build artifacts
+/target
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+Thumbs.db
+.DS_Store
+
+# Tooling
+rustup-init.exe
+"inodA Browser For Embedded Devices.txt"
+
+# Debug / temporary output
+check_err.txt
+error.log
+*.log
+
+# Context snapshot files
+project_context.txt
+.contextignore

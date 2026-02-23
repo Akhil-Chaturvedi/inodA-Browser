@@ -4,8 +4,11 @@
 //! elements using specificity scoring (id, class, tag). Supports compound
 //! selectors, comma-separated selector lists, CSS inheritance for text
 //! properties, and shorthand expansion for `margin`, `padding`, and `background`.
+//! Inline `style` attributes are parsed natively via `cssparser`'s
+//! `DeclarationParser` trait.
 
 use cssparser::{Parser, ParserInput, Token};
+use cssparser::{DeclarationParser, AtRuleParser, QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, ParserState};
 
 /// A simple structure storing the selectors matching a rule block
 #[derive(Debug, Default, Clone)]
@@ -142,14 +145,12 @@ fn build_styled_node(
                 }
                 
                 if let Some((_, style_attr)) = data.attributes.iter().find(|(k, _)| k == "style") {
-                    let inline_sheet = parse_stylesheet(&format!("dummy {{ {} }}", style_attr));
-                    if let Some(inline_rule) = inline_sheet.rules.first() {
-                        for decl in &inline_rule.declarations {
-                            if let Some(pos) = specified_values.iter().position(|(k, _)| k == &decl.name) {
-                                specified_values[pos].1 = decl.value.clone();
-                            } else {
-                                specified_values.push((decl.name.clone(), decl.value.clone()));
-                            }
+                    let inline_decls = parse_inline_declarations(style_attr);
+                    for decl in &inline_decls {
+                        if let Some(pos) = specified_values.iter().position(|(k, _)| k == &decl.name) {
+                            specified_values[pos].1 = decl.value.clone();
+                        } else {
+                            specified_values.push((decl.name.clone(), decl.value.clone()));
                         }
                     }
                 }
@@ -282,4 +283,86 @@ fn parse_rule<'i, 't>(parser: &mut Parser<'i, 't>) -> Result<Option<StyleRule>, 
     } else {
          Ok(None)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Inline style parsing via cssparser's DeclarationParser trait.
+// This replaces the old `format!("dummy {{ ... }}")` workaround.
+// ---------------------------------------------------------------------------
+
+struct InlineStyleParser;
+
+impl<'i> DeclarationParser<'i> for InlineStyleParser {
+    type Declaration = Declaration;
+    type Error = ();
+
+    fn parse_value<'t>(
+        &mut self,
+        name: cssparser::CowRcStr<'i>,
+        input: &mut Parser<'i, 't>,
+        _start: &ParserState,
+    ) -> Result<Declaration, cssparser::ParseError<'i, ()>> {
+        let mut value = String::new();
+        while let Ok(token) = input.next() {
+            match token {
+                Token::Ident(n) => value.push_str(n),
+                Token::Number { value: v, .. } => value.push_str(&v.to_string()),
+                Token::Dimension { value: v, unit, .. } => {
+                    value.push_str(&v.to_string());
+                    value.push_str(unit.as_ref());
+                }
+                Token::Percentage { unit_value, .. } => {
+                    value.push_str(&(unit_value * 100.0).to_string());
+                    value.push('%');
+                }
+                Token::Hash(s) | Token::IDHash(s) => {
+                    value.push('#');
+                    value.push_str(s);
+                }
+                Token::QuotedString(s) => value.push_str(s),
+                Token::WhiteSpace(_) => value.push(' '),
+                Token::Comma => value.push(','),
+                Token::Delim(c) => value.push(*c),
+                _ => {}
+            }
+        }
+        Ok(Declaration {
+            name: name.to_string(),
+            value: value.trim().to_string(),
+        })
+    }
+}
+
+impl<'i> AtRuleParser<'i> for InlineStyleParser {
+    type Prelude = ();
+    type AtRule = Declaration;
+    type Error = ();
+}
+
+impl<'i> QualifiedRuleParser<'i> for InlineStyleParser {
+    type Prelude = ();
+    type QualifiedRule = Declaration;
+    type Error = ();
+}
+
+impl<'i> RuleBodyItemParser<'i, Declaration, ()> for InlineStyleParser {
+    fn parse_declarations(&self) -> bool { true }
+    fn parse_qualified(&self) -> bool { false }
+}
+
+/// Parse inline style declarations (e.g., from a `style="..."` attribute)
+/// using cssparser's native declaration parsing infrastructure.
+pub fn parse_inline_declarations(style_text: &str) -> Vec<Declaration> {
+    let mut input = ParserInput::new(style_text);
+    let mut parser = Parser::new(&mut input);
+    let mut style_parser = InlineStyleParser;
+
+    let iter = RuleBodyParser::new(&mut parser, &mut style_parser);
+    let mut declarations = Vec::new();
+    for result in iter {
+        if let Ok(decl) = result {
+            declarations.push(decl);
+        }
+    }
+    declarations
 }

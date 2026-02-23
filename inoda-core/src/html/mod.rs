@@ -1,78 +1,300 @@
 //! HTML parsing module.
 //!
-//! Converts an HTML string into the arena-based `Document` using html5ever.
+//! Implements `html5ever::TreeSink` directly on a `DocumentBuilder` wrapper,
+//! streaming parsed tokens into the `generational_arena`-backed `Document`
+//! in a single pass. No intermediate `RcDom` allocation.
+//!
 //! Extracts raw CSS text from `<style>` elements into `Document::style_texts`.
-//! Whitespace-only text nodes are discarded to reduce arena size.
+
+use std::borrow::Cow;
+use std::cell::RefCell;
 
 use html5ever::parse_document;
-use html5ever::tendril::TendrilSink;
-use markup5ever_rcdom::{Handle, NodeData, RcDom};
+use html5ever::tendril::{StrTendril, TendrilSink};
+use markup5ever::interface::tree_builder::{
+    ElementFlags, NodeOrText, QuirksMode, TreeSink, ElemName,
+};
+use markup5ever::interface::{Attribute, QualName};
+use markup5ever::{LocalName, Namespace};
 
 use crate::dom::{Document, ElementData, Node, NodeId};
 
+/// Wraps a `Document` in a `RefCell` so that `TreeSink` (which takes `&self`)
+/// can mutate the arena.
+struct DocumentBuilder {
+    doc: RefCell<Document>,
+}
+
+/// The ElemName implementation for our handles.
+#[derive(Debug)]
+struct InodaElemName {
+    ns: Namespace,
+    local: LocalName,
+}
+
+impl ElemName for InodaElemName {
+    fn ns(&self) -> &Namespace { &self.ns }
+    fn local_name(&self) -> &LocalName { &self.local }
+}
+
+impl TreeSink for DocumentBuilder {
+    type Handle = NodeId;
+    type Output = Document;
+    type ElemName<'a> = InodaElemName;
+
+    fn finish(self) -> Document {
+        self.doc.into_inner()
+    }
+
+    fn parse_error(&self, _msg: Cow<'static, str>) {
+        // Silently ignore parse errors for now.
+    }
+
+    fn get_document(&self) -> NodeId {
+        self.doc.borrow().root_id
+    }
+
+    fn elem_name<'a>(&'a self, target: &'a NodeId) -> InodaElemName {
+        let doc = self.doc.borrow();
+        if let Some(Node::Element(data)) = doc.nodes.get(*target) {
+            InodaElemName {
+                ns: Namespace::from("http://www.w3.org/1999/xhtml"),
+                local: LocalName::from(data.tag_name.as_str()),
+            }
+        } else {
+            InodaElemName {
+                ns: Namespace::from(""),
+                local: LocalName::from(""),
+            }
+        }
+    }
+
+    fn create_element(
+        &self,
+        name: QualName,
+        attrs: Vec<Attribute>,
+        _flags: ElementFlags,
+    ) -> NodeId {
+        let mut doc = self.doc.borrow_mut();
+        let attributes: Vec<(String, String)> = attrs
+            .into_iter()
+            .map(|a| (a.name.local.to_string(), a.value.to_string()))
+            .collect();
+        let tag_name = name.local.to_string();
+        let node = Node::Element(ElementData {
+            tag_name,
+            attributes,
+            children: Vec::new(),
+        });
+        doc.add_node(node)
+    }
+
+    fn create_comment(&self, _text: StrTendril) -> NodeId {
+        // Store comments as empty text nodes (ignored during layout/render).
+        let mut doc = self.doc.borrow_mut();
+        doc.add_node(Node::Text(String::new()))
+    }
+
+    fn create_pi(&self, _target: StrTendril, _data: StrTendril) -> NodeId {
+        let mut doc = self.doc.borrow_mut();
+        doc.add_node(Node::Text(String::new()))
+    }
+
+    fn append(&self, parent: &NodeId, child: NodeOrText<NodeId>) {
+        let mut doc = self.doc.borrow_mut();
+        match child {
+            NodeOrText::AppendNode(node_id) => {
+                doc.append_child(*parent, node_id);
+            }
+            NodeOrText::AppendText(text) => {
+                let text_str = text.to_string();
+                // Skip whitespace-only text nodes to reduce arena size
+                if text_str.trim().is_empty() {
+                    return;
+                }
+
+                // Check if we should merge with the last child if it is also text
+                let children_slice: Option<Vec<NodeId>> = match doc.nodes.get(*parent) {
+                    Some(Node::Element(d)) => Some(d.children.clone()),
+                    Some(Node::Root(c)) => Some(c.clone()),
+                    _ => None,
+                };
+                if let Some(children) = children_slice {
+                    if let Some(last_child_id) = children.last().copied() {
+                        if let Some(Node::Text(existing)) = doc.nodes.get_mut(last_child_id) {
+                            existing.push_str(&text_str);
+                            return;
+                        }
+                    }
+                }
+
+                let id = doc.add_node(Node::Text(text_str));
+                doc.append_child(*parent, id);
+            }
+        }
+    }
+
+    fn append_based_on_parent_node(
+        &self,
+        element: &NodeId,
+        _prev_element: &NodeId,
+        child: NodeOrText<NodeId>,
+    ) {
+        // Simplified: always append to the element.
+        self.append(element, child);
+    }
+
+    fn append_doctype_to_document(
+        &self,
+        _name: StrTendril,
+        _public_id: StrTendril,
+        _system_id: StrTendril,
+    ) {
+        // DOCTYPE is ignored in our minimal engine.
+    }
+
+    fn get_template_contents(&self, target: &NodeId) -> NodeId {
+        // We don't support <template>; just return the element itself.
+        *target
+    }
+
+    fn same_node(&self, x: &NodeId, y: &NodeId) -> bool {
+        *x == *y
+    }
+
+    fn set_quirks_mode(&self, _mode: QuirksMode) {
+        // Ignored.
+    }
+
+    fn append_before_sibling(&self, sibling: &NodeId, new_node: NodeOrText<NodeId>) {
+        // Walk all nodes to find the parent of sibling, then insert before it.
+        // This is O(N) but append_before_sibling is rare in practice.
+        let mut doc = self.doc.borrow_mut();
+        let sibling_id = *sibling;
+
+        let new_id = match new_node {
+            NodeOrText::AppendNode(id) => id,
+            NodeOrText::AppendText(text) => {
+                let text_str = text.to_string();
+                if text_str.trim().is_empty() { return; }
+                doc.add_node(Node::Text(text_str))
+            }
+        };
+
+        // Find parent that contains sibling_id in its children
+        let parent_ids: Vec<NodeId> = doc.nodes.iter().filter_map(|(id, node)| {
+            let children = match node {
+                Node::Element(d) => &d.children,
+                Node::Root(c) => c,
+                _ => return None,
+            };
+            if children.contains(&sibling_id) { Some(id) } else { None }
+        }).collect();
+
+        if let Some(parent_id) = parent_ids.first() {
+            let parent_id = *parent_id;
+            if let Some(parent) = doc.nodes.get_mut(parent_id) {
+                let children = match parent {
+                    Node::Element(d) => &mut d.children,
+                    Node::Root(c) => c,
+                    _ => return,
+                };
+                if let Some(pos) = children.iter().position(|id| *id == sibling_id) {
+                    children.insert(pos, new_id);
+                }
+            }
+        }
+    }
+
+    fn add_attrs_if_missing(&self, target: &NodeId, attrs: Vec<Attribute>) {
+        let mut doc = self.doc.borrow_mut();
+        if let Some(Node::Element(data)) = doc.nodes.get_mut(*target) {
+            for attr in attrs {
+                let name = attr.name.local.to_string();
+                if !data.attributes.iter().any(|(k, _)| k == &name) {
+                    data.attributes.push((name, attr.value.to_string()));
+                }
+            }
+        }
+    }
+
+    fn remove_from_parent(&self, target: &NodeId) {
+        let target_id = *target;
+        let mut doc = self.doc.borrow_mut();
+
+        // Find and remove from parent
+        let parent_ids: Vec<NodeId> = doc.nodes.iter().filter_map(|(id, node)| {
+            let children = match node {
+                Node::Element(d) => &d.children,
+                Node::Root(c) => c,
+                _ => return None,
+            };
+            if children.contains(&target_id) { Some(id) } else { None }
+        }).collect();
+
+        for parent_id in parent_ids {
+            doc.remove_child(parent_id, target_id);
+        }
+    }
+
+    fn reparent_children(&self, node: &NodeId, new_parent: &NodeId) {
+        let mut doc = self.doc.borrow_mut();
+        let children: Vec<NodeId> = match doc.nodes.get(*node) {
+            Some(Node::Element(d)) => d.children.clone(),
+            Some(Node::Root(c)) => c.clone(),
+            _ => return,
+        };
+
+        // Clear old parent's children
+        match doc.nodes.get_mut(*node) {
+            Some(Node::Element(d)) => d.children.clear(),
+            Some(Node::Root(c)) => c.clear(),
+            _ => return,
+        }
+
+        // Append to new parent
+        for child_id in children {
+            doc.append_child(*new_parent, child_id);
+        }
+    }
+}
+
+/// Extract CSS text from `<style>` elements after parsing.
+fn extract_style_texts(doc: &mut Document) {
+    let style_element_ids: Vec<NodeId> = doc.nodes.iter().filter_map(|(id, node)| {
+        if let Node::Element(data) = node {
+            if data.tag_name == "style" {
+                return Some(id);
+            }
+        }
+        None
+    }).collect();
+
+    for style_id in style_element_ids {
+        let mut style_text = String::new();
+        if let Some(children) = doc.children_of(style_id).map(|c| c.to_vec()) {
+            for child_id in children {
+                if let Some(Node::Text(txt)) = doc.nodes.get(child_id) {
+                    style_text.push_str(txt);
+                }
+            }
+        }
+        if !style_text.is_empty() {
+            doc.style_texts.push(style_text);
+        }
+    }
+}
+
 pub fn parse_html(html: &str) -> Document {
-    let dom = parse_document(RcDom::default(), Default::default())
+    let builder = DocumentBuilder {
+        doc: RefCell::new(Document::new()),
+    };
+
+    let mut doc = parse_document(builder, Default::default())
         .from_utf8()
         .read_from(&mut html.as_bytes())
         .unwrap();
 
-    let mut arena_doc = Document::new();
-    let root_id = arena_doc.root_id;
-    walk_rcdom(&dom.document, &mut arena_doc, root_id);
-
-    arena_doc
-}
-
-fn walk_rcdom(rc_node: &Handle, document: &mut Document, parent_id: NodeId) {
-    let mut current_id = parent_id;
-
-    match rc_node.data {
-        NodeData::Element { ref name, ref attrs, .. } => {
-            let mut attributes = Vec::with_capacity(attrs.borrow().len());
-            for attr in attrs.borrow().iter() {
-                attributes.push((
-                    attr.name.local.to_string(),
-                    attr.value.to_string(),
-                ));
-            }
-
-            let tag_name = name.local.to_string();
-
-            if tag_name == "style" {
-                let mut style_text = String::new();
-                for child in rc_node.children.borrow().iter() {
-                    if let NodeData::Text { ref contents } = child.data {
-                        style_text.push_str(&contents.borrow());
-                    }
-                }
-                document.style_texts.push(style_text);
-            }
-
-            let element_data = ElementData {
-                tag_name,
-                attributes,
-                children: Vec::new(),
-            };
-
-            let node = Node::Element(element_data);
-            let id = document.add_node(node);
-            document.append_child(parent_id, id);
-            current_id = id;
-        }
-        NodeData::Text { ref contents } => {
-            let text = contents.borrow().to_string();
-            // Ignore pure whitespace nodes for memory efficiency
-            if !text.trim().is_empty() {
-                let node = Node::Text(text);
-                let id = document.add_node(node);
-                document.append_child(parent_id, id);
-            }
-        }
-        _ => {}
-    }
-
-    // Recursively walk children
-    for child in rc_node.children.borrow().iter() {
-        walk_rcdom(child, document, current_id);
-    }
+    extract_style_texts(&mut doc);
+    doc
 }

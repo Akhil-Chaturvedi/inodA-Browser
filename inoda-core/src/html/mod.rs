@@ -1,8 +1,8 @@
 //! HTML parsing module.
 //!
 //! Implements `html5ever::TreeSink` directly on a `DocumentBuilder` wrapper,
-//! streaming parsed tokens into the `generational_arena`-backed `Document`
-//! in a single pass. No intermediate `RcDom` allocation.
+//! streaming atomized `LocalName` tokens into the `generational_arena`-backed
+//! `Document` in a single pass. No intermediate `RcDom` allocation.
 //!
 //! Extracts raw CSS text from `<style>` elements into `Document::style_texts`.
 
@@ -15,7 +15,7 @@ use markup5ever::interface::tree_builder::{
     ElementFlags, NodeOrText, QuirksMode, TreeSink, ElemName,
 };
 use markup5ever::interface::{Attribute, QualName};
-use markup5ever::{LocalName, Namespace};
+use markup5ever::{local_name, LocalName, Namespace};
 
 use crate::dom::{Document, ElementData, Node, NodeId};
 
@@ -59,7 +59,7 @@ impl TreeSink for DocumentBuilder {
         if let Some(Node::Element(data)) = doc.nodes.get(*target) {
             InodaElemName {
                 ns: Namespace::from("http://www.w3.org/1999/xhtml"),
-                local: LocalName::from(data.tag_name.as_str()),
+                local: data.tag_name.clone(),
             }
         } else {
             InodaElemName {
@@ -76,11 +76,11 @@ impl TreeSink for DocumentBuilder {
         _flags: ElementFlags,
     ) -> NodeId {
         let mut doc = self.doc.borrow_mut();
-        let attributes: Vec<(String, String)> = attrs
+        let attributes: Vec<(LocalName, String)> = attrs
             .into_iter()
-            .map(|a| (a.name.local.to_string(), a.value.to_string()))
+            .map(|a| (a.name.local, a.value.to_string()))
             .collect();
-        let tag_name = name.local.to_string();
+        let tag_name = name.local;
         let node = Node::Element(ElementData {
             tag_name,
             attributes,
@@ -167,8 +167,6 @@ impl TreeSink for DocumentBuilder {
     }
 
     fn append_before_sibling(&self, sibling: &NodeId, new_node: NodeOrText<NodeId>) {
-        // Walk all nodes to find the parent of sibling, then insert before it.
-        // This is O(N) but append_before_sibling is rare in practice.
         let mut doc = self.doc.borrow_mut();
         let sibling_id = *sibling;
 
@@ -181,36 +179,30 @@ impl TreeSink for DocumentBuilder {
             }
         };
 
-        // Find parent that contains sibling_id in its children
-        let parent_ids: Vec<NodeId> = doc.nodes.iter().filter_map(|(id, node)| {
-            let children = match node {
-                Node::Element(d) => &d.children,
-                Node::Root(c) => c,
-                _ => return None,
-            };
-            if children.contains(&sibling_id) { Some(id) } else { None }
-        }).collect();
+        // O(1) parent lookup via parent_map
+        let parent_id = match doc.parent_map.get(&sibling_id).copied() {
+            Some(pid) => pid,
+            None => return,
+        };
 
-        if let Some(parent_id) = parent_ids.first() {
-            let parent_id = *parent_id;
-            if let Some(parent) = doc.nodes.get_mut(parent_id) {
-                let children = match parent {
-                    Node::Element(d) => &mut d.children,
-                    Node::Root(c) => c,
-                    _ => return,
-                };
-                if let Some(pos) = children.iter().position(|id| *id == sibling_id) {
-                    children.insert(pos, new_id);
-                }
+        if let Some(parent) = doc.nodes.get_mut(parent_id) {
+            let children = match parent {
+                Node::Element(d) => &mut d.children,
+                Node::Root(c) => c,
+                _ => return,
+            };
+            if let Some(pos) = children.iter().position(|id| *id == sibling_id) {
+                children.insert(pos, new_id);
             }
         }
+        doc.parent_map.insert(new_id, parent_id);
     }
 
     fn add_attrs_if_missing(&self, target: &NodeId, attrs: Vec<Attribute>) {
         let mut doc = self.doc.borrow_mut();
         if let Some(Node::Element(data)) = doc.nodes.get_mut(*target) {
             for attr in attrs {
-                let name = attr.name.local.to_string();
+                let name = attr.name.local;
                 if !data.attributes.iter().any(|(k, _)| k == &name) {
                     data.attributes.push((name, attr.value.to_string()));
                 }
@@ -222,17 +214,8 @@ impl TreeSink for DocumentBuilder {
         let target_id = *target;
         let mut doc = self.doc.borrow_mut();
 
-        // Find and remove from parent
-        let parent_ids: Vec<NodeId> = doc.nodes.iter().filter_map(|(id, node)| {
-            let children = match node {
-                Node::Element(d) => &d.children,
-                Node::Root(c) => c,
-                _ => return None,
-            };
-            if children.contains(&target_id) { Some(id) } else { None }
-        }).collect();
-
-        for parent_id in parent_ids {
+        // O(1) parent lookup via parent_map
+        if let Some(parent_id) = doc.parent_map.get(&target_id).copied() {
             doc.remove_child(parent_id, target_id);
         }
     }
@@ -252,7 +235,10 @@ impl TreeSink for DocumentBuilder {
             _ => return,
         }
 
-        // Append to new parent
+        // Remove old parent_map entries and append to new parent
+        for child_id in &children {
+            doc.parent_map.remove(child_id);
+        }
         for child_id in children {
             doc.append_child(*new_parent, child_id);
         }
@@ -263,7 +249,7 @@ impl TreeSink for DocumentBuilder {
 fn extract_style_texts(doc: &mut Document) {
     let style_element_ids: Vec<NodeId> = doc.nodes.iter().filter_map(|(id, node)| {
         if let Node::Element(data) = node {
-            if data.tag_name == "style" {
+            if data.tag_name == local_name!("style") {
                 return Some(id);
             }
         }

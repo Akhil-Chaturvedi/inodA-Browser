@@ -13,12 +13,13 @@ Early development. The engine covers enough of the web platform to parse simple 
 | Crate              | Version | Purpose                                     |
 |--------------------|---------|---------------------------------------------|
 | `html5ever`        | 0.38    | Spec-compliant HTML tokenizer and parser    |
-| `markup5ever`      | 0.38    | Shared types for html5ever (QualName, etc.) |
+| `markup5ever`      | 0.38    | Shared types for html5ever (LocalName, etc.) |
 | `cssparser`        | 0.36    | Mozilla CSS tokenizer (same one Servo uses) |
 | `taffy`            | 0.9     | Flexbox and CSS Grid layout algorithm       |
 | `femtovg`          | 0.20    | 2D vector graphics (OpenGL-backed)          |
 | `rquickjs`         | 0.11    | QuickJS JavaScript engine bindings          |
 | `generational-arena`| 0.2    | Generational index arena for the DOM        |
+| `string_cache`     | 0.9     | Atom string interning (DefaultAtom, etc.)    |
 
 No other runtime dependencies.
 
@@ -37,9 +38,9 @@ src/
 
 ### dom
 
-`generational_arena::Arena<Node>` indexed by `generational_arena::Index` (`NodeId`). No `Rc`, no `RefCell`. Nodes are either `Element(ElementData)`, `Text(String)`, or `Root(Vec<NodeId>)`. Attributes are stored as `Vec<(String, String)>`. Computed styles live in a separate `StyledNode` tree that references arena indices.
+`generational_arena::Arena<Node>` indexed by `generational_arena::Index` (`NodeId`). No `Rc`, no `RefCell`. Nodes are either `Element(ElementData)`, `Text(String)`, or `Root(Vec<NodeId>)`. The `Document` maintains a `parent_map: HashMap<NodeId, NodeId>` for $O(1)$ parent lookups. `ElementData.tag_name` and attribute keys use `markup5ever::LocalName` for string interning.
 
-Generational indices allow O(1) insertion and deletion without invalidating other handles. Previous versions used a flat `Vec<Node>` indexed by `usize`, which leaked memory on deletion.
+Generational indices allow $O(1)$ insertion and deletion without invalidating other handles. Previous versions used a flat `Vec<Node>` indexed by `usize`, which leaked memory on deletion and could not safely track parents.
 
 ### html
 
@@ -47,16 +48,17 @@ Implements `html5ever::TreeSink` directly on a `DocumentBuilder` wrapper. HTML t
 
 ### css
 
-- Parses CSS text into `StyleSheet -> Vec<StyleRule> -> Vec<Declaration>`.
-- Supports tag, class, ID, and compound selectors (`div.card`, `h1, h2`).
-- Computes specificity as `(id_count, class_count, tag_count)` and applies rules in specificity order, preserving source order for ties.
+- Parses CSS text into a `StyleSheet` containing pre-parsed `ComplexSelector` ASTs.
+- Supports tag, class, ID, compound, and complex combinators (`>`, ` `).
+- Computes specificity as `(id_count, class_count, tag_count)` at parse time.
 - Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent to child.
 - Expands `margin`, `padding` shorthands (1/2/4-value syntax) and maps `background` to `background-color`.
-- Inline `style=""` attributes are parsed natively via `cssparser`'s `DeclarationParser` trait. Previous versions used a `format!("dummy {{ ... }}")` workaround to wrap inline styles in a fake rule block.
+- Uses `string_cache::DefaultAtom` for property names to minimize memory overhead during style resolution.
+- Inline `style=""` attributes are parsed natively via `cssparser`'s `DeclarationParser` trait.
 
 ### layout
 
-Walks the `StyledNode` tree and builds a parallel `TaffyTree<String>`. Text nodes become leaf nodes measured by a character-count heuristic (8px per character, 18px line height) -- this is a placeholder, not real text shaping.
+Walks the `StyledNode` tree and builds a parallel `TaffyTree<String>`. Text nodes become leaf nodes measured by a character-count heuristic (width = char_count * font_size / 2, height = font_size). Font size is synchronized from the computed styles.
 
 Supported CSS properties mapped to Taffy:
 - `display`: flex, grid, block, none (inline/inline-block are recognized but not yet laid out differently)
@@ -80,20 +82,24 @@ Font loading is not handled here. The host application must register fonts with 
 
 ### js
 
-Embeds QuickJS via `rquickjs`. The `JsEngine` takes ownership of a `Document` behind `Arc<Mutex<>>` so closures registered into JS can read and mutate the DOM.
+Embeds QuickJS via `rquickjs`. The `JsEngine` holds the `Document` behind `Rc<RefCell<Document>>`. QuickJS is single-threaded; all DOM access is serialized through the `RefCell`.
 
 Exposed globals:
 - `console.log(msg)`, `console.warn(msg)`, `console.error(msg)` -- print to stdout
-- `document.getElementById(id)` -- returns element tag name as a string, or null
-- `document.querySelector(selector)` -- basic tag/class/id matching, returns tag name as a string, or null
-- `document.createElement(tagName)` -- inserts an Element into the arena, returns its generational index as a `"idx,generation"` string handle
-- `document.appendChild(parentHandle, childHandle)` -- appends a child node using string handles
-- `document.addEventListener(event, callback)` -- logs the registration, does not fire events
-- `setTimeout(callback, delay)` -- registers the callback in a cooperative timer queue; the host must call `JsEngine::pump()` to fire expired timers
+- `document.getElementById(id)` -- returns a native `NodeHandle` object, or null
+- `document.querySelector(selector)` -- supports complex combinators, returns a `NodeHandle`, or null
+- `document.createElement(tagName)` -- inserts an Element into the arena, returns a `NodeHandle`
+- `document.appendChild(parent, child)` -- appends a child node using native object handles
+- `document.addEventListener(event, callback)` -- logs registration (scaffold)
+- `setTimeout(callback, delay)` -- registers a cooperative timer; host must call `pump()`
 
-None of these return actual DOM element objects. `getElementById` and `querySelector` return the tag name as a string. This is a scaffold, not a conformant DOM API.
+`NodeHandle` class methods:
+- `handle.tagName` -- returns the tag name string
+- `handle.getAttribute(key)` -- returns value or null
+- `handle.setAttribute(key, value)` -- updates or inserts attribute
+- `handle.removeChild(child)` -- detaches child from node
 
-Timer callbacks are stored as `rquickjs::Persistent<Function>` so they survive the QuickJS context lifetime boundary. The host application should call `pump()` on its event loop tick to dispatch expired timers.
+Timer callbacks are stored as `rquickjs::Persistent<Function>` to survive context boundaries. The host application should call `pump()` on its event loop tick to dispatch expired timers.
 
 ## Building
 
@@ -123,9 +129,8 @@ This list is not exhaustive. The engine is a working skeleton, not a production 
 - Layout properties `margin`, `padding`, `border-width`, `position`, `overflow`, `z-index`, `float` are not wired to Taffy.
 - Color parsing is limited to 5 named colors and 6-digit hex.
 - No `@media`, `@import`, `@keyframes`, CSS variables, or `calc()`.
-- Selector matching is homegrown string manipulation. It handles tag, class, ID, and compound selectors but breaks on complex combinators (`>`, `+`, `~`), attribute selectors, and pseudo-classes with arguments.
+- Selector matching supports combinators (`>`, ` `) but not `+`, `~`, attribute selectors, or pseudo-classes with arguments.
 - `addEventListener` logs the event name but never dispatches events.
-- `document.getElementById` and `document.querySelector` return tag name strings, not DOM node objects.
 - `femtovg` requires an OpenGL context. The render module cannot be used in headless/software-only environments without swapping the backend.
 - `setTimeout` fires callbacks only when the host calls `pump()`. There is no background thread or async runtime.
 - Viewport units (`vw`, `vh`) are resolved to absolute pixels at tree construction time. Resizing the window requires rebuilding the layout tree.

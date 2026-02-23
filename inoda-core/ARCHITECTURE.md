@@ -24,7 +24,7 @@ render::draw_layout_tree()  -- walks Layout + StyledNode in parallel,
                                (border), fill_text (text content)
 ```
 
-JavaScript execution happens outside this pipeline. The host application creates a `JsEngine`, passing in the `Document`. JS code can read and mutate the DOM via `Arc<Mutex<Document>>`, but there is currently no mechanism to trigger re-style or re-layout from JS mutations. Timer callbacks registered via `setTimeout` fire only when the host calls `JsEngine::pump()`.
+JavaScript execution happens outside this pipeline. The host application creates a `JsEngine`, passing in the `Document`. JS code can read and mutate the DOM via `Rc<RefCell<Document>>`. QuickJS is single-threaded; access is serialized. There is currently no mechanism to trigger re-style or re-layout from JS mutations. Timer callbacks registered via `setTimeout` fire only when the host calls `JsEngine::pump()`.
 
 ## Data structures
 
@@ -34,15 +34,16 @@ JavaScript execution happens outside this pipeline. The host application creates
 Document {
     nodes: Arena<Node>,             // generational_arena::Arena, indexed by Index
     root_id: generational_arena::Index,
-    style_texts: Vec<String>        // raw CSS from <style> tags
+    style_texts: Vec<String>,       // raw CSS from <style> tags
+    parent_map: HashMap<NodeId, NodeId> // O(1) parent lookups
 }
 
 Node = Element(ElementData) | Text(String) | Root(Vec<NodeId>)
 NodeId = generational_arena::Index  // type alias
 
 ElementData {
-    tag_name: String,
-    attributes: Vec<(String, String)>,
+    tag_name: markup5ever::LocalName,   // interned
+    attributes: Vec<(markup5ever::LocalName, String)>,
     children: Vec<NodeId>
 }
 ```
@@ -54,7 +55,7 @@ Generational indices provide O(1) insertion and deletion without index invalidat
 ```
 StyledNode {
     node_id: NodeId,                            // generational_arena::Index
-    specified_values: Vec<(String, String)>,     // computed CSS key-value pairs
+    specified_values: Vec<(string_cache::DefaultAtom, String)>, // computed CSS properties
     children: Vec<StyledNode>                   // mirrors DOM children
 }
 ```
@@ -65,11 +66,13 @@ This is a tree (not arena). Each node owns its children. It exists only during l
 
 ```
 StyleSheet { rules: Vec<StyleRule> }
-StyleRule  { selectors: String, declarations: Vec<Declaration> }
-Declaration { name: String, value: String }
+StyleRule  { selectors: Vec<ComplexSelector>, declarations: Vec<Declaration> }
+ComplexSelector { last: CompoundSelector, ancestors: Vec<(Combinator, CompoundSelector)>, specificity: (u32, u32, u32) }
+Combinator = Descendant | Child
+Declaration { name: string_cache::DefaultAtom, value: String }
 ```
 
-Selectors are stored as a raw string (e.g., `"div.card, .header"`). Comma-separated selectors are split at match time. There is no parsed selector AST. Inline `style` attributes are parsed using `cssparser`'s `DeclarationParser` trait directly, without wrapping in a fake rule block.
+Selectors are pre-parsed into a `ComplexSelector` AST at stylesheet creation time. Specificity is calculated once during parsing. Combinators (`>` for child, space for descendant) are supported by walking the `parent_map` during matching. Inline `style` attributes are parsed using `cssparser`'s `DeclarationParser` trait directly.
 
 ### PendingTimer (js/mod.rs)
 
@@ -93,7 +96,7 @@ Text nodes are inserted into Taffy as leaf nodes with a `String` context. During
 
 ## Thread safety
 
-`JsEngine` holds the `Document` inside `Arc<Mutex<Document>>`. Each JS-exposed function clones the `Arc` and locks the `Mutex` to access the DOM. This means JS execution is single-threaded (QuickJS itself is single-threaded) and DOM access is serialized. Timer state (`next_timer_id`, `pending_timers`) is also behind `Arc<Mutex<>>`.
+`JsEngine` holds the `Document` inside `Rc<RefCell<Document>>`. QuickJS and its wrapper `rquickjs` are designed for single-threaded usage. All JS-exposed functions (e.g., in `NodeHandle`) borrow the `RefCell` to access the DOM. This model provides high performance for embedded environments by avoiding mutex contention while ensuring memory safety through Rust's runtime borrow checking. Timer state is similarly managed via `Rc<RefCell>`.
 
 ## HTML parsing
 

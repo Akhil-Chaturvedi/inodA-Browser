@@ -26,7 +26,7 @@ pub fn draw_layout_tree<T: Renderer>(
         let abs_y = offset_y + layout.location.y;
 
         // Draw Background
-        if let Some((_, bg_color_str)) = styled_node.specified_values.iter().find(|(k, _)| k == "background-color") {
+        if let Some((_, bg_color_str)) = styled_node.specified_values.iter().find(|(k, _)| &**k == "background-color") {
             if let Some(color) = parse_color(bg_color_str) {
                 let mut path = Path::new();
                 path.rect(abs_x, abs_y, layout.size.width, layout.size.height);
@@ -37,7 +37,7 @@ pub fn draw_layout_tree<T: Renderer>(
         }
 
         // Draw Border
-        if let Some((_, border_color_str)) = styled_node.specified_values.iter().find(|(k, _)| k == "border-color") {
+        if let Some((_, border_color_str)) = styled_node.specified_values.iter().find(|(k, _)| &**k == "border-color") {
              if let Some(color) = parse_color(border_color_str) {
                 let mut path = Path::new();
                 path.rect(abs_x, abs_y, layout.size.width, layout.size.height);
@@ -60,14 +60,14 @@ pub fn draw_layout_tree<T: Renderer>(
 
         if is_text {
             let mut paint = Paint::color(Color::rgb(0, 0, 0)); // Default black
-            if let Some((_, color_str)) = styled_node.specified_values.iter().find(|(k, _)| k == "color") {
+            if let Some((_, color_str)) = styled_node.specified_values.iter().find(|(k, _)| &**k == "color") {
                  if let Some(color) = parse_color(color_str) {
                       paint = Paint::color(color);
                  }
             }
             
             paint.set_font_size(16.0);
-            if let Some((_, size_str)) = styled_node.specified_values.iter().find(|(k, _)| k == "font-size") {
+            if let Some((_, size_str)) = styled_node.specified_values.iter().find(|(k, _)| &**k == "font-size") {
                 if let Ok(size) = size_str.trim_end_matches("px").parse::<f32>() {
                      paint.set_font_size(size);
                 }

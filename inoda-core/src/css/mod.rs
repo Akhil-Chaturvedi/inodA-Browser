@@ -1,14 +1,53 @@
 //! CSS parsing, selector matching, and style computation.
 //!
-//! Parses CSS text into a `StyleSheet` of rules. Matches selectors against DOM
-//! elements using specificity scoring (id, class, tag). Supports compound
-//! selectors, comma-separated selector lists, CSS inheritance for text
-//! properties, and shorthand expansion for `margin`, `padding`, and `background`.
-//! Inline `style` attributes are parsed natively via `cssparser`'s
-//! `DeclarationParser` trait.
+//! Parses CSS text into a `StyleSheet` of rules with pre-parsed `ComplexSelector`
+//! ASTs. Matches selectors against DOM elements using pre-computed specificity
+//! and the O(1) parent map for complex combinators (`>`, ` `).
+//!
+//! Property names are interned as `string_cache::DefaultAtom` to minimize
+//! memory allocations during style tree construction. Supports compound
+//! selectors, comma-separated lists, CSS inheritance for text properties,
+//! and shorthand expansion for `margin`, `padding`, and `background`. Inline
+//! `style` attributes are parsed natively.
 
 use cssparser::{Parser, ParserInput, Token};
 use cssparser::{DeclarationParser, AtRuleParser, QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, ParserState};
+
+// ---------------------------------------------------------------------------
+// Selector AST -- parsed once, matched many times without string operations.
+// ---------------------------------------------------------------------------
+
+/// A single selector component.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SimpleSelector {
+    Tag(String),
+    Class(String),
+    Id(String),
+    PseudoClass(String),
+    Universal,
+}
+
+/// A compound selector is a sequence of simple selectors that all apply to
+/// the same element (e.g., `div.card#main` = [Tag("div"), Class("card"), Id("main")]).
+#[derive(Debug, Clone)]
+pub struct CompoundSelector {
+    pub parts: Vec<SimpleSelector>,
+    /// Pre-computed specificity: (id_count, class_count, tag_count).
+    pub specificity: (u32, u32, u32),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Combinator {
+    Descendant,
+    Child,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComplexSelector {
+    pub last: CompoundSelector,
+    pub ancestors: Vec<(Combinator, CompoundSelector)>,
+    pub specificity: (u32, u32, u32),
+}
 
 /// A simple structure storing the selectors matching a rule block
 #[derive(Debug, Default, Clone)]
@@ -18,15 +57,250 @@ pub struct StyleSheet {
 
 #[derive(Debug, Clone)]
 pub struct StyleRule {
-    pub selectors: String, // Keeping it simple for the initial bridge: we can just match exact selector strings first
+    /// Pre-parsed complex selector list (comma-separated selectors become separate entries).
+    pub selectors: Vec<ComplexSelector>,
     pub declarations: Vec<Declaration>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Declaration {
-    pub name: String,
+    pub name: string_cache::DefaultAtom,
     pub value: String,
 }
+
+// ---------------------------------------------------------------------------
+// Selector parsing
+// ---------------------------------------------------------------------------
+
+/// Parse a raw selector string like `"div.card, #main"` into a Vec of ComplexSelectors.
+fn parse_selector_list(raw: &str) -> Vec<ComplexSelector> {
+    raw.split(',')
+        .map(|s| parse_complex_selector(s.trim()))
+        .filter(|cs| !cs.last.parts.is_empty())
+        .collect()
+}
+
+fn parse_complex_selector(raw: &str) -> ComplexSelector {
+    let mut s = raw.trim().to_string();
+    while s.contains(" > ") { s = s.replace(" > ", ">"); }
+    while s.contains("> ") { s = s.replace("> ", ">"); }
+    while s.contains(" >") { s = s.replace(" >", ">"); }
+    
+    let tokens = s.split_whitespace();
+    let mut list = Vec::new();
+    
+    for token in tokens {
+        let pieces: Vec<&str> = token.split('>').collect();
+        for (i, piece) in pieces.iter().enumerate() {
+            if i == 0 {
+                list.push((Combinator::Descendant, piece.to_string()));
+            } else {
+                list.push((Combinator::Child, piece.to_string()));
+            }
+        }
+    }
+    
+    if list.is_empty() {
+         return ComplexSelector { last: parse_compound_selector(""), ancestors: vec![], specificity: (0,0,0) };
+    }
+    
+    list[0].0 = Combinator::Descendant; // Dummy
+    
+    let mut total_spec = (0, 0, 0);
+    let mut parsed_list = Vec::new();
+    
+    for (comb, txt) in list {
+         let cs = parse_compound_selector(&txt);
+         total_spec.0 += cs.specificity.0;
+         total_spec.1 += cs.specificity.1;
+         total_spec.2 += cs.specificity.2;
+         parsed_list.push((comb, cs));
+    }
+    
+    let (mut last_comb, last) = parsed_list.pop().unwrap();
+    let mut ancestors = Vec::new();
+    
+    while let Some((next_comb, prev_cs)) = parsed_list.pop() {
+         ancestors.push((last_comb, prev_cs));
+         last_comb = next_comb;
+    }
+    
+    ComplexSelector {
+        last,
+        ancestors,
+        specificity: total_spec,
+    }
+}
+
+/// Parse a single compound selector string like `"div.card#main"`.
+fn parse_compound_selector(s: &str) -> CompoundSelector {
+    let mut parts = Vec::new();
+    let mut spec = (0u32, 0u32, 0u32);
+    let mut remaining = s;
+
+    // Leading tag name (no prefix)
+    if !remaining.is_empty()
+        && !remaining.starts_with('.')
+        && !remaining.starts_with('#')
+        && !remaining.starts_with(':')
+    {
+        let end = remaining
+            .find(|c| c == '.' || c == '#' || c == ':')
+            .unwrap_or(remaining.len());
+        let tag = &remaining[..end];
+        if tag == "*" {
+            parts.push(SimpleSelector::Universal);
+        } else if !tag.is_empty() {
+            parts.push(SimpleSelector::Tag(tag.to_string()));
+            spec.2 += 1;
+        }
+        remaining = &remaining[end..];
+    }
+
+    // Remaining: classes, ids, pseudo-classes
+    while !remaining.is_empty() {
+        if remaining.starts_with('#') {
+            remaining = &remaining[1..];
+            let end = remaining
+                .find(|c| c == '.' || c == '#' || c == ':')
+                .unwrap_or(remaining.len());
+            parts.push(SimpleSelector::Id(remaining[..end].to_string()));
+            spec.0 += 1;
+            remaining = &remaining[end..];
+        } else if remaining.starts_with('.') {
+            remaining = &remaining[1..];
+            let end = remaining
+                .find(|c| c == '.' || c == '#' || c == ':')
+                .unwrap_or(remaining.len());
+            parts.push(SimpleSelector::Class(remaining[..end].to_string()));
+            spec.1 += 1;
+            remaining = &remaining[end..];
+        } else if remaining.starts_with(':') {
+            remaining = &remaining[1..];
+            let end = remaining
+                .find(|c| c == '.' || c == '#' || c == ':')
+                .unwrap_or(remaining.len());
+            parts.push(SimpleSelector::PseudoClass(remaining[..end].to_string()));
+            spec.1 += 1; // pseudo-classes have class-level specificity
+            remaining = &remaining[end..];
+        } else {
+            break;
+        }
+    }
+
+    CompoundSelector {
+        parts,
+        specificity: spec,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Selector matching -- enum comparison, no string parsing.
+// ---------------------------------------------------------------------------
+
+/// Match a pre-parsed compound selector against an element's tag name and attributes.
+fn match_compound_selector(
+    compound: &CompoundSelector,
+    tag_name: &markup5ever::LocalName,
+    attributes: &[(markup5ever::LocalName, String)],
+) -> bool {
+    if compound.parts.is_empty() {
+        return false;
+    }
+
+    let class_attr = attributes
+        .iter()
+        .find(|(k, _)| &**k == "class")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let classes: Vec<&str> = class_attr.split_whitespace().collect();
+    let id_attr = attributes
+        .iter()
+        .find(|(k, _)| &**k == "id")
+        .map(|(_, v)| v.as_str());
+
+    for part in &compound.parts {
+        match part {
+            SimpleSelector::Tag(t) => {
+                if t != &**tag_name {
+                    return false;
+                }
+            }
+            SimpleSelector::Class(c) => {
+                if !classes.contains(&c.as_str()) {
+                    return false;
+                }
+            }
+            SimpleSelector::Id(id) => {
+                if Some(id.as_str()) != id_attr {
+                    return false;
+                }
+            }
+            SimpleSelector::PseudoClass(_) => {
+                // Pseudo-classes are not matched against DOM state yet.
+                // Treat as always-matching for now.
+            }
+            SimpleSelector::Universal => {
+                // Always matches.
+            }
+        }
+    }
+    true
+}
+
+fn match_complex_selector(
+    complex: &ComplexSelector,
+    node_id: crate::dom::NodeId,
+    document: &crate::dom::Document,
+) -> bool {
+    // Fast path: does the right-most part match the current element?
+    if let Some(crate::dom::Node::Element(data)) = document.nodes.get(node_id) {
+        if !match_compound_selector(&complex.last, &data.tag_name, &data.attributes) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    // Now walk up the ancestors based on combinators
+    let mut current_id = node_id;
+    
+    for (comb, ancestor_compound) in &complex.ancestors {
+        let mut matched = false;
+        
+        loop {
+            // Move to parent
+            if let Some(parent_id) = document.parent_of(current_id) {
+                current_id = parent_id;
+                
+                if let Some(crate::dom::Node::Element(parent_data)) = document.nodes.get(current_id) {
+                    if match_compound_selector(ancestor_compound, &parent_data.tag_name, &parent_data.attributes) {
+                        matched = true;
+                        break;
+                    }
+                }
+                
+                // If it's a direct child combinator and we didn't match the immediate parent, we fail this sequence.
+                if *comb == Combinator::Child {
+                    break;
+                }
+            } else {
+                // Root of document
+                break;
+            }
+        }
+        
+        if !matched {
+            return false;
+        }
+    }
+
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Stylesheet parsing
+// ---------------------------------------------------------------------------
 
 pub fn parse_stylesheet(css: &str) -> StyleSheet {
     let mut input = ParserInput::new(css);
@@ -49,62 +323,15 @@ pub fn compute_styles(document: &crate::dom::Document, base_stylesheet: &StyleSh
 }
 
 #[inline]
-fn is_inheritable(property: &str) -> bool {
-    matches!(property, "color" | "font-family" | "font-size" | "font-weight" | "line-height" | "text-align" | "visibility")
-}
-
-fn match_simple_selector(selector: &str, tag_name: &str, attributes: &[(String, String)]) -> (bool, (u32, u32, u32)) {
-    let mut s = selector;
-    let mut spec = (0, 0, 0);
-    
-    // Tag
-    let mut parsed_tag = "";
-    if !s.starts_with('.') && !s.starts_with('#') && !s.starts_with(':') {
-        let end = s.find(|c| c == '.' || c == '#' || c == ':').unwrap_or(s.len());
-        parsed_tag = &s[..end];
-        s = &s[end..];
-        spec.2 += 1;
-    }
-    if !parsed_tag.is_empty() && parsed_tag != tag_name && parsed_tag != "*" {
-        return (false, (0,0,0));
-    }
-    
-    // Classes, IDs, Pseudo
-    let class_attr = attributes.iter().find(|(k, _)| k == "class").map(|(_, v)| v.as_str()).unwrap_or("");
-    let classes: Vec<&str> = class_attr.split_whitespace().collect();
-    let id_attr = attributes.iter().find(|(k, _)| k == "id").map(|(_, v)| v.as_str());
-
-    while !s.is_empty() {
-        if s.starts_with('#') {
-            s = &s[1..];
-            let end = s.find(|c| c == '.' || c == '#' || c == ':').unwrap_or(s.len());
-            if Some(&s[..end]) != id_attr { return (false, (0,0,0)); }
-            spec.0 += 1;
-            s = &s[end..];
-        } else if s.starts_with('.') {
-            s = &s[1..];
-            let end = s.find(|c| c == '.' || c == '#' || c == ':').unwrap_or(s.len());
-            if !classes.contains(&&s[..end]) { return (false, (0,0,0)); }
-            spec.1 += 1;
-            s = &s[end..];
-        } else if s.starts_with(':') {
-            s = &s[1..];
-            let end = s.find(|c| c == '.' || c == '#' || c == ':').unwrap_or(s.len());
-            spec.1 += 1; // Pseudo-classes have class specificity
-            s = &s[end..];
-        } else {
-            break;
-        }
-    }
-    if selector.is_empty() { return (false, (0,0,0)); }
-    (true, spec)
+fn is_inheritable(property: &string_cache::DefaultAtom) -> bool {
+    matches!(&**property, "color" | "font-family" | "font-size" | "font-weight" | "line-height" | "text-align" | "visibility")
 }
 
 fn build_styled_node(
     document: &crate::dom::Document,
     node_id: crate::dom::NodeId,
     stylesheet: &StyleSheet,
-    parent_styles: &[(String, String)]
+    parent_styles: &[(string_cache::DefaultAtom, String)]
 ) -> crate::dom::StyledNode {
     let mut specified_values = Vec::new();
     
@@ -119,14 +346,13 @@ fn build_styled_node(
     if let Some(node) = document.nodes.get(node_id) {
         match node {
             crate::dom::Node::Element(data) => {
-                let mut matched_rules = Vec::new();
+                let mut matched_rules: Vec<((u32, u32, u32), &StyleRule)> = Vec::new();
                 for rule in &stylesheet.rules {
-                    for selector_part in rule.selectors.split(',') {
-                        let selector_part = selector_part.trim();
-                        let (matches, spec) = match_simple_selector(selector_part, &data.tag_name, &data.attributes);
-                        if matches {
-                            matched_rules.push((spec, rule));
-                            break; // matched this rule
+                    // Check each complex selector in the pre-parsed list
+                    for complex in &rule.selectors {
+                        if match_complex_selector(complex, node_id, document) {
+                            matched_rules.push((complex.specificity, rule));
+                            break; // matched this rule via at least one selector
                         }
                     }
                 }
@@ -144,7 +370,7 @@ fn build_styled_node(
                     }
                 }
                 
-                if let Some((_, style_attr)) = data.attributes.iter().find(|(k, _)| k == "style") {
+                if let Some((_, style_attr)) = data.attributes.iter().find(|(k, _)| &**k == "style") {
                     let inline_decls = parse_inline_declarations(style_attr);
                     for decl in &inline_decls {
                         if let Some(pos) = specified_values.iter().position(|(k, _)| k == &decl.name) {
@@ -176,44 +402,47 @@ fn build_styled_node(
 
 fn parse_rules_list<'i, 't>(parser: &mut Parser<'i, 't>, stylesheet: &mut StyleSheet) {
     while !parser.is_exhausted() {
-        // We advance through the rules list, skipping whitespace and comments natively via cssparser
         match parse_rule(parser) {
             Ok(Some(rule)) => stylesheet.rules.push(rule),
-            Ok(None) => {
-                // Not a style rule, skip it
-            }
+            Ok(None) => {}
             Err(_) => {
-                // Recover from error by skipping to the next top-level rule
                 let _ = parser.parse_until_before(cssparser::Delimiter::CurlyBracketBlock, |p| {
                     while p.next().is_ok() {}
                     Ok::<(), cssparser::ParseError<()>>(())
                 });
-                let _ = parser.next(); // Consume the curly bracket block itself preventing infinite loop
+                let _ = parser.next();
             }
         }
     }
 }
 
 fn parse_rule<'i, 't>(parser: &mut Parser<'i, 't>) -> Result<Option<StyleRule>, cssparser::ParseError<'i, ()>> {
-    let mut selectors = String::new();
-    while let Ok(token) = parser.next() {
+    // 1. Collect raw selector text
+    let mut raw_selectors = String::new();
+    while let Ok(token) = parser.next_including_whitespace() {
         if matches!(token, Token::CurlyBracketBlock) { break; }
         match token {
-            Token::Ident(n) => selectors.push_str(n),
-            Token::Hash(n) | Token::IDHash(n) => { selectors.push('#'); selectors.push_str(n); },
-            Token::Delim(c) => selectors.push(*c),
-            Token::WhiteSpace(_) => selectors.push(' '),
-            Token::Comma => selectors.push(','),
-            Token::Colon => selectors.push(':'),
+            Token::Ident(n) => raw_selectors.push_str(n.as_ref()),
+            Token::Hash(n) | Token::IDHash(n) => { raw_selectors.push('#'); raw_selectors.push_str(n.as_ref()); },
+            Token::Delim(c) => raw_selectors.push(*c),
+            Token::WhiteSpace(_) => raw_selectors.push(' '),
+            Token::Comma => raw_selectors.push(','),
+            Token::Colon => raw_selectors.push(':'),
             _ => {}
         }
     }
 
+    if raw_selectors.is_empty() {
+        return Ok(None);
+    }
+
+    // 2. Parse the raw selector string into an AST
+    let selectors = parse_selector_list(&raw_selectors);
     if selectors.is_empty() {
         return Ok(None);
     }
 
-    // 2. Parse Declarations (inside `{...}`)
+    // 3. Parse declarations (inside `{...}`)
     let mut declarations = Vec::new();
     let result = parser.parse_nested_block(|p| {
         while !p.is_exhausted() {
@@ -221,7 +450,6 @@ fn parse_rule<'i, 't>(parser: &mut Parser<'i, 't>) -> Result<Option<StyleRule>, 
                 let name = ident.as_ref().to_owned();
                 let _ = p.expect_colon();
                 
-                // Parse value until semicolon
                 let mut value = String::new();
                 while let Ok(token) = p.next() {
                      if matches!(token, Token::Semicolon) { break; }
@@ -239,40 +467,39 @@ fn parse_rule<'i, 't>(parser: &mut Parser<'i, 't>) -> Result<Option<StyleRule>, 
 
                 // Expand shorthand properties
                 let value_trimmed = value.trim();
-                if name == "margin" || name == "padding" {
+                let name_str = name; // string_cache interning input string
+                if name_str == "margin" || name_str == "padding" {
                     let parts: Vec<&str> = value_trimmed.split_whitespace().collect();
                     match parts.len() {
                         1 => {
-                            declarations.push(Declaration { name: format!("{}-top", name), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: format!("{}-right", name), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: format!("{}-bottom", name), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: format!("{}-left", name), value: parts[0].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-top", name_str)), value: parts[0].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-right", name_str)), value: parts[0].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-bottom", name_str)), value: parts[0].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-left", name_str)), value: parts[0].to_string() });
                         }
                         2 => {
-                            declarations.push(Declaration { name: format!("{}-top", name), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: format!("{}-bottom", name), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: format!("{}-left", name), value: parts[1].to_string() });
-                            declarations.push(Declaration { name: format!("{}-right", name), value: parts[1].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-top", name_str)), value: parts[0].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-bottom", name_str)), value: parts[0].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-left", name_str)), value: parts[1].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-right", name_str)), value: parts[1].to_string() });
                         }
                         4 => {
-                            declarations.push(Declaration { name: format!("{}-top", name), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: format!("{}-right", name), value: parts[1].to_string() });
-                            declarations.push(Declaration { name: format!("{}-bottom", name), value: parts[2].to_string() });
-                            declarations.push(Declaration { name: format!("{}-left", name), value: parts[3].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-top", name_str)), value: parts[0].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-right", name_str)), value: parts[1].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-bottom", name_str)), value: parts[2].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-left", name_str)), value: parts[3].to_string() });
                         }
                         _ => {
-                            // Support 3-part or other invalid shorthands as fallback
-                            declarations.push(Declaration { name, value });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(name_str), value });
                         }
                     }
-                } else if name == "background" {
-                    // Simple shorthand mapping for background color (ex: `background: red`)
-                    declarations.push(Declaration { name: "background-color".to_string(), value });
+                } else if name_str == "background" {
+                    declarations.push(Declaration { name: string_cache::DefaultAtom::from("background-color"), value });
                 } else {
-                    declarations.push(Declaration { name, value });
+                    declarations.push(Declaration { name: string_cache::DefaultAtom::from(name_str), value });
                 }
             } else {
-                let _ = p.next(); // skip unknown
+                let _ = p.next();
             }
         }
         Ok::<(), cssparser::ParseError<()>>(())
@@ -287,7 +514,6 @@ fn parse_rule<'i, 't>(parser: &mut Parser<'i, 't>) -> Result<Option<StyleRule>, 
 
 // ---------------------------------------------------------------------------
 // Inline style parsing via cssparser's DeclarationParser trait.
-// This replaces the old `format!("dummy {{ ... }}")` workaround.
 // ---------------------------------------------------------------------------
 
 struct InlineStyleParser;
@@ -327,7 +553,7 @@ impl<'i> DeclarationParser<'i> for InlineStyleParser {
             }
         }
         Ok(Declaration {
-            name: name.to_string(),
+            name: string_cache::DefaultAtom::from(name.as_ref()),
             value: value.trim().to_string(),
         })
     }

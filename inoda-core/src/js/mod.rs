@@ -2,19 +2,93 @@
 //!
 //! Embeds QuickJS via `rquickjs`. Exposes a subset of the Web API:
 //! - `console.log`, `console.warn`, `console.error` (print to stdout)
-//! - `document.getElementById`, `document.querySelector` (return tag name strings, not DOM objects)
+//! - `document.getElementById`, `document.querySelector` (return native `NodeHandle` objects)
 //! - `document.createElement`, `document.appendChild` (mutate the arena DOM)
 //! - `document.addEventListener` (logs registration, does not dispatch events)
 //! - `setTimeout` (cooperative timer queue via `pump()`)
 //!
-//! The Document is held behind `Arc<Mutex<>>` for shared access from JS closures.
-//! Timer callbacks are stored in a JS-side registry and dispatched by the host
-//! via `JsEngine::pump()`.
+//! DOM handles are exposed to JavaScript as native `NodeHandle` class instances
+//! wrapping a `generational_arena::Index`. Methods include:
+//! - `handle.tagName`
+//! - `handle.getAttribute(key)`
+//! - `handle.setAttribute(key, value)`
+//! - `handle.removeChild(child)`
+//!
+//! The Document is held behind `Rc<RefCell<Document>>` for single-threaded access.
+//! All JS operations are synchronous and serialized through this lock.
 
 use rquickjs::{Context, Runtime, Persistent};
-use std::sync::{Arc, Mutex};
+use rquickjs::class::{Trace, Tracer, JsClass, Readable};
+use rquickjs::function::This;
+use std::rc::Rc;
+use std::cell::{RefCell, Cell};
 use std::time::Instant;
 use crate::dom::Document;
+
+// ---------------------------------------------------------------------------
+// NodeHandle: an opaque JS class wrapping a generational_arena::Index.
+// ---------------------------------------------------------------------------
+
+/// A DOM node handle exposed to JavaScript as a native class.
+/// Stores the raw parts of a `generational_arena::Index` to avoid
+/// string serialization on every DOM operation.
+pub struct NodeHandle {
+    arena_index: usize,
+    arena_generation: u64,
+}
+
+impl NodeHandle {
+    pub fn from_node_id(id: crate::dom::NodeId) -> Self {
+        let (idx, generation) = id.into_raw_parts();
+        NodeHandle { arena_index: idx, arena_generation: generation }
+    }
+
+    pub fn to_node_id(&self) -> crate::dom::NodeId {
+        generational_arena::Index::from_raw_parts(self.arena_index, self.arena_generation)
+    }
+}
+
+impl<'js> Trace<'js> for NodeHandle {
+    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {
+        // No JS values to trace; NodeHandle only contains plain integers.
+    }
+}
+
+unsafe impl<'js> rquickjs::JsLifetime<'js> for NodeHandle {
+    type Changed<'to> = NodeHandle;
+}
+
+impl<'js> JsClass<'js> for NodeHandle {
+    const NAME: &'static str = "NodeHandle";
+    type Mutable = Readable;
+
+    fn prototype(ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<Option<rquickjs::Object<'js>>> {
+        let proto = rquickjs::Object::new(ctx.clone())?;
+        Ok(Some(proto))
+    }
+
+    fn constructor(_ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<Option<rquickjs::function::Constructor<'js>>> {
+        // NodeHandle cannot be constructed from JS -- only from Rust.
+        Ok(None)
+    }
+}
+
+pub struct NodeHandleWithTag {
+    handle: NodeHandle,
+    tag_name: String,
+}
+
+impl<'js> rquickjs::IntoJs<'js> for NodeHandleWithTag {
+    fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
+        let cls = rquickjs::Class::instance(ctx.clone(), self.handle)?;
+        cls.set("tagName", self.tag_name)?;
+        cls.into_js(ctx)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Timer queue
+// ---------------------------------------------------------------------------
 
 /// A pending timer entry storing a persistent JS callback.
 struct PendingTimer {
@@ -29,11 +103,11 @@ pub struct JsEngine {
     #[allow(dead_code)]
     runtime: Runtime,
     context: Context,
-    pub document: Arc<Mutex<Document>>,
+    pub document: Rc<RefCell<Document>>,
     /// Monotonically increasing timer ID counter.
-    next_timer_id: Arc<Mutex<u32>>,
+    next_timer_id: Rc<Cell<u32>>,
     /// List of pending timers waiting to fire.
-    pending_timers: Arc<Mutex<Vec<PendingTimer>>>,
+    pending_timers: Rc<RefCell<Vec<PendingTimer>>>,
 }
 
 impl JsEngine {
@@ -44,9 +118,9 @@ impl JsEngine {
         let engine = JsEngine {
             runtime,
             context,
-            document: Arc::new(Mutex::new(document)),
-            next_timer_id: Arc::new(Mutex::new(1)),
-            pending_timers: Arc::new(Mutex::new(Vec::new())),
+            document: Rc::new(RefCell::new(document)),
+            next_timer_id: Rc::new(Cell::new(1)),
+            pending_timers: Rc::new(RefCell::new(Vec::new())),
         };
 
         engine.init_web_api();
@@ -61,6 +135,54 @@ impl JsEngine {
         
         self.context.with(|ctx| {
             let globals = ctx.globals();
+
+            // Register the NodeHandle class prototype
+            let proto = rquickjs::Class::<NodeHandle>::prototype(&ctx).unwrap().unwrap();
+
+            let get_attr_func = rquickjs::Function::new(ctx.clone(), {
+                let doc_ref = doc_ref.clone();
+                move |This(this): This<rquickjs::Class<'_, NodeHandle>>, attr: String| -> Option<String> {
+                    let doc = doc_ref.borrow();
+                    let node_id = this.borrow().to_node_id();
+                    if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
+                        for (k, v) in &data.attributes {
+                            if &**k == attr {
+                                return Some(v.clone());
+                            }
+                        }
+                    }
+                    None
+                }
+            }).unwrap();
+            proto.set("getAttribute", get_attr_func).unwrap();
+
+            let set_attr_func = rquickjs::Function::new(ctx.clone(), {
+                let doc_ref = doc_ref.clone();
+                move |This(this): This<rquickjs::Class<'_, NodeHandle>>, attr: String, value: String| {
+                    let mut doc = doc_ref.borrow_mut();
+                    let node_id = this.borrow().to_node_id();
+                    if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
+                        let local_attr = markup5ever::LocalName::from(attr.as_str());
+                        if let Some(pos) = data.attributes.iter().position(|(k, _)| *k == local_attr) {
+                            data.attributes[pos].1 = value;
+                        } else {
+                            data.attributes.push((local_attr, value));
+                        }
+                    }
+                }
+            }).unwrap();
+            proto.set("setAttribute", set_attr_func).unwrap();
+
+            let remove_child_func = rquickjs::Function::new(ctx.clone(), {
+                let doc_ref = doc_ref.clone();
+                move |This(this): This<rquickjs::Class<'_, NodeHandle>>, child: rquickjs::Class<'_, NodeHandle>| {
+                    let mut doc = doc_ref.borrow_mut();
+                    let parent_id = this.borrow().to_node_id();
+                    let child_id = child.borrow().to_node_id();
+                    doc.remove_child(parent_id, child_id);
+                }
+            }).unwrap();
+            proto.set("removeChild", remove_child_func).unwrap();
 
             // --- console object ---
             let console_obj = rquickjs::Object::new(ctx.clone()).unwrap();
@@ -85,14 +207,18 @@ impl JsEngine {
             // --- document object ---
             let document_obj = rquickjs::Object::new(ctx.clone()).unwrap();
 
+            // getElementById: returns a NodeHandle JS object or null
             let get_by_id_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
-                move |id: String| -> Option<String> {
-                    let doc = doc_ref.lock().unwrap();
-                    for (_, node) in doc.nodes.iter() {
+                move |id: String| -> Option<NodeHandleWithTag> {
+                    let doc = doc_ref.borrow();
+                    for (node_id, node) in doc.nodes.iter() {
                         if let crate::dom::Node::Element(data) = node {
-                            if data.attributes.iter().find(|(k, _)| k == "id").map(|(_, v)| v) == Some(&id) {
-                                return Some(data.tag_name.clone());
+                            if data.attributes.iter().any(|(k, v)| &**k == "id" && v == &id) {
+                                return Some(NodeHandleWithTag {
+                                    handle: NodeHandle::from_node_id(node_id),
+                                    tag_name: data.tag_name.to_string(),
+                                });
                             }
                         }
                     }
@@ -102,19 +228,23 @@ impl JsEngine {
 
             document_obj.set("getElementById", get_by_id_func).unwrap();
 
+            // querySelector: returns a NodeHandle JS object or null
             let query_selector_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
-                move |selector: String| -> Option<String> {
-                    let doc = doc_ref.lock().unwrap();
-                    for (_, node) in doc.nodes.iter() {
+                move |selector: String| -> Option<NodeHandleWithTag> {
+                    let doc = doc_ref.borrow();
+                    for (node_id, node) in doc.nodes.iter() {
                         if let crate::dom::Node::Element(data) = node {
                             let is_match = 
-                               (selector.starts_with('.') && data.attributes.iter().find(|(k, _)| k == "class").map(|(_, v)| format!(".{}", v)) == Some(selector.clone())) ||
-                               (selector.starts_with('#') && data.attributes.iter().find(|(k, _)| k == "id").map(|(_, v)| format!("#{}", v)) == Some(selector.clone())) ||
-                               (data.tag_name == selector);
+                               (selector.starts_with('.') && data.attributes.iter().any(|(k, v)| &**k == "class" && format!(".{}", v) == selector)) ||
+                               (selector.starts_with('#') && data.attributes.iter().any(|(k, v)| &**k == "id" && format!("#{}", v) == selector)) ||
+                               (&*data.tag_name == selector);
                                
                             if is_match {
-                                return Some(data.tag_name.clone());
+                                return Some(NodeHandleWithTag {
+                                    handle: NodeHandle::from_node_id(node_id),
+                                    tag_name: data.tag_name.to_string(),
+                                });
                             }
                         }
                     }
@@ -130,39 +260,36 @@ impl JsEngine {
 
             document_obj.set("addEventListener", add_event_listener_func).unwrap();
 
+            // createElement: returns a NodeHandle JS object
             let create_element_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
-                move |tag_name: String| -> String {
-                    let mut doc = doc_ref.lock().unwrap();
+                move |tag_name: String| -> NodeHandleWithTag {
+                    let mut doc = doc_ref.borrow_mut();
+                    let tag_name_clone = tag_name.clone();
                     let node = crate::dom::Node::Element(crate::dom::ElementData {
-                        tag_name,
+                        tag_name: markup5ever::LocalName::from(tag_name.as_str()),
                         attributes: Vec::new(),
                         children: Vec::new(),
                     });
                     let index = doc.add_node(node);
-                    let (idx, generation) = index.into_raw_parts();
-                    format!("{},{}", idx, generation)
+                    drop(doc);
+
+                    NodeHandleWithTag {
+                        handle: NodeHandle::from_node_id(index),
+                        tag_name: tag_name_clone,
+                    }
                 }
             }).unwrap();
             document_obj.set("createElement", create_element_func).unwrap();
 
+            // appendChild: accepts two NodeHandle objects (no string parsing)
             let append_child_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
-                move |parent_handle: String, child_handle: String| {
-                    let parse_handle = |s: &str| -> Option<generational_arena::Index> {
-                        let parts: Vec<&str> = s.split(',').collect();
-                        if parts.len() == 2 {
-                            let idx = parts[0].parse::<usize>().ok()?;
-                            let generation = parts[1].parse::<u64>().ok()?;
-                            Some(generational_arena::Index::from_raw_parts(idx, generation))
-                        } else {
-                            None
-                        }
-                    };
-                    if let (Some(parent_id), Some(child_id)) = (parse_handle(&parent_handle), parse_handle(&child_handle)) {
-                        let mut doc = doc_ref.lock().unwrap();
-                        doc.append_child(parent_id, child_id);
-                    }
+                move |parent_cls: rquickjs::Class<'_, NodeHandle>, child_cls: rquickjs::Class<'_, NodeHandle>| {
+                    let parent_id = parent_cls.borrow().to_node_id();
+                    let child_id = child_cls.borrow().to_node_id();
+                    let mut doc = doc_ref.borrow_mut();
+                    doc.append_child(parent_id, child_id);
                 }
             }).unwrap();
             document_obj.set("appendChild", append_child_func).unwrap();
@@ -174,12 +301,11 @@ impl JsEngine {
                 let timer_id_counter = timer_id_counter.clone();
                 let pending_timers = pending_timers.clone();
                 move |cb: Persistent<rquickjs::Function<'static>>, delay: i32| -> i32 {
-                    let mut id_counter = timer_id_counter.lock().unwrap();
-                    let timer_id = *id_counter;
-                    *id_counter += 1;
+                    let timer_id = timer_id_counter.get();
+                    timer_id_counter.set(timer_id + 1);
 
                     let fire_at = Instant::now() + std::time::Duration::from_millis(delay.max(0) as u64);
-                    let mut timers = pending_timers.lock().unwrap();
+                    let mut timers = pending_timers.borrow_mut();
                     timers.push(PendingTimer { id: timer_id, fire_at, callback: cb });
 
                     timer_id as i32
@@ -197,7 +323,7 @@ impl JsEngine {
         let now = Instant::now();
         let expired: Vec<Persistent<rquickjs::Function<'static>>>;
         {
-            let mut timers = self.pending_timers.lock().unwrap();
+            let mut timers = self.pending_timers.borrow_mut();
             let (ready, remaining): (Vec<_>, Vec<_>) = timers.drain(..).partition(|t| t.fire_at <= now);
             expired = ready.into_iter().map(|t| t.callback).collect();
             *timers = remaining;
@@ -216,7 +342,7 @@ impl JsEngine {
 
     /// Returns true if there are pending timers that haven't fired yet.
     pub fn has_pending_timers(&self) -> bool {
-        let timers = self.pending_timers.lock().unwrap();
+        let timers = self.pending_timers.borrow();
         !timers.is_empty()
     }
 

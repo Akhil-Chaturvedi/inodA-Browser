@@ -258,6 +258,7 @@ dependencies = [
  "html5ever",
  "markup5ever",
  "rquickjs",
+ "string_cache",
  "taffy",
 ]
 
@@ -623,6 +624,7 @@ dependencies = [
  "parking_lot",
  "phf_shared",
  "precomputed-hash",
+ "serde",
 ]
 
 [[package]]

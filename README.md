@@ -1,6 +1,6 @@
 # inodA Browser
 
-A lightweight web browser built for embedded and resource-constrained devices. The project aims to render basic web content (HTML, CSS, JavaScript) with minimal memory and CPU overhead, targeting hardware that cannot run Chromium or Firefox.
+An experimental web browser engine for resource-constrained embedded systems. The engine is designed to parse and render basic HTML, CSS, and JavaScript with minimal memory and CPU overhead, serving as a lightweight alternative to Chromium or Firefox for specialized hardware.
 
 ## Repository structure
 
@@ -26,9 +26,9 @@ See [inoda-core/ARCHITECTURE.md](inoda-core/ARCHITECTURE.md) for data flow, data
 
 ## Current state
 
-The engine can parse simple HTML pages with embedded CSS, compute Flexbox layout, and render backgrounds/borders/text to a canvas. A basic JavaScript bridge provides `console.log`, `document.getElementById`, `document.querySelector`, `document.createElement`, `document.appendChild`, and a cooperative `setTimeout` with a host-driven timer queue.
+The engine parses HTML pages with embedded CSS, builds an arena-based DOM with O(1) parent traversing, and implements CSS selectors (tag, class, ID, compound, and complex combinators). It resolves Flexbox/Grid layout and renders backgrounds, borders, and text to a canvas. A JavaScript bridge provides a native `NodeHandle` class for DOM manipulation (`getElementById`, `querySelector`, `createElement`, `setAttribute`, `getAttribute`, `removeChild`) and a cooperative `setTimeout`.
 
-This is early-stage. There is no networking, no resource loading, no image support, and no inline text flow. The host application (not included in this repository yet) must provide a window, OpenGL context, event loop, and font registration.
+The engine uses string interning (via `string_cache`) for tag names and CSS properties to minimize memory overhead. There is no networking, resource loading, image support, or inline text flow. The host application must provide a window, OpenGL context, event loop, and font registration.
 
 ## Building
 

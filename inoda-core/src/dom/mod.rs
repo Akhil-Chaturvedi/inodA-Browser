@@ -3,8 +3,15 @@
 //! Uses `generational_arena` for O(1) insertion and deletion without
 //! index invalidation. Nodes can be safely removed and their indices
 //! will not be reused until the generation wraps.
+//!
+//! Tag names and attribute keys are interned using `markup5ever::LocalName`
+//! to minimize memory usage and enable O(1) comparison.
+//!
+//! Parent pointers are stored in a separate `HashMap<NodeId, NodeId>`
+//! to enable O(1) parent lookups without modifying the `Node` enum.
 
 use generational_arena::{Arena, Index};
+use std::collections::HashMap;
 
 /// A DOM document backed by a generational arena.
 #[derive(Debug, Clone)]
@@ -13,6 +20,8 @@ pub struct Document {
     pub root_id: NodeId,
     /// Raw CSS text extracted from `<style>` elements during parsing.
     pub style_texts: Vec<String>,
+    /// Maps child NodeId -> parent NodeId for O(1) parent lookups.
+    pub parent_map: HashMap<NodeId, NodeId>,
 }
 
 /// A handle into the arena. Generational indices prevent ABA problems.
@@ -27,8 +36,8 @@ pub enum Node {
 
 #[derive(Debug, Clone)]
 pub struct ElementData {
-    pub tag_name: String,
-    pub attributes: Vec<(String, String)>,
+    pub tag_name: markup5ever::LocalName,
+    pub attributes: Vec<(markup5ever::LocalName, String)>,
     pub children: Vec<NodeId>,
 }
 
@@ -36,7 +45,7 @@ pub struct ElementData {
 #[derive(Debug)]
 pub struct StyledNode {
     pub node_id: NodeId,
-    pub specified_values: Vec<(String, String)>,
+    pub specified_values: Vec<(string_cache::DefaultAtom, String)>,
     pub children: Vec<StyledNode>,
 }
 
@@ -48,6 +57,7 @@ impl Default for Document {
             nodes: arena,
             root_id,
             style_texts: Vec::new(),
+            parent_map: HashMap::new(),
         }
     }
 }
@@ -62,6 +72,7 @@ impl Document {
     }
 
     pub fn remove_node(&mut self, id: NodeId) -> Option<Node> {
+        self.parent_map.remove(&id);
         self.nodes.remove(id)
     }
 
@@ -75,9 +86,10 @@ impl Document {
                     children.push(child_id);
                 }
                 Node::Text(_) => {
-                    // Cannot append to text
+                    return; // Cannot append to text
                 }
             }
+            self.parent_map.insert(child_id, parent_id);
         }
     }
 
@@ -93,7 +105,13 @@ impl Document {
                 }
                 Node::Text(_) => {}
             }
+            self.parent_map.remove(&child_id);
         }
+    }
+
+    /// Get the parent of a node via O(1) lookup.
+    pub fn parent_of(&self, node_id: NodeId) -> Option<NodeId> {
+        self.parent_map.get(&node_id).copied()
     }
 
     /// Get the children of a node, if it has any.

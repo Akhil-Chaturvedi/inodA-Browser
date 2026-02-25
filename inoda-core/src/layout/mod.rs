@@ -1,9 +1,10 @@
 //! Layout computation module.
 //!
 //! Converts a `StyledNode` tree into a `TaffyTree` and runs the Flexbox/Grid
-//! layout algorithm. Text nodes are measured with a heuristic synchronized
-//! with the computed `font-size`.
-//! (width = char_count * font_size / 2, height = font_size).
+//! layout algorithm.
+//!
+//! Text nodes are measured against the available width so long text can wrap
+//! into multiple lines, allowing Taffy to receive a realistic block height.
 //!
 //! Supported dimension units: px, %, vw, vh, em, rem, auto.
 //! Supported display modes: flex, grid, block, none.
@@ -16,67 +17,72 @@ use taffy::{
     TaffyTree,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct TextMeasureContext {
-    pub text: String,
+    pub node_id: crate::dom::NodeId,
     pub font_size: f32,
 }
 
-/// Computes the visual layout bounds of all elements in the styled tree based on the provided viewport constraints.
 pub fn compute_layout(document: &crate::dom::Document, styled_node: &StyledNode, viewport_width: f32, viewport_height: f32) -> (TaffyTree<TextMeasureContext>, NodeId) {
     let mut tree: TaffyTree<TextMeasureContext> = TaffyTree::new();
-    
-    // Recursive bridge to insert the styled node tree into Taffy
     let root_taffy_node = build_taffy_node(&mut tree, document, styled_node, viewport_width, viewport_height);
 
-    // Run the massive computation algorithm from flexbox/grid layout constraints
     let available_space = Size {
         width: AvailableSpace::Definite(viewport_width),
         height: AvailableSpace::Definite(viewport_height),
     };
+
     tree.compute_layout_with_measure(
         root_taffy_node,
         available_space,
-        |_known_dimensions, _available_space, _node_id, context: Option<&mut TextMeasureContext>, _style| {
-            if let Some(ctx) = context {
-                let char_count = ctx.text.trim().len() as f32;
-                taffy::geometry::Size {
-                    width: char_count * ctx.font_size * 0.6,
-                    height: ctx.font_size * 1.2,
-                }
+        |_known_dimensions, available_space, _node_id, context: Option<&mut TextMeasureContext>, _style| {
+            let Some(ctx) = context else {
+                return taffy::geometry::Size::ZERO;
+            };
+
+            let width_constraint = match available_space.width {
+                AvailableSpace::Definite(w) if w.is_finite() && w > 0.0 => w,
+                _ => viewport_width.max(1.0),
+            };
+
+            let text = match document.nodes.get(ctx.node_id) {
+                Some(crate::dom::Node::Text(txt)) => txt.text.trim(),
+                _ => "",
+            };
+
+            let char_width = (ctx.font_size * 0.55).max(1.0);
+            let text_width = (text.chars().count() as f32) * char_width;
+            let lines = if text.is_empty() {
+                1.0
             } else {
-                taffy::geometry::Size::ZERO
+                (text_width / width_constraint).ceil().max(1.0)
+            };
+
+            taffy::geometry::Size {
+                width: text_width.min(width_constraint),
+                height: lines * ctx.font_size * 1.2,
             }
         },
     ).unwrap();
 
-    // After this finishes, you can obtain spatial constraints by querying the tree via:
-    // tree.layout(node_id).unwrap() // Returns a `taffy::Layout` struct (x, y, width, height)
     (tree, root_taffy_node)
 }
 
 fn build_taffy_node(tree: &mut TaffyTree<TextMeasureContext>, document: &crate::dom::Document, styled_node: &StyledNode, vw: f32, vh: f32) -> NodeId {
-    // Phase 1: convert text-based CSS string values on this StyledNode into
-    // Strongly-typed Taffy CSS enums
     let mut style = Style::DEFAULT;
-    
-    // Resolve font size for em calculations (defaulting to 16.0 px)
+
     let font_size = styled_node.specified_values.iter()
         .find(|(k, _)| &**k == "font-size")
         .and_then(|(_, v)| v.trim_end_matches("px").parse::<f32>().ok())
         .unwrap_or(16.0);
 
-    // Apply Display (flex, grid, block, none)
     if let Some((_, display_val)) = styled_node.specified_values.iter().find(|(k, _)| &**k == "display") {
         match display_val.as_str() {
             "flex" => style.display = Display::Flex,
             "grid" => style.display = Display::Grid,
             "none" => style.display = Display::None,
             "block" => style.display = Display::Block,
-            "inline" | "inline-block" => {
-                // Approximate inline by wrapping or laying out horizontally if parent is flex
-                // Taffy doesn't have native "inline" text flow yet, but wait Block can be used
-            }
+            "inline" | "inline-block" => {}
             _ => {}
         }
     }
@@ -89,14 +95,12 @@ fn build_taffy_node(tree: &mut TaffyTree<TextMeasureContext>, document: &crate::
         }
     }
 
-    // Default 'block' elements stacking top-to-bottom if no direction was specified
     if styled_node.specified_values.iter().find(|(k, _)| &**k == "display").map(|(_, s)| s.as_str()) != Some("flex") {
         if styled_node.specified_values.iter().find(|(k, _)| &**k == "flex-direction").is_none() {
             style.flex_direction = FlexDirection::Column;
         }
     }
 
-    // Apply Dimensions (width, height)
     if let Some((_, width_val)) = styled_node.specified_values.iter().find(|(k, _)| &**k == "width") {
         if let Some(dim) = parse_dimension(width_val, vw, vh, font_size) {
             style.size.width = dim;
@@ -108,33 +112,17 @@ fn build_taffy_node(tree: &mut TaffyTree<TextMeasureContext>, document: &crate::
             style.size.height = dim;
         }
     }
-    
-    // Add additional properties here like margins, padding, aligning etc.
 
-    let mut is_text = false;
-    let mut text_content = String::new();
-    if let Some(node) = document.nodes.get(styled_node.node_id) {
-        if let crate::dom::Node::Text(txt) = node {
-            is_text = true;
-            text_content = txt.clone();
-        }
-    }
-
-    // Phase 2: Recursively build Taffy nodes for all children
-    if is_text {
-        // Create a leaf node with context (the text)
+    if matches!(document.nodes.get(styled_node.node_id), Some(crate::dom::Node::Text(_))) {
         tree.new_leaf_with_context(style, TextMeasureContext {
-            text: text_content,
+            node_id: styled_node.node_id,
             font_size,
         }).unwrap()
     } else {
-        let mut taffy_children = Vec::new();
-        for child in &styled_node.children {
-            let child_taffy_id = build_taffy_node(tree, document, child, vw, vh);
-            taffy_children.push(child_taffy_id);
-        }
+        let taffy_children = styled_node.children.iter()
+            .map(|child| build_taffy_node(tree, document, child, vw, vh))
+            .collect::<Vec<_>>();
 
-        // Phase 3: Insert into the tree and return ID
         tree.new_with_children(style, &taffy_children).unwrap()
     }
 }
@@ -145,7 +133,7 @@ fn parse_dimension(val: &str, vw: f32, vh: f32, font_size: f32) -> Option<Dimens
     if val == "auto" {
         return Some(Dimension::auto());
     }
-    
+
     if val.ends_with("px") {
         if let Ok(num) = val.trim_end_matches("px").parse::<f32>() {
             return Some(Dimension::length(num));

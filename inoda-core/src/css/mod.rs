@@ -10,8 +10,11 @@
 //! and shorthand expansion for `margin`, `padding`, and `background`. Inline
 //! `style` attributes are parsed natively.
 
+use cssparser::{
+    AtRuleParser, DeclarationParser, ParserState, QualifiedRuleParser, RuleBodyItemParser,
+    RuleBodyParser,
+};
 use cssparser::{Parser, ParserInput, Token};
-use cssparser::{DeclarationParser, AtRuleParser, QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, ParserState};
 
 // ---------------------------------------------------------------------------
 // Selector AST -- parsed once, matched many times without string operations.
@@ -85,13 +88,14 @@ fn parse_complex_selector(raw: &str) -> ComplexSelector {
     let mut current = String::new();
     let mut next_combinator = Combinator::Descendant;
 
-    let push_current = |list: &mut Vec<(Combinator, String)>, current: &mut String, comb: Combinator| {
-        let trimmed = current.trim();
-        if !trimmed.is_empty() {
-            list.push((comb, trimmed.to_string()));
-            current.clear();
-        }
-    };
+    let push_current =
+        |list: &mut Vec<(Combinator, String)>, current: &mut String, comb: Combinator| {
+            let trimmed = current.trim();
+            if !trimmed.is_empty() {
+                list.push((comb, trimmed.to_string()));
+                current.clear();
+            }
+        };
 
     for ch in raw.trim().chars() {
         if ch == '>' {
@@ -112,32 +116,36 @@ fn parse_complex_selector(raw: &str) -> ComplexSelector {
     }
 
     push_current(&mut list, &mut current, next_combinator);
-    
+
     if list.is_empty() {
-         return ComplexSelector { last: parse_compound_selector(""), ancestors: vec![], specificity: (0,0,0) };
+        return ComplexSelector {
+            last: parse_compound_selector(""),
+            ancestors: vec![],
+            specificity: (0, 0, 0),
+        };
     }
-    
+
     list[0].0 = Combinator::Descendant; // Dummy
-    
+
     let mut total_spec = (0, 0, 0);
     let mut parsed_list = Vec::new();
-    
+
     for (comb, txt) in list {
-         let cs = parse_compound_selector(&txt);
-         total_spec.0 += cs.specificity.0;
-         total_spec.1 += cs.specificity.1;
-         total_spec.2 += cs.specificity.2;
-         parsed_list.push((comb, cs));
+        let cs = parse_compound_selector(&txt);
+        total_spec.0 += cs.specificity.0;
+        total_spec.1 += cs.specificity.1;
+        total_spec.2 += cs.specificity.2;
+        parsed_list.push((comb, cs));
     }
-    
+
     let (mut last_comb, last) = parsed_list.pop().unwrap();
     let mut ancestors = Vec::new();
-    
+
     while let Some((next_comb, prev_cs)) = parsed_list.pop() {
-         ancestors.push((last_comb, prev_cs));
-         last_comb = next_comb;
+        ancestors.push((last_comb, prev_cs));
+        last_comb = next_comb;
     }
-    
+
     ComplexSelector {
         last,
         ancestors,
@@ -277,22 +285,27 @@ fn match_complex_selector(
 
     // Now walk up the ancestors based on combinators
     let mut current_id = node_id;
-    
+
     for (comb, ancestor_compound) in &complex.ancestors {
         let mut matched = false;
-        
+
         loop {
             // Move to parent
             if let Some(parent_id) = document.parent_of(current_id) {
                 current_id = parent_id;
-                
-                if let Some(crate::dom::Node::Element(parent_data)) = document.nodes.get(current_id) {
-                    if match_compound_selector(ancestor_compound, &parent_data.tag_name, &parent_data.attributes) {
+
+                if let Some(crate::dom::Node::Element(parent_data)) = document.nodes.get(current_id)
+                {
+                    if match_compound_selector(
+                        ancestor_compound,
+                        &parent_data.tag_name,
+                        &parent_data.attributes,
+                    ) {
                         matched = true;
                         break;
                     }
                 }
-                
+
                 // If it's a direct child combinator and we didn't match the immediate parent, we fail this sequence.
                 if *comb == Combinator::Child {
                     break;
@@ -302,7 +315,7 @@ fn match_complex_selector(
                 break;
             }
         }
-        
+
         if !matched {
             return false;
         }
@@ -324,9 +337,12 @@ pub fn parse_stylesheet(css: &str) -> StyleSheet {
     stylesheet
 }
 
-pub fn compute_styles(document: &crate::dom::Document, base_stylesheet: &StyleSheet) -> crate::dom::StyledNode {
+pub fn compute_styles(
+    document: &crate::dom::Document,
+    base_stylesheet: &StyleSheet,
+) -> crate::dom::StyledNode {
     let mut combined_sheet = base_stylesheet.clone();
-    
+
     for style_text in &document.style_texts {
         let inline_sheet = parse_stylesheet(style_text);
         combined_sheet.rules.extend(inline_sheet.rules);
@@ -337,17 +353,26 @@ pub fn compute_styles(document: &crate::dom::Document, base_stylesheet: &StyleSh
 
 #[inline]
 fn is_inheritable(property: &string_cache::DefaultAtom) -> bool {
-    matches!(&**property, "color" | "font-family" | "font-size" | "font-weight" | "line-height" | "text-align" | "visibility")
+    matches!(
+        &**property,
+        "color"
+            | "font-family"
+            | "font-size"
+            | "font-weight"
+            | "line-height"
+            | "text-align"
+            | "visibility"
+    )
 }
 
 fn build_styled_node(
     document: &crate::dom::Document,
     node_id: crate::dom::NodeId,
     stylesheet: &StyleSheet,
-    parent_styles: &[(string_cache::DefaultAtom, String)]
+    parent_styles: &[(string_cache::DefaultAtom, String)],
 ) -> crate::dom::StyledNode {
     let mut specified_values = Vec::new();
-    
+
     for (k, v) in parent_styles {
         if is_inheritable(k) {
             specified_values.push((k.clone(), v.clone()));
@@ -355,7 +380,7 @@ fn build_styled_node(
     }
 
     let mut children_ids = Vec::new();
-    
+
     if let Some(node) = document.nodes.get(node_id) {
         match node {
             crate::dom::Node::Element(data) => {
@@ -369,24 +394,29 @@ fn build_styled_node(
                         }
                     }
                 }
-                
+
                 // Sort stably to preserve source-order precedence for equal specificities
                 matched_rules.sort_by_key(|(spec, _)| *spec);
-                
+
                 for (_, rule) in matched_rules {
                     for decl in &rule.declarations {
-                        if let Some(pos) = specified_values.iter().position(|(k, _)| k == &decl.name) {
+                        if let Some(pos) =
+                            specified_values.iter().position(|(k, _)| k == &decl.name)
+                        {
                             specified_values[pos].1 = decl.value.clone();
                         } else {
                             specified_values.push((decl.name.clone(), decl.value.clone()));
                         }
                     }
                 }
-                
-                if let Some((_, style_attr)) = data.attributes.iter().find(|(k, _)| &**k == "style") {
+
+                if let Some((_, style_attr)) = data.attributes.iter().find(|(k, _)| &**k == "style")
+                {
                     let inline_decls = parse_inline_declarations(style_attr);
                     for decl in &inline_decls {
-                        if let Some(pos) = specified_values.iter().position(|(k, _)| k == &decl.name) {
+                        if let Some(pos) =
+                            specified_values.iter().position(|(k, _)| k == &decl.name)
+                        {
                             specified_values[pos].1 = decl.value.clone();
                         } else {
                             specified_values.push((decl.name.clone(), decl.value.clone()));
@@ -402,7 +432,8 @@ fn build_styled_node(
         }
     }
 
-    let children = children_ids.into_iter()
+    let children = children_ids
+        .into_iter()
         .map(|id| build_styled_node(document, id, stylesheet, &specified_values))
         .collect();
 
@@ -429,14 +460,21 @@ fn parse_rules_list<'i, 't>(parser: &mut Parser<'i, 't>, stylesheet: &mut StyleS
     }
 }
 
-fn parse_rule<'i, 't>(parser: &mut Parser<'i, 't>) -> Result<Option<StyleRule>, cssparser::ParseError<'i, ()>> {
+fn parse_rule<'i, 't>(
+    parser: &mut Parser<'i, 't>,
+) -> Result<Option<StyleRule>, cssparser::ParseError<'i, ()>> {
     // 1. Collect raw selector text
     let mut raw_selectors = String::new();
     while let Ok(token) = parser.next_including_whitespace() {
-        if matches!(token, Token::CurlyBracketBlock) { break; }
+        if matches!(token, Token::CurlyBracketBlock) {
+            break;
+        }
         match token {
             Token::Ident(n) => raw_selectors.push_str(n.as_ref()),
-            Token::Hash(n) | Token::IDHash(n) => { raw_selectors.push('#'); raw_selectors.push_str(n.as_ref()); },
+            Token::Hash(n) | Token::IDHash(n) => {
+                raw_selectors.push('#');
+                raw_selectors.push_str(n.as_ref());
+            }
             Token::Delim(c) => raw_selectors.push(*c),
             Token::WhiteSpace(_) => raw_selectors.push(' '),
             Token::Comma => raw_selectors.push(','),
@@ -462,20 +500,22 @@ fn parse_rule<'i, 't>(parser: &mut Parser<'i, 't>) -> Result<Option<StyleRule>, 
             if let Ok(ident) = p.expect_ident() {
                 let name = ident.as_ref().to_owned();
                 let _ = p.expect_colon();
-                
+
                 let mut value = String::new();
                 while let Ok(token) = p.next() {
-                     if matches!(token, Token::Semicolon) { break; }
-                     match token {
-                         Token::Ident(n) => value.push_str(n),
-                         Token::Number { value: v, .. } => value.push_str(&v.to_string()),
-                         Token::Dimension { value: v, unit, .. } => {
-                             value.push_str(&v.to_string());
-                             value.push_str(unit.as_ref());
-                         }
-                         Token::QuotedString(s) => value.push_str(s),
-                         _ => {}
-                     }
+                    if matches!(token, Token::Semicolon) {
+                        break;
+                    }
+                    match token {
+                        Token::Ident(n) => value.push_str(n),
+                        Token::Number { value: v, .. } => value.push_str(&v.to_string()),
+                        Token::Dimension { value: v, unit, .. } => {
+                            value.push_str(&v.to_string());
+                            value.push_str(unit.as_ref());
+                        }
+                        Token::QuotedString(s) => value.push_str(s),
+                        _ => {}
+                    }
                 }
 
                 // Expand shorthand properties
@@ -486,35 +526,85 @@ fn parse_rule<'i, 't>(parser: &mut Parser<'i, 't>) -> Result<Option<StyleRule>, 
                     let (top, right, bottom, left) = if name_str == "margin" {
                         ("margin-top", "margin-right", "margin-bottom", "margin-left")
                     } else {
-                        ("padding-top", "padding-right", "padding-bottom", "padding-left")
+                        (
+                            "padding-top",
+                            "padding-right",
+                            "padding-bottom",
+                            "padding-left",
+                        )
                     };
                     match parts.len() {
                         1 => {
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(top), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(right), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(bottom), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(left), value: parts[0].to_string() });
+                            declarations.push(Declaration {
+                                name: string_cache::DefaultAtom::from(top),
+                                value: parts[0].to_string(),
+                            });
+                            declarations.push(Declaration {
+                                name: string_cache::DefaultAtom::from(right),
+                                value: parts[0].to_string(),
+                            });
+                            declarations.push(Declaration {
+                                name: string_cache::DefaultAtom::from(bottom),
+                                value: parts[0].to_string(),
+                            });
+                            declarations.push(Declaration {
+                                name: string_cache::DefaultAtom::from(left),
+                                value: parts[0].to_string(),
+                            });
                         }
                         2 => {
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(top), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(bottom), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(left), value: parts[1].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(right), value: parts[1].to_string() });
+                            declarations.push(Declaration {
+                                name: string_cache::DefaultAtom::from(top),
+                                value: parts[0].to_string(),
+                            });
+                            declarations.push(Declaration {
+                                name: string_cache::DefaultAtom::from(bottom),
+                                value: parts[0].to_string(),
+                            });
+                            declarations.push(Declaration {
+                                name: string_cache::DefaultAtom::from(left),
+                                value: parts[1].to_string(),
+                            });
+                            declarations.push(Declaration {
+                                name: string_cache::DefaultAtom::from(right),
+                                value: parts[1].to_string(),
+                            });
                         }
                         4 => {
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(top), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(right), value: parts[1].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(bottom), value: parts[2].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(left), value: parts[3].to_string() });
+                            declarations.push(Declaration {
+                                name: string_cache::DefaultAtom::from(top),
+                                value: parts[0].to_string(),
+                            });
+                            declarations.push(Declaration {
+                                name: string_cache::DefaultAtom::from(right),
+                                value: parts[1].to_string(),
+                            });
+                            declarations.push(Declaration {
+                                name: string_cache::DefaultAtom::from(bottom),
+                                value: parts[2].to_string(),
+                            });
+                            declarations.push(Declaration {
+                                name: string_cache::DefaultAtom::from(left),
+                                value: parts[3].to_string(),
+                            });
                         }
                         _ => {
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(name_str), value });
+                            declarations.push(Declaration {
+                                name: string_cache::DefaultAtom::from(name_str),
+                                value,
+                            });
                         }
                     }
                 } else if name_str == "background" {
-                    declarations.push(Declaration { name: string_cache::DefaultAtom::from("background-color"), value });
+                    declarations.push(Declaration {
+                        name: string_cache::DefaultAtom::from("background-color"),
+                        value,
+                    });
                 } else {
-                    declarations.push(Declaration { name: string_cache::DefaultAtom::from(name_str), value });
+                    declarations.push(Declaration {
+                        name: string_cache::DefaultAtom::from(name_str),
+                        value,
+                    });
                 }
             } else {
                 let _ = p.next();
@@ -524,9 +614,12 @@ fn parse_rule<'i, 't>(parser: &mut Parser<'i, 't>) -> Result<Option<StyleRule>, 
     });
 
     if result.is_ok() {
-         Ok(Some(StyleRule { selectors, declarations }))
+        Ok(Some(StyleRule {
+            selectors,
+            declarations,
+        }))
     } else {
-         Ok(None)
+        Ok(None)
     }
 }
 
@@ -590,8 +683,12 @@ impl<'i> QualifiedRuleParser<'i> for InlineStyleParser {
 }
 
 impl<'i> RuleBodyItemParser<'i, Declaration, ()> for InlineStyleParser {
-    fn parse_declarations(&self) -> bool { true }
-    fn parse_qualified(&self) -> bool { false }
+    fn parse_declarations(&self) -> bool {
+        true
+    }
+    fn parse_qualified(&self) -> bool {
+        false
+    }
 }
 
 /// Parse inline style declarations (e.g., from a `style="..."` attribute)

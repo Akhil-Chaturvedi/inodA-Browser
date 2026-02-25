@@ -61,7 +61,9 @@ pub struct StyledNode {
 impl Default for Document {
     fn default() -> Self {
         let mut arena = Arena::new();
-        let root_id = arena.insert(Node::Root(RootData { children: Vec::new() }));
+        let root_id = arena.insert(Node::Root(RootData {
+            children: Vec::new(),
+        }));
         Document {
             nodes: arena,
             root_id,
@@ -83,6 +85,16 @@ impl Document {
         if let Some(parent_id) = self.parent_of(id) {
             self.remove_child(parent_id, id);
         }
+
+        let child_ids = self
+            .children_of(id)
+            .map(|children| children.to_vec())
+            .unwrap_or_default();
+
+        for child_id in child_ids {
+            self.remove_node(child_id);
+        }
+
         self.nodes.remove(id)
     }
 

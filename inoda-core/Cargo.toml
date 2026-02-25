@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cosmic-text = "0.12"
 cssparser = "0.36.0"
 generational-arena = "0.2.9"
 html5ever = "0.38.0"

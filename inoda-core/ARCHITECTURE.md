@@ -20,8 +20,8 @@ layout::compute_layout()    -- converts StyledNode tree to TaffyTree, resolves
   |                            runs Taffy flexbox/grid solver -> positioned Layout tree
   v
 render::draw_layout_tree()  -- walks Layout + StyledNode in parallel,
-                               issues femtovg draw calls: fill_path (bg), stroke_path
-                               (border), fill_text (text content)
+                               issues renderer backend draw calls: fill_rect (bg),
+                               stroke_rect (border), draw_text (text content)
 ```
 
 JavaScript execution happens outside this pipeline. The host application creates a `JsEngine`, passing in the `Document`. JS code can read and mutate the DOM via `Rc<RefCell<Document>>`. QuickJS is single-threaded; access is serialized. There is currently no mechanism to trigger re-style or re-layout from JS mutations. Timer callbacks registered via `setTimeout` fire only when the host calls `JsEngine::pump()`.
@@ -35,15 +35,25 @@ Document {
     nodes: Arena<Node>,             // generational_arena::Arena, indexed by Index
     root_id: generational_arena::Index,
     style_texts: Vec<String>,       // raw CSS from <style> tags
-    parent_map: HashMap<NodeId, NodeId> // O(1) parent lookups
+    // parent pointers live on ElementData/TextData for O(1) parent lookups
 }
 
-Node = Element(ElementData) | Text(String) | Root(Vec<NodeId>)
+Node = Element(ElementData) | Text(TextData) | Root(RootData)
 NodeId = generational_arena::Index  // type alias
 
 ElementData {
     tag_name: markup5ever::LocalName,   // interned
     attributes: Vec<(markup5ever::LocalName, String)>,
+    children: Vec<NodeId>,
+    parent: Option<NodeId>
+}
+
+TextData {
+    text: String,
+    parent: Option<NodeId>
+}
+
+RootData {
     children: Vec<NodeId>
 }
 ```
@@ -72,7 +82,7 @@ Combinator = Descendant | Child
 Declaration { name: string_cache::DefaultAtom, value: String }
 ```
 
-Selectors are pre-parsed into a `ComplexSelector` AST at stylesheet creation time. Specificity is calculated once during parsing. Combinators (`>` for child, space for descendant) are supported by walking the `parent_map` during matching. Inline `style` attributes are parsed using `cssparser`'s `DeclarationParser` trait directly.
+Selectors are pre-parsed into a `ComplexSelector` AST at stylesheet creation time. Specificity is calculated once during parsing. Combinators (`>` for child, space for descendant) are supported by walking in-node parent pointers during matching. Inline `style` attributes are parsed using `cssparser`'s `DeclarationParser` trait directly.
 
 ### PendingTimer (js/mod.rs)
 
@@ -92,7 +102,7 @@ Selectors are scored as `(id_count, class_count, tag_count)`. Matched rules are 
 
 ## Text measurement
 
-Text nodes are inserted into Taffy as leaf nodes with a `String` context. During `compute_layout_with_measure`, the measure function estimates width as `char_count * 8.0` pixels and height as `18.0` pixels. This is a fixed-width monospace approximation. It does not account for font metrics, kerning, proportional widths, or line wrapping.
+Text nodes are inserted into Taffy as leaf nodes with a measurement context. During `compute_layout_with_measure`, text uses a fixed-width monospace approximation (`char_width ~= font_size * 0.55`) and wraps on whitespace boundaries with long-token fallback. This improves line breaking but still does not use real font shaping/kerning.
 
 ## Thread safety
 

@@ -12,10 +12,10 @@ use std::cell::RefCell;
 use html5ever::parse_document;
 use html5ever::tendril::{StrTendril, TendrilSink};
 use markup5ever::interface::tree_builder::{
-    ElementFlags, NodeOrText, QuirksMode, TreeSink, ElemName,
+    ElemName, ElementFlags, NodeOrText, QuirksMode, TreeSink,
 };
 use markup5ever::interface::{Attribute, QualName};
-use markup5ever::{local_name, LocalName, Namespace};
+use markup5ever::{LocalName, Namespace, local_name};
 
 use crate::dom::{Document, ElementData, Node, NodeId, TextData};
 
@@ -33,8 +33,12 @@ struct InodaElemName {
 }
 
 impl ElemName for InodaElemName {
-    fn ns(&self) -> &Namespace { &self.ns }
-    fn local_name(&self) -> &LocalName { &self.local }
+    fn ns(&self) -> &Namespace {
+        &self.ns
+    }
+    fn local_name(&self) -> &LocalName {
+        &self.local
+    }
 }
 
 impl TreeSink for DocumentBuilder {
@@ -93,12 +97,18 @@ impl TreeSink for DocumentBuilder {
     fn create_comment(&self, _text: StrTendril) -> NodeId {
         // Store comments as empty text nodes (ignored during layout/render).
         let mut doc = self.doc.borrow_mut();
-        doc.add_node(Node::Text(TextData { text: String::new(), parent: None }))
+        doc.add_node(Node::Text(TextData {
+            text: String::new(),
+            parent: None,
+        }))
     }
 
     fn create_pi(&self, _target: StrTendril, _data: StrTendril) -> NodeId {
         let mut doc = self.doc.borrow_mut();
-        doc.add_node(Node::Text(TextData { text: String::new(), parent: None }))
+        doc.add_node(Node::Text(TextData {
+            text: String::new(),
+            parent: None,
+        }))
     }
 
     fn append(&self, parent: &NodeId, child: NodeOrText<NodeId>) {
@@ -109,11 +119,6 @@ impl TreeSink for DocumentBuilder {
             }
             NodeOrText::AppendText(text) => {
                 let text_str = text.to_string();
-                // Skip whitespace-only text nodes to reduce arena size
-                if text_str.trim().is_empty() {
-                    return;
-                }
-
                 // Check if we should merge with the last child if it is also text
                 let children_slice: Option<Vec<NodeId>> = match doc.nodes.get(*parent) {
                     Some(Node::Element(d)) => Some(d.children.clone()),
@@ -129,7 +134,10 @@ impl TreeSink for DocumentBuilder {
                     }
                 }
 
-                let id = doc.add_node(Node::Text(TextData { text: text_str, parent: None }));
+                let id = doc.add_node(Node::Text(TextData {
+                    text: text_str,
+                    parent: None,
+                }));
                 doc.append_child(*parent, id);
             }
         }
@@ -175,8 +183,10 @@ impl TreeSink for DocumentBuilder {
             NodeOrText::AppendNode(id) => id,
             NodeOrText::AppendText(text) => {
                 let text_str = text.to_string();
-                if text_str.trim().is_empty() { return; }
-                doc.add_node(Node::Text(TextData { text: text_str, parent: None }))
+                doc.add_node(Node::Text(TextData {
+                    text: text_str,
+                    parent: None,
+                }))
             }
         };
 
@@ -246,14 +256,18 @@ impl TreeSink for DocumentBuilder {
 
 /// Extract CSS text from `<style>` elements after parsing.
 fn extract_style_texts(doc: &mut Document) {
-    let style_element_ids: Vec<NodeId> = doc.nodes.iter().filter_map(|(id, node)| {
-        if let Node::Element(data) = node {
-            if data.tag_name == local_name!("style") {
-                return Some(id);
+    let style_element_ids: Vec<NodeId> = doc
+        .nodes
+        .iter()
+        .filter_map(|(id, node)| {
+            if let Node::Element(data) = node {
+                if data.tag_name == local_name!("style") {
+                    return Some(id);
+                }
             }
-        }
-        None
-    }).collect();
+            None
+        })
+        .collect();
 
     for style_id in style_element_ids {
         let mut style_text = String::new();

@@ -17,13 +17,13 @@
 //! The Document is held behind `Rc<RefCell<Document>>` for single-threaded access.
 //! All JS operations are synchronous and serialized through this lock.
 
-use rquickjs::{Context, Runtime, Persistent};
-use rquickjs::class::{Trace, Tracer, JsClass, Readable};
-use rquickjs::function::This;
-use std::rc::Rc;
-use std::cell::{RefCell, Cell};
-use std::time::Instant;
 use crate::dom::Document;
+use rquickjs::class::{JsClass, Readable, Trace, Tracer};
+use rquickjs::function::This;
+use rquickjs::{Context, Persistent, Runtime};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use std::time::Instant;
 
 // ---------------------------------------------------------------------------
 // NodeHandle: an opaque JS class wrapping a generational_arena::Index.
@@ -40,7 +40,10 @@ pub struct NodeHandle {
 impl NodeHandle {
     pub fn from_node_id(id: crate::dom::NodeId) -> Self {
         let (idx, generation) = id.into_raw_parts();
-        NodeHandle { arena_index: idx, arena_generation: generation }
+        NodeHandle {
+            arena_index: idx,
+            arena_generation: generation,
+        }
     }
 
     pub fn to_node_id(&self) -> crate::dom::NodeId {
@@ -67,7 +70,9 @@ impl<'js> JsClass<'js> for NodeHandle {
         Ok(Some(proto))
     }
 
-    fn constructor(_ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<Option<rquickjs::function::Constructor<'js>>> {
+    fn constructor(
+        _ctx: &rquickjs::Ctx<'js>,
+    ) -> rquickjs::Result<Option<rquickjs::function::Constructor<'js>>> {
         // NodeHandle cannot be constructed from JS -- only from Rust.
         Ok(None)
     }
@@ -116,7 +121,7 @@ impl JsEngine {
     pub fn new(document: Document) -> Self {
         let runtime = Runtime::new().unwrap();
         let context = Context::full(&runtime).unwrap();
-        
+
         let engine = JsEngine {
             runtime,
             context,
@@ -134,16 +139,20 @@ impl JsEngine {
         let doc_ref = self.document.clone();
         let timer_id_counter = self.next_timer_id.clone();
         let pending_timers = self.pending_timers.clone();
-        
+
         self.context.with(|ctx| {
             let globals = ctx.globals();
 
             // Register the NodeHandle class prototype
-            let proto = rquickjs::Class::<NodeHandle>::prototype(&ctx).unwrap().unwrap();
+            let proto = rquickjs::Class::<NodeHandle>::prototype(&ctx)
+                .unwrap()
+                .unwrap();
 
             let get_attr_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
-                move |This(this): This<rquickjs::Class<'_, NodeHandle>>, attr: String| -> Option<String> {
+                move |This(this): This<rquickjs::Class<'_, NodeHandle>>,
+                      attr: String|
+                      -> Option<String> {
                     let doc = doc_ref.borrow();
                     let node_id = this.borrow().to_node_id();
                     if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
@@ -155,35 +164,43 @@ impl JsEngine {
                     }
                     None
                 }
-            }).unwrap();
+            })
+            .unwrap();
             proto.set("getAttribute", get_attr_func).unwrap();
 
             let set_attr_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
-                move |This(this): This<rquickjs::Class<'_, NodeHandle>>, attr: String, value: String| {
+                move |This(this): This<rquickjs::Class<'_, NodeHandle>>,
+                      attr: String,
+                      value: String| {
                     let mut doc = doc_ref.borrow_mut();
                     let node_id = this.borrow().to_node_id();
                     if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
                         let local_attr = markup5ever::LocalName::from(attr.as_str());
-                        if let Some(pos) = data.attributes.iter().position(|(k, _)| *k == local_attr) {
+                        if let Some(pos) =
+                            data.attributes.iter().position(|(k, _)| *k == local_attr)
+                        {
                             data.attributes[pos].1 = value;
                         } else {
                             data.attributes.push((local_attr, value));
                         }
                     }
                 }
-            }).unwrap();
+            })
+            .unwrap();
             proto.set("setAttribute", set_attr_func).unwrap();
 
             let remove_child_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
-                move |This(this): This<rquickjs::Class<'_, NodeHandle>>, child: rquickjs::Class<'_, NodeHandle>| {
+                move |This(this): This<rquickjs::Class<'_, NodeHandle>>,
+                      child: rquickjs::Class<'_, NodeHandle>| {
                     let mut doc = doc_ref.borrow_mut();
                     let parent_id = this.borrow().to_node_id();
                     let child_id = child.borrow().to_node_id();
                     doc.remove_child(parent_id, child_id);
                 }
-            }).unwrap();
+            })
+            .unwrap();
             proto.set("removeChild", remove_child_func).unwrap();
 
             // --- console object ---
@@ -191,17 +208,20 @@ impl JsEngine {
 
             let log_func = rquickjs::Function::new(ctx.clone(), |msg: String| {
                 println!("[JS console.log] {}", msg);
-            }).unwrap();
+            })
+            .unwrap();
             console_obj.set("log", log_func).unwrap();
 
             let warn_func = rquickjs::Function::new(ctx.clone(), |msg: String| {
                 println!("[JS console.warn] {}", msg);
-            }).unwrap();
+            })
+            .unwrap();
             console_obj.set("warn", warn_func).unwrap();
 
             let error_func = rquickjs::Function::new(ctx.clone(), |msg: String| {
                 println!("[JS console.error] {}", msg);
-            }).unwrap();
+            })
+            .unwrap();
             console_obj.set("error", error_func).unwrap();
 
             globals.set("console", console_obj).unwrap();
@@ -216,20 +236,31 @@ impl JsEngine {
                     let doc = doc_ref.borrow();
                     for (node_id, node) in doc.nodes.iter() {
                         if let crate::dom::Node::Element(data) = node {
-                            if data.attributes.iter().any(|(k, v)| &**k == "id" && v == &id) {
+                            if data
+                                .attributes
+                                .iter()
+                                .any(|(k, v)| &**k == "id" && v == &id)
+                            {
                                 return Some(NodeHandleWithTag {
                                     handle: NodeHandle::from_node_id(node_id),
                                     tag_name: data.tag_name.to_string(),
-                                    node_key: format!("{}:{}", node_id.into_raw_parts().0, node_id.into_raw_parts().1),
+                                    node_key: format!(
+                                        "{}:{}",
+                                        node_id.into_raw_parts().0,
+                                        node_id.into_raw_parts().1
+                                    ),
                                 });
                             }
                         }
                     }
                     None
                 }
-            }).unwrap();
+            })
+            .unwrap();
 
-            document_obj.set("_getElementByIdRaw", get_by_id_func).unwrap();
+            document_obj
+                .set("_getElementByIdRaw", get_by_id_func)
+                .unwrap();
 
             // querySelector: returns a NodeHandle JS object or null
             let query_selector_func = rquickjs::Function::new(ctx.clone(), {
@@ -238,31 +269,49 @@ impl JsEngine {
                     let doc = doc_ref.borrow();
                     for (node_id, node) in doc.nodes.iter() {
                         if let crate::dom::Node::Element(data) = node {
-                            let is_match = 
-                               (selector.starts_with('.') && data.attributes.iter().any(|(k, v)| &**k == "class" && format!(".{}", v) == selector)) ||
-                               (selector.starts_with('#') && data.attributes.iter().any(|(k, v)| &**k == "id" && format!("#{}", v) == selector)) ||
-                               (&*data.tag_name == selector);
-                               
+                            let is_match = (selector.starts_with('.')
+                                && data.attributes.iter().any(|(k, v)| {
+                                    &**k == "class" && format!(".{}", v) == selector
+                                }))
+                                || (selector.starts_with('#')
+                                    && data.attributes.iter().any(|(k, v)| {
+                                        &**k == "id" && format!("#{}", v) == selector
+                                    }))
+                                || (&*data.tag_name == selector);
+
                             if is_match {
                                 return Some(NodeHandleWithTag {
                                     handle: NodeHandle::from_node_id(node_id),
                                     tag_name: data.tag_name.to_string(),
-                                    node_key: format!("{}:{}", node_id.into_raw_parts().0, node_id.into_raw_parts().1),
+                                    node_key: format!(
+                                        "{}:{}",
+                                        node_id.into_raw_parts().0,
+                                        node_id.into_raw_parts().1
+                                    ),
                                 });
                             }
                         }
                     }
                     None
                 }
-            }).unwrap();
-            
-            document_obj.set("_querySelectorRaw", query_selector_func).unwrap();
+            })
+            .unwrap();
 
-            let add_event_listener_func = rquickjs::Function::new(ctx.clone(), move |event: String, _cb: rquickjs::Function| {
-                println!("[JS addEventListener] Registered event: {}", event);
-            }).unwrap();
+            document_obj
+                .set("_querySelectorRaw", query_selector_func)
+                .unwrap();
 
-            document_obj.set("addEventListener", add_event_listener_func).unwrap();
+            let add_event_listener_func = rquickjs::Function::new(
+                ctx.clone(),
+                move |event: String, _cb: rquickjs::Function| {
+                    println!("[JS addEventListener] Registered event: {}", event);
+                },
+            )
+            .unwrap();
+
+            document_obj
+                .set("addEventListener", add_event_listener_func)
+                .unwrap();
 
             // createElement: returns a NodeHandle JS object
             let create_element_func = rquickjs::Function::new(ctx.clone(), {
@@ -282,27 +331,38 @@ impl JsEngine {
                     NodeHandleWithTag {
                         handle: NodeHandle::from_node_id(index),
                         tag_name: tag_name_clone,
-                        node_key: format!("{}:{}", index.into_raw_parts().0, index.into_raw_parts().1),
+                        node_key: format!(
+                            "{}:{}",
+                            index.into_raw_parts().0,
+                            index.into_raw_parts().1
+                        ),
                     }
                 }
-            }).unwrap();
-            document_obj.set("_createElementRaw", create_element_func).unwrap();
+            })
+            .unwrap();
+            document_obj
+                .set("_createElementRaw", create_element_func)
+                .unwrap();
 
             // appendChild: accepts two NodeHandle objects (no string parsing)
             let append_child_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
-                move |parent_cls: rquickjs::Class<'_, NodeHandle>, child_cls: rquickjs::Class<'_, NodeHandle>| {
+                move |parent_cls: rquickjs::Class<'_, NodeHandle>,
+                      child_cls: rquickjs::Class<'_, NodeHandle>| {
                     let parent_id = parent_cls.borrow().to_node_id();
                     let child_id = child_cls.borrow().to_node_id();
                     let mut doc = doc_ref.borrow_mut();
                     doc.append_child(parent_id, child_id);
                 }
-            }).unwrap();
+            })
+            .unwrap();
             document_obj.set("appendChild", append_child_func).unwrap();
 
             globals.set("document", document_obj).unwrap();
 
-            let _: () = ctx.eval(r#"
+            let _: () = ctx
+                .eval(
+                    r#"
                 document.__nodeCache = Object.create(null);
                 document.getElementById = function(id) {
                     const node = this._getElementByIdRaw(id);
@@ -325,7 +385,9 @@ impl JsEngine {
                     this.__nodeCache[node.__nodeKey] = node;
                     return node;
                 };
-            "#).unwrap();
+            "#,
+                )
+                .unwrap();
 
             // --- setTimeout with Persistent<Function> storage ---
             let set_timeout_func = rquickjs::Function::new(ctx.clone(), {
@@ -335,13 +397,19 @@ impl JsEngine {
                     let timer_id = timer_id_counter.get();
                     timer_id_counter.set(timer_id + 1);
 
-                    let fire_at = Instant::now() + std::time::Duration::from_millis(delay.max(0) as u64);
+                    let fire_at =
+                        Instant::now() + std::time::Duration::from_millis(delay.max(0) as u64);
                     let mut timers = pending_timers.borrow_mut();
-                    timers.push(PendingTimer { id: timer_id, fire_at, callback: cb });
+                    timers.push(PendingTimer {
+                        id: timer_id,
+                        fire_at,
+                        callback: cb,
+                    });
 
                     timer_id as i32
                 }
-            }).unwrap();
+            })
+            .unwrap();
 
             globals.set("setTimeout", set_timeout_func).unwrap();
         });
@@ -355,7 +423,8 @@ impl JsEngine {
         let expired: Vec<Persistent<rquickjs::Function<'static>>>;
         {
             let mut timers = self.pending_timers.borrow_mut();
-            let (ready, remaining): (Vec<_>, Vec<_>) = timers.drain(..).partition(|t| t.fire_at <= now);
+            let (ready, remaining): (Vec<_>, Vec<_>) =
+                timers.drain(..).partition(|t| t.fire_at <= now);
             expired = ready.into_iter().map(|t| t.callback).collect();
             *timers = remaining;
         }
@@ -379,11 +448,12 @@ impl JsEngine {
 
     /// Evaluates a JavaScript string and returns any string result or errors
     pub fn execute_script(&self, script: &str) -> String {
-        self.context.with(|ctx| {
-            match ctx.eval::<rquickjs::Value, _>(script) {
+        self.context
+            .with(|ctx| match ctx.eval::<rquickjs::Value, _>(script) {
                 Ok(result) => {
                     if let Ok(s) = result.get::<rquickjs::String>() {
-                        s.to_string().unwrap_or_else(|_| "Error formatting string".to_string())
+                        s.to_string()
+                            .unwrap_or_else(|_| "Error formatting string".to_string())
                     } else if let Ok(i) = result.get::<i32>() {
                         i.to_string()
                     } else if let Ok(f) = result.get::<f64>() {
@@ -397,9 +467,8 @@ impl JsEngine {
                     } else {
                         "[Object/Unsupported]".to_string()
                     }
-                },
+                }
                 Err(e) => format!("JS Error: {:?}", e),
-            }
-        })
+            })
     }
 }

@@ -34,28 +34,51 @@ pub fn draw_layout_tree<R: RendererBackend>(
         let abs_x = offset_x + layout.location.x;
         let abs_y = offset_y + layout.location.y;
 
-        if let Some((_, bg_color_str)) = styled_node.specified_values.iter().find(|(k, _)| &**k == "background-color") {
+        if let Some((_, bg_color_str)) = styled_node
+            .specified_values
+            .iter()
+            .find(|(k, _)| &**k == "background-color")
+        {
             if let Some(color) = parse_color(bg_color_str) {
                 renderer.fill_rect(abs_x, abs_y, layout.size.width, layout.size.height, color);
             }
         }
 
-        if let Some((_, border_color_str)) = styled_node.specified_values.iter().find(|(k, _)| &**k == "border-color") {
-             if let Some(color) = parse_color(border_color_str) {
-                renderer.stroke_rect(abs_x, abs_y, layout.size.width, layout.size.height, 1.0, color);
-             }
+        if let Some((_, border_color_str)) = styled_node
+            .specified_values
+            .iter()
+            .find(|(k, _)| &**k == "border-color")
+        {
+            if let Some(color) = parse_color(border_color_str) {
+                renderer.stroke_rect(
+                    abs_x,
+                    abs_y,
+                    layout.size.width,
+                    layout.size.height,
+                    1.0,
+                    color,
+                );
+            }
         }
 
         if let Some(crate::dom::Node::Text(txt)) = document.nodes.get(styled_node.node_id) {
             let mut color = Color { r: 0, g: 0, b: 0 };
-            if let Some((_, color_str)) = styled_node.specified_values.iter().find(|(k, _)| &**k == "color") {
+            if let Some((_, color_str)) = styled_node
+                .specified_values
+                .iter()
+                .find(|(k, _)| &**k == "color")
+            {
                 if let Some(parsed) = parse_color(color_str) {
                     color = parsed;
                 }
             }
 
             let mut font_size = 16.0;
-            if let Some((_, size_str)) = styled_node.specified_values.iter().find(|(k, _)| &**k == "font-size") {
+            if let Some((_, size_str)) = styled_node
+                .specified_values
+                .iter()
+                .find(|(k, _)| &**k == "font-size")
+            {
                 if let Ok(size) = size_str.trim_end_matches("px").parse::<f32>() {
                     font_size = size;
                 }
@@ -66,9 +89,17 @@ pub fn draw_layout_tree<R: RendererBackend>(
 
         if let Ok(children) = layout_tree.children(layout_node_id) {
             for (i, child_layout_id) in children.into_iter().enumerate() {
-                 if let Some(child_style) = styled_node.children.get(i) {
-                     draw_layout_tree(renderer, document, layout_tree, child_style, child_layout_id, abs_x, abs_y);
-                 }
+                if let Some(child_style) = styled_node.children.get(i) {
+                    draw_layout_tree(
+                        renderer,
+                        document,
+                        layout_tree,
+                        child_style,
+                        child_layout_id,
+                        abs_x,
+                        abs_y,
+                    );
+                }
             }
         }
     }
@@ -80,7 +111,11 @@ fn parse_color(val: &str) -> Option<Color> {
         "green" => Some(Color { r: 0, g: 255, b: 0 }),
         "blue" => Some(Color { r: 0, g: 0, b: 255 }),
         "black" => Some(Color { r: 0, g: 0, b: 0 }),
-        "white" => Some(Color { r: 255, g: 255, b: 255 }),
+        "white" => Some(Color {
+            r: 255,
+            g: 255,
+            b: 255,
+        }),
         hex if hex.starts_with('#') && hex.len() == 7 => {
             let r = u8::from_str_radix(&hex[1..3], 16).ok()?;
             let g = u8::from_str_radix(&hex[3..5], 16).ok()?;

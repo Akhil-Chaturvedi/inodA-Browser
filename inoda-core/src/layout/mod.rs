@@ -10,12 +10,31 @@
 //! Supported display modes: flex, grid, block, none.
 //! Properties like margin, padding, and alignment are not yet wired.
 
+use std::{cell::RefCell, collections::HashMap};
+
 use crate::dom::StyledNode;
+use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, Wrap};
 use taffy::{
     TaffyTree,
     prelude::*,
     style::{Dimension, Style},
 };
+
+pub type TextLayoutCache = HashMap<crate::dom::NodeId, TextNodeLayout>;
+
+#[derive(Debug, Clone)]
+pub struct TextLineLayout {
+    pub text: String,
+    pub line_width: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct TextNodeLayout {
+    pub lines: Vec<TextLineLayout>,
+    pub line_height: f32,
+    pub width: f32,
+    pub height: f32,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct TextMeasureContext {
@@ -43,6 +62,9 @@ pub fn compute_layout(
         height: AvailableSpace::Definite(viewport_height),
     };
 
+    let font_system = RefCell::new(FontSystem::new());
+    let measured_text_nodes: RefCell<TextLayoutCache> = RefCell::new(HashMap::new());
+
     tree.compute_layout_with_measure(
         root_taffy_node,
         available_space,
@@ -61,7 +83,7 @@ pub fn compute_layout(
             };
 
             let text = match document.nodes.get(ctx.node_id) {
-                Some(crate::dom::Node::Text(txt)) => txt.text.trim(),
+                Some(crate::dom::Node::Text(txt)) => txt.text.as_str(),
                 _ => "",
             };
 
@@ -76,7 +98,53 @@ pub fn compute_layout(
     )
     .unwrap();
 
-    (tree, root_taffy_node)
+    (tree, root_taffy_node, measured_text_nodes.into_inner())
+}
+
+fn measure_text_with_cosmic(
+    font_system: &mut FontSystem,
+    text: &str,
+    width_constraint: f32,
+    font_size: f32,
+) -> TextNodeLayout {
+    let line_height = (font_size * 1.2).max(1.0);
+
+    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
+    buffer.set_wrap(font_system, Wrap::WordOrGlyph);
+    buffer.set_size(
+        font_system,
+        Some(width_constraint.max(1.0)),
+        Some(f32::INFINITY),
+    );
+    buffer.set_text(font_system, text, Attrs::new(), Shaping::Advanced);
+    buffer.shape_until_scroll(font_system, false);
+
+    let mut lines = Vec::new();
+    let mut max_width: f32 = 0.0;
+    for run in buffer.layout_runs() {
+        max_width = max_width.max(run.line_w);
+        lines.push(TextLineLayout {
+            text: run.text.to_string(),
+            line_width: run.line_w,
+        });
+    }
+
+    if lines.is_empty() {
+        lines.push(TextLineLayout {
+            text: String::new(),
+            line_width: 0.0,
+        });
+    }
+
+    let width = max_width.min(width_constraint.max(1.0));
+    let height = (lines.len() as f32) * line_height;
+
+    TextNodeLayout {
+        lines,
+        line_height,
+        width,
+        height,
+    }
 }
 
 fn measure_wrapped_text(text: &str, width_constraint: f32, font_size: f32) -> (f32, usize) {
@@ -240,8 +308,8 @@ fn parse_dimension(val: &str, vw: f32, vh: f32, font_size: f32) -> Option<Dimens
         if let Ok(num) = val.trim_end_matches("px").parse::<f32>() {
             return Some(Dimension::length(num));
         }
-    } else if val.ends_with("%") {
-        if let Ok(num) = val.trim_end_matches("%").parse::<f32>() {
+    } else if val.ends_with('%') {
+        if let Ok(num) = val.trim_end_matches('%').parse::<f32>() {
             return Some(Dimension::percent(num / 100.0));
         }
     } else if val.ends_with("vw") {

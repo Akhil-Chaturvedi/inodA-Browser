@@ -15,6 +15,7 @@ Early development. The engine covers enough of the web platform to parse simple 
 | `html5ever`        | 0.38    | Spec-compliant HTML tokenizer and parser    |
 | `markup5ever`      | 0.38    | Shared types for html5ever (LocalName, etc.) |
 | `cssparser`        | 0.36    | Mozilla CSS tokenizer (same one Servo uses) |
+| `cosmic-text`      | 0.12    | Font shaping + wrapped text measurement      |
 | `taffy`            | 0.9     | Flexbox and CSS Grid layout algorithm       |
 | `rquickjs`         | 0.11    | QuickJS JavaScript engine bindings          |
 | `generational-arena`| 0.2    | Generational index arena for the DOM        |

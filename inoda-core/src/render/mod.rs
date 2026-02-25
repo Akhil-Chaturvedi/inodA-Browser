@@ -5,7 +5,7 @@
 //! depend on OpenGL APIs; platform binaries can implement this trait using
 //! tiny-skia, LVGL, or any other raster target.
 
-use crate::dom::StyledNode;
+use crate::{dom::StyledNode, layout::TextLayoutCache};
 use taffy::TaffyTree;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,10 +15,23 @@ pub struct Color {
     pub b: u8,
 }
 
+#[derive(Debug, Clone)]
+pub struct TextDrawLine {
+    pub x: f32,
+    pub baseline_y: f32,
+    pub text: String,
+}
+
 pub trait RendererBackend {
     fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color);
     fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32, line_width: f32, color: Color);
     fn draw_text(&mut self, x: f32, y: f32, text: &str, size: f32, color: Color);
+
+    fn draw_text_layout(&mut self, lines: &[TextDrawLine], size: f32, color: Color) {
+        for line in lines {
+            self.draw_text(line.x, line.baseline_y, &line.text, size, color);
+        }
+    }
 }
 
 pub fn draw_layout_tree<R: RendererBackend>(
@@ -29,6 +42,7 @@ pub fn draw_layout_tree<R: RendererBackend>(
     layout_node_id: taffy::NodeId,
     offset_x: f32,
     offset_y: f32,
+    text_layouts: Option<&TextLayoutCache>,
 ) {
     if let Ok(layout) = layout_tree.layout(layout_node_id) {
         let abs_x = offset_x + layout.location.x;
@@ -84,7 +98,21 @@ pub fn draw_layout_tree<R: RendererBackend>(
                 }
             }
 
-            renderer.draw_text(abs_x, abs_y + font_size, &txt.text, font_size, color);
+            if let Some(cache) = text_layouts.and_then(|m| m.get(&styled_node.node_id)) {
+                let lines = cache
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .map(|(line_index, line)| TextDrawLine {
+                        x: abs_x,
+                        baseline_y: abs_y + (line_index as f32 * cache.line_height) + font_size,
+                        text: line.text.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                renderer.draw_text_layout(&lines, font_size, color);
+            } else {
+                renderer.draw_text(abs_x, abs_y + font_size, &txt.text, font_size, color);
+            }
         }
 
         if let Ok(children) = layout_tree.children(layout_node_id) {

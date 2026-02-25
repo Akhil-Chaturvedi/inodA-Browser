@@ -17,7 +17,7 @@ use markup5ever::interface::tree_builder::{
 use markup5ever::interface::{Attribute, QualName};
 use markup5ever::{local_name, LocalName, Namespace};
 
-use crate::dom::{Document, ElementData, Node, NodeId};
+use crate::dom::{Document, ElementData, Node, NodeId, TextData};
 
 /// Wraps a `Document` in a `RefCell` so that `TreeSink` (which takes `&self`)
 /// can mutate the arena.
@@ -85,6 +85,7 @@ impl TreeSink for DocumentBuilder {
             tag_name,
             attributes,
             children: Vec::new(),
+            parent: None,
         });
         doc.add_node(node)
     }
@@ -92,12 +93,12 @@ impl TreeSink for DocumentBuilder {
     fn create_comment(&self, _text: StrTendril) -> NodeId {
         // Store comments as empty text nodes (ignored during layout/render).
         let mut doc = self.doc.borrow_mut();
-        doc.add_node(Node::Text(String::new()))
+        doc.add_node(Node::Text(TextData { text: String::new(), parent: None }))
     }
 
     fn create_pi(&self, _target: StrTendril, _data: StrTendril) -> NodeId {
         let mut doc = self.doc.borrow_mut();
-        doc.add_node(Node::Text(String::new()))
+        doc.add_node(Node::Text(TextData { text: String::new(), parent: None }))
     }
 
     fn append(&self, parent: &NodeId, child: NodeOrText<NodeId>) {
@@ -116,19 +117,19 @@ impl TreeSink for DocumentBuilder {
                 // Check if we should merge with the last child if it is also text
                 let children_slice: Option<Vec<NodeId>> = match doc.nodes.get(*parent) {
                     Some(Node::Element(d)) => Some(d.children.clone()),
-                    Some(Node::Root(c)) => Some(c.clone()),
+                    Some(Node::Root(c)) => Some(c.children.clone()),
                     _ => None,
                 };
                 if let Some(children) = children_slice {
                     if let Some(last_child_id) = children.last().copied() {
                         if let Some(Node::Text(existing)) = doc.nodes.get_mut(last_child_id) {
-                            existing.push_str(&text_str);
+                            existing.text.push_str(&text_str);
                             return;
                         }
                     }
                 }
 
-                let id = doc.add_node(Node::Text(text_str));
+                let id = doc.add_node(Node::Text(TextData { text: text_str, parent: None }));
                 doc.append_child(*parent, id);
             }
         }
@@ -175,27 +176,30 @@ impl TreeSink for DocumentBuilder {
             NodeOrText::AppendText(text) => {
                 let text_str = text.to_string();
                 if text_str.trim().is_empty() { return; }
-                doc.add_node(Node::Text(text_str))
+                doc.add_node(Node::Text(TextData { text: text_str, parent: None }))
             }
         };
 
-        // O(1) parent lookup via parent_map
-        let parent_id = match doc.parent_map.get(&sibling_id).copied() {
+        let parent_id = match doc.parent_of(sibling_id) {
             Some(pid) => pid,
             None => return,
         };
 
+        doc.append_child(parent_id, new_id);
+
         if let Some(parent) = doc.nodes.get_mut(parent_id) {
             let children = match parent {
                 Node::Element(d) => &mut d.children,
-                Node::Root(c) => c,
+                Node::Root(c) => &mut c.children,
                 _ => return,
             };
+            if let Some(inserted_pos) = children.iter().position(|id| *id == new_id) {
+                children.remove(inserted_pos);
+            }
             if let Some(pos) = children.iter().position(|id| *id == sibling_id) {
                 children.insert(pos, new_id);
             }
         }
-        doc.parent_map.insert(new_id, parent_id);
     }
 
     fn add_attrs_if_missing(&self, target: &NodeId, attrs: Vec<Attribute>) {
@@ -214,8 +218,7 @@ impl TreeSink for DocumentBuilder {
         let target_id = *target;
         let mut doc = self.doc.borrow_mut();
 
-        // O(1) parent lookup via parent_map
-        if let Some(parent_id) = doc.parent_map.get(&target_id).copied() {
+        if let Some(parent_id) = doc.parent_of(target_id) {
             doc.remove_child(parent_id, target_id);
         }
     }
@@ -224,21 +227,17 @@ impl TreeSink for DocumentBuilder {
         let mut doc = self.doc.borrow_mut();
         let children: Vec<NodeId> = match doc.nodes.get(*node) {
             Some(Node::Element(d)) => d.children.clone(),
-            Some(Node::Root(c)) => c.clone(),
+            Some(Node::Root(c)) => c.children.clone(),
             _ => return,
         };
 
         // Clear old parent's children
         match doc.nodes.get_mut(*node) {
             Some(Node::Element(d)) => d.children.clear(),
-            Some(Node::Root(c)) => c.clear(),
+            Some(Node::Root(c)) => c.children.clear(),
             _ => return,
         }
 
-        // Remove old parent_map entries and append to new parent
-        for child_id in &children {
-            doc.parent_map.remove(child_id);
-        }
         for child_id in children {
             doc.append_child(*new_parent, child_id);
         }
@@ -261,7 +260,7 @@ fn extract_style_texts(doc: &mut Document) {
         if let Some(children) = doc.children_of(style_id).map(|c| c.to_vec()) {
             for child_id in children {
                 if let Some(Node::Text(txt)) = doc.nodes.get(child_id) {
-                    style_text.push_str(txt);
+                    style_text.push_str(&txt.text);
                 }
             }
         }

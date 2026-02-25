@@ -2,7 +2,7 @@
 //!
 //! Parses CSS text into a `StyleSheet` of rules with pre-parsed `ComplexSelector`
 //! ASTs. Matches selectors against DOM elements using pre-computed specificity
-//! and the O(1) parent map for complex combinators (`>`, ` `).
+//! and O(1) in-node parent pointers for complex combinators (`>`, ` `).
 //!
 //! Property names are interned as `string_cache::DefaultAtom` to minimize
 //! memory allocations during style tree construction. Supports compound
@@ -81,24 +81,37 @@ fn parse_selector_list(raw: &str) -> Vec<ComplexSelector> {
 }
 
 fn parse_complex_selector(raw: &str) -> ComplexSelector {
-    let mut s = raw.trim().to_string();
-    while s.contains(" > ") { s = s.replace(" > ", ">"); }
-    while s.contains("> ") { s = s.replace("> ", ">"); }
-    while s.contains(" >") { s = s.replace(" >", ">"); }
-    
-    let tokens = s.split_whitespace();
-    let mut list = Vec::new();
-    
-    for token in tokens {
-        let pieces: Vec<&str> = token.split('>').collect();
-        for (i, piece) in pieces.iter().enumerate() {
-            if i == 0 {
-                list.push((Combinator::Descendant, piece.to_string()));
-            } else {
-                list.push((Combinator::Child, piece.to_string()));
-            }
+    let mut list: Vec<(Combinator, String)> = Vec::new();
+    let mut current = String::new();
+    let mut next_combinator = Combinator::Descendant;
+
+    let push_current = |list: &mut Vec<(Combinator, String)>, current: &mut String, comb: Combinator| {
+        let trimmed = current.trim();
+        if !trimmed.is_empty() {
+            list.push((comb, trimmed.to_string()));
+            current.clear();
         }
+    };
+
+    for ch in raw.trim().chars() {
+        if ch == '>' {
+            push_current(&mut list, &mut current, next_combinator.clone());
+            next_combinator = Combinator::Child;
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            push_current(&mut list, &mut current, next_combinator.clone());
+            if next_combinator != Combinator::Child {
+                next_combinator = Combinator::Descendant;
+            }
+            continue;
+        }
+
+        current.push(ch);
     }
+
+    push_current(&mut list, &mut current, next_combinator);
     
     if list.is_empty() {
          return ComplexSelector { last: parse_compound_selector(""), ancestors: vec![], specificity: (0,0,0) };
@@ -383,7 +396,7 @@ fn build_styled_node(
                 children_ids = data.children.clone();
             }
             crate::dom::Node::Root(kids) => {
-                children_ids = kids.clone();
+                children_ids = kids.children.clone();
             }
             crate::dom::Node::Text(_) => {}
         }
@@ -470,24 +483,29 @@ fn parse_rule<'i, 't>(parser: &mut Parser<'i, 't>) -> Result<Option<StyleRule>, 
                 let name_str = name; // string_cache interning input string
                 if name_str == "margin" || name_str == "padding" {
                     let parts: Vec<&str> = value_trimmed.split_whitespace().collect();
+                    let (top, right, bottom, left) = if name_str == "margin" {
+                        ("margin-top", "margin-right", "margin-bottom", "margin-left")
+                    } else {
+                        ("padding-top", "padding-right", "padding-bottom", "padding-left")
+                    };
                     match parts.len() {
                         1 => {
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-top", name_str)), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-right", name_str)), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-bottom", name_str)), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-left", name_str)), value: parts[0].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(top), value: parts[0].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(right), value: parts[0].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(bottom), value: parts[0].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(left), value: parts[0].to_string() });
                         }
                         2 => {
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-top", name_str)), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-bottom", name_str)), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-left", name_str)), value: parts[1].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-right", name_str)), value: parts[1].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(top), value: parts[0].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(bottom), value: parts[0].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(left), value: parts[1].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(right), value: parts[1].to_string() });
                         }
                         4 => {
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-top", name_str)), value: parts[0].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-right", name_str)), value: parts[1].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-bottom", name_str)), value: parts[2].to_string() });
-                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(format!("{}-left", name_str)), value: parts[3].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(top), value: parts[0].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(right), value: parts[1].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(bottom), value: parts[2].to_string() });
+                            declarations.push(Declaration { name: string_cache::DefaultAtom::from(left), value: parts[3].to_string() });
                         }
                         _ => {
                             declarations.push(Declaration { name: string_cache::DefaultAtom::from(name_str), value });

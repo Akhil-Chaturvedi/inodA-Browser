@@ -2,14 +2,14 @@
 //!
 //! Parses HTML into an arena-based DOM with O(1) parent traversing, applies
 //! CSS with specificity and combinator support, computes Flexbox/Grid layout
-//! via Taffy, renders to a femtovg canvas, and exposes a native object-based
+//! via Taffy, renders through an abstract backend trait, and exposes a native object-based
 //! DOM API through an embedded QuickJS runtime.
 //!
 //! The engine leverages string interning for tag names and CSS property names
 //! to minimize memory allocations in resource-constrained environments.
 //!
 //! This crate is a library. The host application must provide a window,
-//! OpenGL context, event loop, and font registration.
+//! event loop, and graphics backend implementation.
 
 pub mod dom;
 pub mod html;
@@ -17,6 +17,11 @@ pub mod css;
 pub mod layout;
 pub mod render;
 pub mod js;
+
+
+pub trait ResourceLoader {
+    fn fetch(&self, url: &str) -> Vec<u8>;
+}
 
 #[cfg(test)]
 mod tests {
@@ -34,8 +39,7 @@ mod tests {
         taffy::print_tree(&layout_tree, root_node);
 
         // Test Renderer Bridge Compile
-        // Note: actually executing femtovg requires an OpenGL/WebGL context.
-        // For testing the bridge algorithm itself without a Window, we just verify
+        // For testing the bridge algorithm itself without a concrete backend, we just verify
         // that the layout computation succeeded. Actual pixel rendering will be
         // done in the application binary holding the Window.
 
@@ -61,6 +65,9 @@ mod tests {
         // Test querySelector -- also returns a NodeHandle with tagName
         let result3 = engine.execute_script("document.querySelector('#test-id').tagName");
         assert_eq!(result3, "p");
+
+        let identity = engine.execute_script("document.getElementById('test-id') === document.getElementById('test-id')");
+        assert_eq!(identity, "true");
 
         // Test NodeHandle getAttribute / setAttribute
         let _ = engine.execute_script("var p = document.getElementById('test-id'); p.setAttribute('class', 'greeting');");

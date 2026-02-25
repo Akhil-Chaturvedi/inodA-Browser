@@ -76,12 +76,14 @@ impl<'js> JsClass<'js> for NodeHandle {
 pub struct NodeHandleWithTag {
     handle: NodeHandle,
     tag_name: String,
+    node_key: String,
 }
 
 impl<'js> rquickjs::IntoJs<'js> for NodeHandleWithTag {
     fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
         let cls = rquickjs::Class::instance(ctx.clone(), self.handle)?;
         cls.set("tagName", self.tag_name)?;
+        cls.set("__nodeKey", self.node_key)?;
         cls.into_js(ctx)
     }
 }
@@ -207,7 +209,7 @@ impl JsEngine {
             // --- document object ---
             let document_obj = rquickjs::Object::new(ctx.clone()).unwrap();
 
-            // getElementById: returns a NodeHandle JS object or null
+            // Native lookup helpers; wrapped below with JS-side identity cache
             let get_by_id_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
                 move |id: String| -> Option<NodeHandleWithTag> {
@@ -218,6 +220,7 @@ impl JsEngine {
                                 return Some(NodeHandleWithTag {
                                     handle: NodeHandle::from_node_id(node_id),
                                     tag_name: data.tag_name.to_string(),
+                                    node_key: format!("{}:{}", node_id.into_raw_parts().0, node_id.into_raw_parts().1),
                                 });
                             }
                         }
@@ -226,7 +229,7 @@ impl JsEngine {
                 }
             }).unwrap();
 
-            document_obj.set("getElementById", get_by_id_func).unwrap();
+            document_obj.set("_getElementByIdRaw", get_by_id_func).unwrap();
 
             // querySelector: returns a NodeHandle JS object or null
             let query_selector_func = rquickjs::Function::new(ctx.clone(), {
@@ -244,6 +247,7 @@ impl JsEngine {
                                 return Some(NodeHandleWithTag {
                                     handle: NodeHandle::from_node_id(node_id),
                                     tag_name: data.tag_name.to_string(),
+                                    node_key: format!("{}:{}", node_id.into_raw_parts().0, node_id.into_raw_parts().1),
                                 });
                             }
                         }
@@ -252,7 +256,7 @@ impl JsEngine {
                 }
             }).unwrap();
             
-            document_obj.set("querySelector", query_selector_func).unwrap();
+            document_obj.set("_querySelectorRaw", query_selector_func).unwrap();
 
             let add_event_listener_func = rquickjs::Function::new(ctx.clone(), move |event: String, _cb: rquickjs::Function| {
                 println!("[JS addEventListener] Registered event: {}", event);
@@ -270,6 +274,7 @@ impl JsEngine {
                         tag_name: markup5ever::LocalName::from(tag_name.as_str()),
                         attributes: Vec::new(),
                         children: Vec::new(),
+                        parent: None,
                     });
                     let index = doc.add_node(node);
                     drop(doc);
@@ -277,10 +282,11 @@ impl JsEngine {
                     NodeHandleWithTag {
                         handle: NodeHandle::from_node_id(index),
                         tag_name: tag_name_clone,
+                        node_key: format!("{}:{}", index.into_raw_parts().0, index.into_raw_parts().1),
                     }
                 }
             }).unwrap();
-            document_obj.set("createElement", create_element_func).unwrap();
+            document_obj.set("_createElementRaw", create_element_func).unwrap();
 
             // appendChild: accepts two NodeHandle objects (no string parsing)
             let append_child_func = rquickjs::Function::new(ctx.clone(), {
@@ -295,6 +301,31 @@ impl JsEngine {
             document_obj.set("appendChild", append_child_func).unwrap();
 
             globals.set("document", document_obj).unwrap();
+
+            let _: () = ctx.eval(r#"
+                document.__nodeCache = Object.create(null);
+                document.getElementById = function(id) {
+                    const node = this._getElementByIdRaw(id);
+                    if (node === null) return null;
+                    const key = node.__nodeKey;
+                    if (this.__nodeCache[key]) return this.__nodeCache[key];
+                    this.__nodeCache[key] = node;
+                    return node;
+                };
+                document.querySelector = function(selector) {
+                    const node = this._querySelectorRaw(selector);
+                    if (node === null) return null;
+                    const key = node.__nodeKey;
+                    if (this.__nodeCache[key]) return this.__nodeCache[key];
+                    this.__nodeCache[key] = node;
+                    return node;
+                };
+                document.createElement = function(tag) {
+                    const node = this._createElementRaw(tag);
+                    this.__nodeCache[node.__nodeKey] = node;
+                    return node;
+                };
+            "#).unwrap();
 
             // --- setTimeout with Persistent<Function> storage ---
             let set_timeout_func = rquickjs::Function::new(ctx.clone(), {
@@ -357,6 +388,8 @@ impl JsEngine {
                         i.to_string()
                     } else if let Ok(f) = result.get::<f64>() {
                         f.to_string()
+                    } else if let Ok(b) = result.get::<bool>() {
+                        b.to_string()
                     } else if result.is_undefined() {
                         "undefined".to_string()
                     } else if result.is_null() {

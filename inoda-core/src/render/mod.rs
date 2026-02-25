@@ -1,19 +1,28 @@
 //! Rendering module.
 //!
 //! Walks the Taffy layout tree alongside the `StyledNode` tree and issues
-//! femtovg draw calls for backgrounds, borders, and text. Requires the host
-//! application to provide an OpenGL context and register fonts before text
-//! will render.
-//!
-//! Color parsing: 5 named colors (red, green, blue, black, white) and
-//! 6-digit hex (#rrggbb). No rgb(), rgba(), hsl(), or alpha support.
+//! draw commands to an abstract renderer backend. `inoda-core` does not
+//! depend on OpenGL APIs; platform binaries can implement this trait using
+//! tiny-skia, LVGL, or any other raster target.
 
 use crate::dom::StyledNode;
-use femtovg::{Color, Paint, Path, Canvas, renderer::Renderer};
 use taffy::TaffyTree;
 
-pub fn draw_layout_tree<T: Renderer>(
-    canvas: &mut Canvas<T>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+pub trait RendererBackend {
+    fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color);
+    fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32, line_width: f32, color: Color);
+    fn draw_text(&mut self, x: f32, y: f32, text: &str, size: f32, color: Color);
+}
+
+pub fn draw_layout_tree<R: RendererBackend>(
+    renderer: &mut R,
     document: &crate::dom::Document,
     layout_tree: &TaffyTree,
     styled_node: &StyledNode,
@@ -25,84 +34,58 @@ pub fn draw_layout_tree<T: Renderer>(
         let abs_x = offset_x + layout.location.x;
         let abs_y = offset_y + layout.location.y;
 
-        // Draw Background
         if let Some((_, bg_color_str)) = styled_node.specified_values.iter().find(|(k, _)| &**k == "background-color") {
             if let Some(color) = parse_color(bg_color_str) {
-                let mut path = Path::new();
-                path.rect(abs_x, abs_y, layout.size.width, layout.size.height);
-                
-                let paint = Paint::color(color);
-                canvas.fill_path(&path, &paint);
+                renderer.fill_rect(abs_x, abs_y, layout.size.width, layout.size.height, color);
             }
         }
 
-        // Draw Border
         if let Some((_, border_color_str)) = styled_node.specified_values.iter().find(|(k, _)| &**k == "border-color") {
              if let Some(color) = parse_color(border_color_str) {
-                let mut path = Path::new();
-                path.rect(abs_x, abs_y, layout.size.width, layout.size.height);
-                
-                let mut paint = Paint::color(color);
-                paint.set_line_width(1.0); // Simplified default border width
-                canvas.stroke_path(&path, &paint);
+                renderer.stroke_rect(abs_x, abs_y, layout.size.width, layout.size.height, 1.0, color);
              }
         }
 
-        // Draw Text
-        let mut is_text = false;
-        let mut text_content = String::new();
-        if let Some(node) = document.nodes.get(styled_node.node_id) {
-            if let crate::dom::Node::Text(txt) = node {
-                is_text = true;
-                text_content = txt.clone();
-            }
-        }
-
-        if is_text {
-            let mut paint = Paint::color(Color::rgb(0, 0, 0)); // Default black
+        if let Some(crate::dom::Node::Text(txt)) = document.nodes.get(styled_node.node_id) {
+            let mut color = Color { r: 0, g: 0, b: 0 };
             if let Some((_, color_str)) = styled_node.specified_values.iter().find(|(k, _)| &**k == "color") {
-                 if let Some(color) = parse_color(color_str) {
-                      paint = Paint::color(color);
-                 }
-            }
-            
-            paint.set_font_size(16.0);
-            if let Some((_, size_str)) = styled_node.specified_values.iter().find(|(k, _)| &**k == "font-size") {
-                if let Ok(size) = size_str.trim_end_matches("px").parse::<f32>() {
-                     paint.set_font_size(size);
+                if let Some(parsed) = parse_color(color_str) {
+                    color = parsed;
                 }
             }
-            // Render text. In an actual viewport app, we would load fonts into Canvas first to provide FontId.
-            // But this will silently skip or render default if context exists.
-            let _ = canvas.fill_text(abs_x, abs_y + paint.font_size(), &text_content, &paint);
+
+            let mut font_size = 16.0;
+            if let Some((_, size_str)) = styled_node.specified_values.iter().find(|(k, _)| &**k == "font-size") {
+                if let Ok(size) = size_str.trim_end_matches("px").parse::<f32>() {
+                    font_size = size;
+                }
+            }
+
+            renderer.draw_text(abs_x, abs_y + font_size, &txt.text, font_size, color);
         }
 
-        // Recursively draw children
-        // Taffy layout children map 1:1 to StyledNode children in our current bridge architecture
         if let Ok(children) = layout_tree.children(layout_node_id) {
             for (i, child_layout_id) in children.into_iter().enumerate() {
                  if let Some(child_style) = styled_node.children.get(i) {
-                     draw_layout_tree(canvas, document, layout_tree, child_style, child_layout_id, abs_x, abs_y);
+                     draw_layout_tree(renderer, document, layout_tree, child_style, child_layout_id, abs_x, abs_y);
                  }
             }
         }
     }
 }
 
-// Basic CSS color string to femtovg::Color parser
 fn parse_color(val: &str) -> Option<Color> {
     match val.trim() {
-        "red" => Some(Color::rgb(255, 0, 0)),
-        "green" => Some(Color::rgb(0, 255, 0)),
-        "blue" => Some(Color::rgb(0, 0, 255)),
-        "black" => Some(Color::rgb(0, 0, 0)),
-        "white" => Some(Color::rgb(255, 255, 255)),
-        // Simple hex fallback
+        "red" => Some(Color { r: 255, g: 0, b: 0 }),
+        "green" => Some(Color { r: 0, g: 255, b: 0 }),
+        "blue" => Some(Color { r: 0, g: 0, b: 255 }),
+        "black" => Some(Color { r: 0, g: 0, b: 0 }),
+        "white" => Some(Color { r: 255, g: 255, b: 255 }),
         hex if hex.starts_with('#') && hex.len() == 7 => {
             let r = u8::from_str_radix(&hex[1..3], 16).ok()?;
             let g = u8::from_str_radix(&hex[3..5], 16).ok()?;
             let b = u8::from_str_radix(&hex[5..7], 16).ok()?;
-            Some(Color::rgb(r, g, b))
+            Some(Color { r, g, b })
         }
         _ => None,
     }

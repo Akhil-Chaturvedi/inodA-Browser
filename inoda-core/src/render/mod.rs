@@ -126,7 +126,6 @@ pub fn draw_layout_tree<R: RendererBackend>(
                         child_layout_id,
                         abs_x,
                         abs_y,
-                        text_layouts,
                     );
                 }
             }

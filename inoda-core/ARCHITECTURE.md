@@ -102,7 +102,7 @@ Selectors are scored as `(id_count, class_count, tag_count)`. Matched rules are 
 
 ## Text measurement
 
-Text nodes are inserted into Taffy as leaf nodes with a measurement context. During `compute_layout_with_measure`, text is measured through `cosmic-text` (`Shaping::Advanced`) with width-constrained wrapping. The measurement pass also records per-node line layouts for render-time reuse.
+Text nodes are inserted into Taffy as leaf nodes with a measurement context. During `compute_layout_with_measure`, text uses a fixed-width monospace approximation (`char_width ~= font_size * 0.55`) and wraps on whitespace boundaries with long-token fallback. This improves line breaking but still does not use real font shaping/kerning.
 
 ## Thread safety
 

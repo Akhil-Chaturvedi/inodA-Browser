@@ -58,7 +58,7 @@ Implements `html5ever::TreeSink` directly on a `DocumentBuilder` wrapper. HTML t
 
 ### layout
 
-Walks the `StyledNode` tree and builds a parallel `TaffyTree<TextMeasureContext>`. Text nodes are measured with `cosmic-text` shaping (`Shaping::Advanced`) and width-constrained wrapping, and layout returns a `TextLayoutCache` used during rendering.
+Walks the `StyledNode` tree and builds a parallel `TaffyTree<TextMeasureContext>`. Text nodes become leaf nodes measured by a fixed-width approximation (`char_width ~= font_size * 0.55`) with whitespace-aware wrapping and long-token fallback.
 
 Supported CSS properties mapped to Taffy:
 - `display`: flex, grid, block, none (inline/inline-block are recognized but not yet laid out differently)
@@ -74,7 +74,7 @@ Properties not yet wired: `margin-*`, `padding-*`, `border-*`, `align-items`, `j
 Recursively walks the Taffy layout tree alongside the `StyledNode` tree and issues backend draw calls:
 - Background rectangles (`background-color`)
 - Border strokes (`border-color`, always 1px, no per-side control)
-- Text via precomputed `TextLayoutCache` lines and `RendererBackend::draw_text_layout()` (defaulting to `draw_text()`)
+- Text via `RendererBackend::draw_text()` using inherited `color` and `font-size`
 
 Color parsing handles the named colors `red`, `green`, `blue`, `black`, `white` and 6-digit hex (`#rrggbb`). No `rgb()`, `rgba()`, `hsl()`, shorthand hex, or alpha support.
 
@@ -129,7 +129,7 @@ This list is not exhaustive. The engine is a working skeleton, not a production 
 - No `@media`, `@import`, `@keyframes`, CSS variables, or `calc()`.
 - Selector matching supports combinators (`>`, ` `) but not `+`, `~`, attribute selectors, or pseudo-classes with arguments.
 - `addEventListener` logs the event name but never dispatches events.
-- Rendering still draws text through backend string APIs by default (not direct glyph raster from cosmic shaping yet).
+- Text measurement uses a monospace approximation and space-aware wrapping; exact glyph metrics are backend-specific.
 - `setTimeout` fires callbacks only when the host calls `pump()`. There is no background thread or async runtime.
 - Viewport units (`vw`, `vh`) are resolved to absolute pixels at tree construction time. Resizing the window requires rebuilding the layout tree.
 

@@ -36,8 +36,7 @@ mod tests {
         );
         let styled_tree = css::compute_styles(&doc, &stylesheet);
 
-        let (layout_tree, root_node, _text_layouts) =
-            layout::compute_layout(&doc, &styled_tree, 320.0, 240.0);
+        let (layout_tree, root_node) = layout::compute_layout(&doc, &styled_tree, 320.0, 240.0);
         taffy::print_tree(&layout_tree, root_node);
 
         // Test Renderer Bridge Compile

@@ -224,17 +224,12 @@ fn match_compound_selector(
     compound: &CompoundSelector,
     tag_name: &markup5ever::LocalName,
     attributes: &[(markup5ever::LocalName, String)],
+    classes: &std::collections::HashSet<markup5ever::LocalName>,
 ) -> bool {
     if compound.parts.is_empty() {
         return false;
     }
 
-    let class_attr = attributes
-        .iter()
-        .find(|(k, _)| &**k == "class")
-        .map(|(_, v)| v.as_str())
-        .unwrap_or("");
-    let classes: Vec<&str> = class_attr.split_whitespace().collect();
     let id_attr = attributes
         .iter()
         .find(|(k, _)| &**k == "id")
@@ -248,7 +243,8 @@ fn match_compound_selector(
                 }
             }
             SimpleSelector::Class(c) => {
-                if !classes.contains(&c.as_str()) {
+                let atom = markup5ever::LocalName::from(c.as_str());
+                if !classes.contains(&atom) {
                     return false;
                 }
             }
@@ -276,7 +272,7 @@ fn match_complex_selector(
 ) -> bool {
     // Fast path: does the right-most part match the current element?
     if let Some(crate::dom::Node::Element(data)) = document.nodes.get(node_id) {
-        if !match_compound_selector(&complex.last, &data.tag_name, &data.attributes) {
+        if !match_compound_selector(&complex.last, &data.tag_name, &data.attributes, &data.classes) {
             return false;
         }
     } else {
@@ -300,6 +296,7 @@ fn match_complex_selector(
                         ancestor_compound,
                         &parent_data.tag_name,
                         &parent_data.attributes,
+                        &parent_data.classes,
                     ) {
                         matched = true;
                         break;
@@ -348,7 +345,12 @@ pub fn compute_styles(
         combined_sheet.rules.extend(inline_sheet.rules);
     }
 
-    build_styled_node(document, document.root_id, &combined_sheet, &[])
+    build_styled_node(
+        document,
+        document.root_id,
+        &combined_sheet,
+        &std::rc::Rc::new(Vec::new()),
+    )
 }
 
 #[inline]
@@ -369,11 +371,11 @@ fn build_styled_node(
     document: &crate::dom::Document,
     node_id: crate::dom::NodeId,
     stylesheet: &StyleSheet,
-    parent_styles: &[(string_cache::DefaultAtom, String)],
+    parent_styles: &std::rc::Rc<Vec<(string_cache::DefaultAtom, String)>>,
 ) -> crate::dom::StyledNode {
     let mut specified_values = Vec::new();
 
-    for (k, v) in parent_styles {
+    for (k, v) in parent_styles.iter() {
         if is_inheritable(k) {
             specified_values.push((k.clone(), v.clone()));
         }
@@ -423,23 +425,33 @@ fn build_styled_node(
                         }
                     }
                 }
-                children_ids = data.children.clone();
+                let mut child = document.first_child_of(node_id);
+                while let Some(c) = child {
+                    children_ids.push(c);
+                    child = document.next_sibling_of(c);
+                }
             }
-            crate::dom::Node::Root(kids) => {
-                children_ids = kids.children.clone();
+            crate::dom::Node::Root(_) => {
+                let mut child = document.first_child_of(node_id);
+                while let Some(c) = child {
+                    children_ids.push(c);
+                    child = document.next_sibling_of(c);
+                }
             }
             crate::dom::Node::Text(_) => {}
         }
     }
 
+    let specified_values_rc = std::rc::Rc::new(specified_values);
+
     let children = children_ids
         .into_iter()
-        .map(|id| build_styled_node(document, id, stylesheet, &specified_values))
+        .map(|id| build_styled_node(document, id, stylesheet, &specified_values_rc))
         .collect();
 
     crate::dom::StyledNode {
         node_id,
-        specified_values,
+        specified_values: specified_values_rc,
         children,
     }
 }

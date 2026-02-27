@@ -84,14 +84,35 @@ impl TreeSink for DocumentBuilder {
             .into_iter()
             .map(|a| (a.name.local, a.value.to_string()))
             .collect();
+        let mut classes = std::collections::HashSet::new();
+        let mut id_val = None;
+        for (k, v) in &attributes {
+            if &**k == "class" {
+                for c in v.split_whitespace() {
+                    classes.insert(LocalName::from(c));
+                }
+            } else if &**k == "id" {
+                id_val = Some(v.clone());
+            }
+        }
+
         let tag_name = name.local;
         let node = Node::Element(ElementData {
             tag_name,
             attributes,
-            children: Vec::new(),
+            classes,
             parent: None,
+            first_child: None,
+            last_child: None,
+            prev_sibling: None,
+            next_sibling: None,
         });
-        doc.add_node(node)
+        
+        let node_id = doc.add_node(node);
+        if let Some(id_str) = id_val {
+            doc.id_map.insert(id_str, node_id);
+        }
+        node_id
     }
 
     fn create_comment(&self, _text: StrTendril) -> NodeId {
@@ -100,6 +121,8 @@ impl TreeSink for DocumentBuilder {
         doc.add_node(Node::Text(TextData {
             text: String::new(),
             parent: None,
+            prev_sibling: None,
+            next_sibling: None,
         }))
     }
 
@@ -108,6 +131,8 @@ impl TreeSink for DocumentBuilder {
         doc.add_node(Node::Text(TextData {
             text: String::new(),
             parent: None,
+            prev_sibling: None,
+            next_sibling: None,
         }))
     }
 
@@ -119,24 +144,18 @@ impl TreeSink for DocumentBuilder {
             }
             NodeOrText::AppendText(text) => {
                 let text_str = text.to_string();
-                // Check if we should merge with the last child if it is also text
-                let children_slice: Option<Vec<NodeId>> = match doc.nodes.get(*parent) {
-                    Some(Node::Element(d)) => Some(d.children.clone()),
-                    Some(Node::Root(c)) => Some(c.children.clone()),
-                    _ => None,
-                };
-                if let Some(children) = children_slice {
-                    if let Some(last_child_id) = children.last().copied() {
-                        if let Some(Node::Text(existing)) = doc.nodes.get_mut(last_child_id) {
-                            existing.text.push_str(&text_str);
-                            return;
-                        }
+                if let Some(last_child_id) = doc.last_child_of(*parent) {
+                    if let Some(Node::Text(existing)) = doc.nodes.get_mut(last_child_id) {
+                        existing.text.push_str(&text_str);
+                        return;
                     }
                 }
 
                 let id = doc.add_node(Node::Text(TextData {
                     text: text_str,
                     parent: None,
+                    prev_sibling: None,
+                    next_sibling: None,
                 }));
                 doc.append_child(*parent, id);
             }
@@ -186,6 +205,8 @@ impl TreeSink for DocumentBuilder {
                 doc.add_node(Node::Text(TextData {
                     text: text_str,
                     parent: None,
+                    prev_sibling: None,
+                    next_sibling: None,
                 }))
             }
         };
@@ -197,17 +218,72 @@ impl TreeSink for DocumentBuilder {
 
         doc.append_child(parent_id, new_id);
 
+        // Intrusive shift to place new_id before sibling_id
+        let prev_sibling_of_new = doc.prev_sibling_of(new_id);
+        
         if let Some(parent) = doc.nodes.get_mut(parent_id) {
-            let children = match parent {
-                Node::Element(d) => &mut d.children,
-                Node::Root(c) => &mut c.children,
+            match parent {
+                Node::Element(d) => {
+                    if d.last_child == Some(new_id) {
+                        d.last_child = prev_sibling_of_new;
+                    }
+                },
+                Node::Root(c) => {
+                    if c.last_child == Some(new_id) {
+                        c.last_child = prev_sibling_of_new;
+                    }
+                },
                 _ => return,
-            };
-            if let Some(inserted_pos) = children.iter().position(|id| *id == new_id) {
-                children.remove(inserted_pos);
             }
-            if let Some(pos) = children.iter().position(|id| *id == sibling_id) {
-                children.insert(pos, new_id);
+        }
+        
+        let old_prev = doc.prev_sibling_of(sibling_id);
+        
+        // Remove new_id from its appending position (end)
+        let new_prev = doc.prev_sibling_of(new_id);
+        if let Some(p) = new_prev {
+            if let Some(n) = doc.nodes.get_mut(p) {
+                match n {
+                    Node::Element(d) => d.next_sibling = None,
+                    Node::Text(d) => d.next_sibling = None,
+                    _ => {}
+                }
+            }
+        }
+
+        // Insert new_id before sibling_id
+        if let Some(n) = doc.nodes.get_mut(new_id) {
+            match n {
+                Node::Element(d) => { d.next_sibling = Some(sibling_id); d.prev_sibling = old_prev; },
+                Node::Text(d) => { d.next_sibling = Some(sibling_id); d.prev_sibling = old_prev; },
+                _ => {}
+            }
+        }
+
+        if let Some(s) = doc.nodes.get_mut(sibling_id) {
+            match s {
+                Node::Element(d) => d.prev_sibling = Some(new_id),
+                Node::Text(d) => d.prev_sibling = Some(new_id),
+                _ => {}
+            }
+        }
+        
+        if let Some(p) = old_prev {
+            if let Some(n) = doc.nodes.get_mut(p) {
+                match n {
+                    Node::Element(d) => d.next_sibling = Some(new_id),
+                    Node::Text(d) => d.next_sibling = Some(new_id),
+                    _ => {}
+                }
+            }
+        } else {
+            // It's the new first child
+            if let Some(parent) = doc.nodes.get_mut(parent_id) {
+                match parent {
+                    Node::Element(d) => d.first_child = Some(new_id),
+                    Node::Root(c) => c.first_child = Some(new_id),
+                    _ => {}
+                }
             }
         }
     }
@@ -235,16 +311,18 @@ impl TreeSink for DocumentBuilder {
 
     fn reparent_children(&self, node: &NodeId, new_parent: &NodeId) {
         let mut doc = self.doc.borrow_mut();
-        let children: Vec<NodeId> = match doc.nodes.get(*node) {
-            Some(Node::Element(d)) => d.children.clone(),
-            Some(Node::Root(c)) => c.children.clone(),
-            _ => return,
-        };
+        
+        let mut children = Vec::new();
+        let mut child = doc.first_child_of(*node);
+        while let Some(c) = child {
+            children.push(c);
+            child = doc.next_sibling_of(c);
+        }
 
         // Clear old parent's children
         match doc.nodes.get_mut(*node) {
-            Some(Node::Element(d)) => d.children.clear(),
-            Some(Node::Root(c)) => c.children.clear(),
+            Some(Node::Element(d)) => { d.first_child = None; d.last_child = None; },
+            Some(Node::Root(c)) => { c.first_child = None; c.last_child = None; },
             _ => return,
         }
 
@@ -271,13 +349,15 @@ fn extract_style_texts(doc: &mut Document) {
 
     for style_id in style_element_ids {
         let mut style_text = String::new();
-        if let Some(children) = doc.children_of(style_id).map(|c| c.to_vec()) {
-            for child_id in children {
-                if let Some(Node::Text(txt)) = doc.nodes.get(child_id) {
-                    style_text.push_str(&txt.text);
-                }
+        
+        let mut child_id_opt = doc.first_child_of(style_id);
+        while let Some(child_id) = child_id_opt {
+            if let Some(Node::Text(txt)) = doc.nodes.get(child_id) {
+                style_text.push_str(&txt.text);
             }
+            child_id_opt = doc.next_sibling_of(child_id);
         }
+        
         if !style_text.is_empty() {
             doc.style_texts.push(style_text);
         }

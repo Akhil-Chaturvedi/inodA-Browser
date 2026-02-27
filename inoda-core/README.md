@@ -38,9 +38,9 @@ src/
 
 ### dom
 
-`generational_arena::Arena<Node>` indexed by `generational_arena::Index` (`NodeId`). No `Rc`, no `RefCell`. Nodes are either `Element(ElementData)`, `Text(TextData)`, or `Root(RootData)`. Each element/text node stores its `parent: Option<NodeId>` directly for $O(1)$ parent lookups. `ElementData.tag_name` and attribute keys use `markup5ever::LocalName` for string interning.
+`generational_arena::Arena<Node>` indexed by `generational_arena::Index` (`NodeId`). No `RefCell`. Nodes are either `Element(ElementData)`, `Text(TextData)`, or `Root(RootData)`. The DOM structures form an intrusive linked list directly allocating `first_child`, `next_sibling`, `prev_sibling`, and `parent` fields inside the structs for $O(1)$ traversals without re-allocating interior Vectors. `ElementData.tag_name` and attribute keys use `markup5ever::LocalName` for string interning.
 
-Generational indices allow $O(1)$ insertion and deletion without invalidating other handles. Previous versions used a flat `Vec<Node>` indexed by `usize`, which leaked memory on deletion and could not safely track parents.
+Generational indices allow $O(1)$ insertion and deletion without invalidating other handles. Previous versions used a flat `Vec<Node>` indexed by `usize`, which leaked memory on deletion and could not safely track parents. Nodes are queried in $O(1)$ time via a document-level `id_map`.
 
 ### html
 
@@ -49,16 +49,16 @@ Implements `html5ever::TreeSink` directly on a `DocumentBuilder` wrapper. HTML t
 ### css
 
 - Parses CSS text into a `StyleSheet` containing pre-parsed `ComplexSelector` ASTs.
-- Supports tag, class, ID, compound, and complex combinators (`>`, ` `).
+- Supports tag, class, ID, compound, and complex combinators (`>`, ` `). Class attribute subsets are stored in $O(1)$ hash maps on `ElementData`.
 - Computes specificity as `(id_count, class_count, tag_count)` at parse time.
-- Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent to child.
+- Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent to child via `Rc` memory sharing to avoid explosion memory costs cascading through sub-DOMs.
 - Expands `margin`, `padding` shorthands (1/2/4-value syntax) and maps `background` to `background-color`.
 - Uses `string_cache::DefaultAtom` for property names to minimize memory overhead during style resolution.
 - Inline `style=""` attributes are parsed natively via `cssparser`'s `DeclarationParser` trait.
 
 ### layout
 
-Walks the `StyledNode` tree and builds a parallel `TaffyTree<TextMeasureContext>`. Text nodes become leaf nodes measured by a fixed-width approximation (`char_width ~= font_size * 0.55`) with whitespace-aware wrapping and long-token fallback.
+Walks the `StyledNode` tree and builds a parallel `TaffyTree<TextMeasureContext>`. Text nodes become leaf nodes utilizing `cosmic-text` and a `TextLayoutCache` inside Taffy's contextual measurement system closures to produce accurate wrapping blocks bounding the element layouts prior to pixel rasterization execution.
 
 Supported CSS properties mapped to Taffy:
 - `display`: flex, grid, block, none (inline/inline-block are recognized but not yet laid out differently)
@@ -121,7 +121,7 @@ This list is not exhaustive. The engine is a working skeleton, not a production 
 
 - No networking, resource loading, or URL resolution.
 - No `<img>`, `<video>`, `<canvas>`, `<iframe>`, or form elements.
-- Inline formatting context is still incomplete. Text measurement uses a fixed-width approximation with whitespace-aware wrapping.
+- Inline formatting context is still incomplete regarding baseline alignment and specific float rules interactions.
 - Font loading and fallback are backend-specific and must be provided by the host.
 - `display: inline` and `inline-block` are parsed but laid out identically to block.
 - Layout properties `margin`, `padding`, `border-width`, `position`, `overflow`, `z-index`, `float` are not wired to Taffy.
@@ -129,7 +129,6 @@ This list is not exhaustive. The engine is a working skeleton, not a production 
 - No `@media`, `@import`, `@keyframes`, CSS variables, or `calc()`.
 - Selector matching supports combinators (`>`, ` `) but not `+`, `~`, attribute selectors, or pseudo-classes with arguments.
 - `addEventListener` logs the event name but never dispatches events.
-- Text measurement uses a monospace approximation and space-aware wrapping; exact glyph metrics are backend-specific.
 - `setTimeout` fires callbacks only when the host calls `pump()`. There is no background thread or async runtime.
 - Viewport units (`vw`, `vh`) are resolved to absolute pixels at tree construction time. Resizing the window requires rebuilding the layout tree.
 

@@ -180,10 +180,20 @@ impl JsEngine {
                         if let Some(pos) =
                             data.attributes.iter().position(|(k, _)| *k == local_attr)
                         {
-                            data.attributes[pos].1 = value;
+                            data.attributes[pos].1 = value.clone();
                         } else {
-                            data.attributes.push((local_attr, value));
+                            data.attributes.push((local_attr.clone(), value.clone()));
                         }
+                        
+                        if &*local_attr == "class" {
+                            data.classes.clear();
+                            for c in value.split_whitespace() {
+                                data.classes.insert(markup5ever::LocalName::from(c));
+                            }
+                        }
+                    }
+                    if attr == "id" {
+                        doc.id_map.insert(value.clone(), node_id);
                     }
                 }
             })
@@ -234,23 +244,17 @@ impl JsEngine {
                 let doc_ref = doc_ref.clone();
                 move |id: String| -> Option<NodeHandleWithTag> {
                     let doc = doc_ref.borrow();
-                    for (node_id, node) in doc.nodes.iter() {
-                        if let crate::dom::Node::Element(data) = node {
-                            if data
-                                .attributes
-                                .iter()
-                                .any(|(k, v)| &**k == "id" && v == &id)
-                            {
-                                return Some(NodeHandleWithTag {
-                                    handle: NodeHandle::from_node_id(node_id),
-                                    tag_name: data.tag_name.to_string(),
-                                    node_key: format!(
-                                        "{}:{}",
-                                        node_id.into_raw_parts().0,
-                                        node_id.into_raw_parts().1
-                                    ),
-                                });
-                            }
+                    if let Some(&node_id) = doc.id_map.get(&id) {
+                        if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
+                            return Some(NodeHandleWithTag {
+                                handle: NodeHandle::from_node_id(node_id),
+                                tag_name: data.tag_name.to_string(),
+                                node_key: format!(
+                                    "{}:{}",
+                                    node_id.into_raw_parts().0,
+                                    node_id.into_raw_parts().1
+                                ),
+                            });
                         }
                     }
                     None
@@ -322,8 +326,12 @@ impl JsEngine {
                     let node = crate::dom::Node::Element(crate::dom::ElementData {
                         tag_name: markup5ever::LocalName::from(tag_name.as_str()),
                         attributes: Vec::new(),
-                        children: Vec::new(),
+                        classes: std::collections::HashSet::new(),
                         parent: None,
+                        first_child: None,
+                        last_child: None,
+                        prev_sibling: None,
+                        next_sibling: None,
                     });
                     let index = doc.add_node(node);
                     drop(doc);
@@ -363,27 +371,14 @@ impl JsEngine {
             let _: () = ctx
                 .eval(
                     r#"
-                document.__nodeCache = Object.create(null);
                 document.getElementById = function(id) {
-                    const node = this._getElementByIdRaw(id);
-                    if (node === null) return null;
-                    const key = node.__nodeKey;
-                    if (this.__nodeCache[key]) return this.__nodeCache[key];
-                    this.__nodeCache[key] = node;
-                    return node;
+                    return this._getElementByIdRaw(id);
                 };
                 document.querySelector = function(selector) {
-                    const node = this._querySelectorRaw(selector);
-                    if (node === null) return null;
-                    const key = node.__nodeKey;
-                    if (this.__nodeCache[key]) return this.__nodeCache[key];
-                    this.__nodeCache[key] = node;
-                    return node;
+                    return this._querySelectorRaw(selector);
                 };
                 document.createElement = function(tag) {
-                    const node = this._createElementRaw(tag);
-                    this.__nodeCache[node.__nodeKey] = node;
-                    return node;
+                    return this._createElementRaw(tag);
                 };
             "#,
                 )

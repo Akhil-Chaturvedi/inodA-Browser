@@ -19,6 +19,8 @@ pub struct Document {
     pub root_id: NodeId,
     /// Raw CSS text extracted from `<style>` elements during parsing.
     pub style_texts: Vec<String>,
+    /// O(1) lookup map for `getElementById`.
+    pub id_map: std::collections::HashMap<String, NodeId>,
 }
 
 /// A handle into the arena. Generational indices prevent ABA problems.
@@ -35,26 +37,33 @@ pub enum Node {
 pub struct ElementData {
     pub tag_name: markup5ever::LocalName,
     pub attributes: Vec<(markup5ever::LocalName, String)>,
-    pub children: Vec<NodeId>,
+    pub classes: std::collections::HashSet<markup5ever::LocalName>,
     pub parent: Option<NodeId>,
+    pub first_child: Option<NodeId>,
+    pub last_child: Option<NodeId>,
+    pub prev_sibling: Option<NodeId>,
+    pub next_sibling: Option<NodeId>,
 }
 
 #[derive(Debug, Clone)]
 pub struct TextData {
     pub text: String,
     pub parent: Option<NodeId>,
+    pub prev_sibling: Option<NodeId>,
+    pub next_sibling: Option<NodeId>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RootData {
-    pub children: Vec<NodeId>,
+    pub first_child: Option<NodeId>,
+    pub last_child: Option<NodeId>,
 }
 
 /// A node mapped with its active computed CSS style properties.
 #[derive(Debug)]
 pub struct StyledNode {
     pub node_id: NodeId,
-    pub specified_values: Vec<(string_cache::DefaultAtom, String)>,
+    pub specified_values: std::rc::Rc<Vec<(string_cache::DefaultAtom, String)>>,
     pub children: Vec<StyledNode>,
 }
 
@@ -62,12 +71,14 @@ impl Default for Document {
     fn default() -> Self {
         let mut arena = Arena::new();
         let root_id = arena.insert(Node::Root(RootData {
-            children: Vec::new(),
+            first_child: None,
+            last_child: None,
         }));
         Document {
             nodes: arena,
             root_id,
             style_texts: Vec::new(),
+            id_map: std::collections::HashMap::new(),
         }
     }
 }
@@ -78,20 +89,32 @@ impl Document {
     }
 
     pub fn add_node(&mut self, node: Node) -> NodeId {
-        self.nodes.insert(node)
+        let id = self.nodes.insert(node);
+        if let Some(Node::Element(data)) = self.nodes.get(id) {
+            if let Some((_, id_val)) = data.attributes.iter().find(|(k, _)| &**k == "id") {
+                self.id_map.insert(id_val.clone(), id);
+            }
+        }
+        id
     }
 
     pub fn remove_node(&mut self, id: NodeId) -> Option<Node> {
+        // 1. Unlink from parent and siblings
         if let Some(parent_id) = self.parent_of(id) {
             self.remove_child(parent_id, id);
         }
 
-        let child_ids = self
-            .children_of(id)
-            .map(|children| children.to_vec())
-            .unwrap_or_default();
+        // 2. Remove id from id_map
+        if let Some(Node::Element(data)) = self.nodes.get(id) {
+            if let Some((_, id_val)) = data.attributes.iter().find(|(k, _)| &**k == "id") {
+                self.id_map.remove(id_val);
+            }
+        }
 
-        for child_id in child_ids {
+        // 3. Recursively remove children using intrusive list
+        let mut current_child = self.first_child_of(id);
+        while let Some(child_id) = current_child {
+            current_child = self.next_sibling_of(child_id);
             self.remove_node(child_id);
         }
 
@@ -103,27 +126,55 @@ impl Document {
             self.remove_child(old_parent, child_id);
         }
 
-        if let Some(parent) = self.nodes.get_mut(parent_id) {
-            match parent {
-                Node::Element(data) => data.children.push(child_id),
-                Node::Root(root) => root.children.push(child_id),
-                Node::Text(_) => return,
+        let old_last_child = match self.nodes.get_mut(parent_id) {
+            Some(Node::Element(data)) => {
+                let last = data.last_child;
+                if data.first_child.is_none() { data.first_child = Some(child_id); }
+                data.last_child = Some(child_id);
+                last
             }
-        }
+            Some(Node::Root(root)) => {
+                let last = root.last_child;
+                if root.first_child.is_none() { root.first_child = Some(child_id); }
+                root.last_child = Some(child_id);
+                last
+            }
+            _ => return,
+        };
 
+        if let Some(old_last) = old_last_child {
+            self.set_next_sibling(old_last, Some(child_id));
+        }
+        
+        self.set_prev_sibling(child_id, old_last_child);
+        self.set_next_sibling(child_id, None);
         self.set_parent(child_id, Some(parent_id));
     }
 
-    /// Remove child_id from the children list of parent_id.
     pub fn remove_child(&mut self, parent_id: NodeId, child_id: NodeId) {
+        let prev = self.prev_sibling_of(child_id);
+        let next = self.next_sibling_of(child_id);
+
         if let Some(parent) = self.nodes.get_mut(parent_id) {
             match parent {
-                Node::Element(data) => data.children.retain(|id| *id != child_id),
-                Node::Root(root) => root.children.retain(|id| *id != child_id),
+                Node::Element(data) => {
+                    if data.first_child == Some(child_id) { data.first_child = next; }
+                    if data.last_child == Some(child_id) { data.last_child = prev; }
+                }
+                Node::Root(root) => {
+                    if root.first_child == Some(child_id) { root.first_child = next; }
+                    if root.last_child == Some(child_id) { root.last_child = prev; }
+                }
                 Node::Text(_) => {}
             }
         }
+
+        if let Some(p) = prev { self.set_next_sibling(p, next); }
+        if let Some(n) = next { self.set_prev_sibling(n, prev); }
+
         self.set_parent(child_id, None);
+        self.set_prev_sibling(child_id, None);
+        self.set_next_sibling(child_id, None);
     }
 
     fn set_parent(&mut self, node_id: NodeId, parent: Option<NodeId>) {
@@ -145,12 +196,59 @@ impl Document {
         }
     }
 
-    /// Get the children of a node, if it has any.
-    pub fn children_of(&self, node_id: NodeId) -> Option<&[NodeId]> {
+    /// Get the first child of a node via O(1) in-node lookup.
+    pub fn first_child_of(&self, node_id: NodeId) -> Option<NodeId> {
         match self.nodes.get(node_id)? {
-            Node::Element(data) => Some(&data.children),
-            Node::Root(root) => Some(&root.children),
+            Node::Element(data) => data.first_child,
+            Node::Root(data) => data.first_child,
             Node::Text(_) => None,
+        }
+    }
+
+    /// Get the last child of a node.
+    pub fn last_child_of(&self, node_id: NodeId) -> Option<NodeId> {
+        match self.nodes.get(node_id)? {
+            Node::Element(data) => data.last_child,
+            Node::Root(data) => data.last_child,
+            Node::Text(_) => None,
+        }
+    }
+
+    /// Get the next sibling of a node.
+    pub fn next_sibling_of(&self, node_id: NodeId) -> Option<NodeId> {
+        match self.nodes.get(node_id)? {
+            Node::Element(data) => data.next_sibling,
+            Node::Text(data) => data.next_sibling,
+            Node::Root(_) => None,
+        }
+    }
+
+    /// Get the previous sibling of a node.
+    pub fn prev_sibling_of(&self, node_id: NodeId) -> Option<NodeId> {
+        match self.nodes.get(node_id)? {
+            Node::Element(data) => data.prev_sibling,
+            Node::Text(data) => data.prev_sibling,
+            Node::Root(_) => None,
+        }
+    }
+
+    fn set_next_sibling(&mut self, node_id: NodeId, next: Option<NodeId>) {
+        if let Some(node) = self.nodes.get_mut(node_id) {
+            match node {
+                Node::Element(data) => data.next_sibling = next,
+                Node::Text(data) => data.next_sibling = next,
+                Node::Root(_) => {}
+            }
+        }
+    }
+
+    fn set_prev_sibling(&mut self, node_id: NodeId, prev: Option<NodeId>) {
+        if let Some(node) = self.nodes.get_mut(node_id) {
+            match node {
+                Node::Element(data) => data.prev_sibling = prev,
+                Node::Text(data) => data.prev_sibling = prev,
+                Node::Root(_) => {}
+            }
         }
     }
 }

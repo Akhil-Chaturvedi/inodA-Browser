@@ -26,7 +26,7 @@ See [inoda-core/ARCHITECTURE.md](inoda-core/ARCHITECTURE.md) for data flow, data
 
 ## Current state
 
-The engine parses HTML pages with embedded CSS, builds an arena-based DOM with O(1) parent traversing, and implements CSS selectors (tag, class, ID, compound, and complex combinators). It resolves Flexbox/Grid layout and renders backgrounds, borders, and text to a canvas. A JavaScript bridge provides a native `NodeHandle` class for DOM manipulation (`getElementById`, `querySelector`, `createElement`, `setAttribute`, `getAttribute`, `removeChild`) and a cooperative `setTimeout`.
+The engine parses HTML pages with embedded CSS, builds an intrusive linked list arena-based DOM with O(1) parent traversing and zero-allocation mutations, and implements $O(1)$ CSS matching (tag, class, ID, compound, and complex combinators). It resolves Flexbox/Grid layout and renders backgrounds, borders, and text to a canvas via `cosmic-text` and `fontdb`. A JavaScript bridge provides a native `NodeHandle` class for DOM manipulation (`getElementById` via $O(1)$ lookup mapping, `querySelector`, `createElement`, `setAttribute`, `getAttribute`, `removeChild`) and a cooperative `setTimeout`.
 
 The engine uses string interning (via `string_cache`) for tag names and CSS properties to minimize memory overhead. There is no networking, resource loading, or image support. The host application must provide a window or surface, an event loop, and a renderer backend implementation.
 

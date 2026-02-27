@@ -44,8 +44,12 @@ NodeId = generational_arena::Index  // type alias
 ElementData {
     tag_name: markup5ever::LocalName,   // interned
     attributes: Vec<(markup5ever::LocalName, String)>,
-    children: Vec<NodeId>,
-    parent: Option<NodeId>
+    classes: std::collections::HashSet<markup5ever::LocalName>,
+    parent: Option<NodeId>,
+    first_child: Option<NodeId>,
+    last_child: Option<NodeId>,
+    prev_sibling: Option<NodeId>,
+    next_sibling: Option<NodeId>
 }
 
 TextData {
@@ -54,18 +58,19 @@ TextData {
 }
 
 RootData {
-    children: Vec<NodeId>
+    first_child: Option<NodeId>,
+    last_child: Option<NodeId>
 }
 ```
 
-Generational indices provide O(1) insertion and deletion without index invalidation or ABA problems. Removed nodes do not leave dangling references. Previous versions used a flat `Vec<Node>` indexed by `usize`, which could not safely delete nodes.
+Generational indices provide O(1) insertion and deletion without index invalidation or ABA problems. Removed nodes do not leave dangling references. The DOM tree itself is wired via an intrusive linked list (`first_child`, `next_sibling`, etc.) which allows for zero-allocation mutations.
 
 ### StyledNode (dom/mod.rs)
 
 ```
 StyledNode {
     node_id: NodeId,                            // generational_arena::Index
-    specified_values: Vec<(string_cache::DefaultAtom, String)>, // computed CSS properties
+    specified_values: std::rc::Rc<Vec<(string_cache::DefaultAtom, String)>>, // shared computed CSS properties
     children: Vec<StyledNode>                   // mirrors DOM children
 }
 ```
@@ -102,7 +107,7 @@ Selectors are scored as `(id_count, class_count, tag_count)`. Matched rules are 
 
 ## Text measurement
 
-Text nodes are inserted into Taffy as leaf nodes with a measurement context. During `compute_layout_with_measure`, text uses a fixed-width monospace approximation (`char_width ~= font_size * 0.55`) and wraps on whitespace boundaries with long-token fallback. This improves line breaking but still does not use real font shaping/kerning.
+Text nodes are inserted into Taffy as leaf nodes with a measurement context. During `compute_layout_with_measure`, text uses `cosmic-text` and `fontdb` to perform actual text shaping and font metric calculation via a `TextLayoutCache`. This provides accurate glyph sizing and wrapping based on system or hosted fonts rather than approximations.
 
 ## Thread safety
 

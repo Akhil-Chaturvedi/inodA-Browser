@@ -47,7 +47,8 @@ pub fn compute_layout(
     styled_node: &StyledNode,
     viewport_width: f32,
     viewport_height: f32,
-) -> (TaffyTree<TextMeasureContext>, NodeId) {
+    font_system: &mut FontSystem,
+) -> (TaffyTree<TextMeasureContext>, NodeId, TextLayoutCache) {
     let mut tree: TaffyTree<TextMeasureContext> = TaffyTree::new();
     let root_taffy_node = build_taffy_node(
         &mut tree,
@@ -62,7 +63,7 @@ pub fn compute_layout(
         height: AvailableSpace::Definite(viewport_height),
     };
 
-    let font_system = RefCell::new(FontSystem::new());
+    let font_system = RefCell::new(font_system);
     let measured_text_nodes: RefCell<TextLayoutCache> = RefCell::new(HashMap::new());
 
     tree.compute_layout_with_measure(
@@ -87,13 +88,16 @@ pub fn compute_layout(
                 _ => "",
             };
 
-            let (measured_width, lines) =
-                measure_wrapped_text(text, width_constraint, ctx.font_size);
-
-            taffy::geometry::Size {
-                width: measured_width,
-                height: (lines as f32) * ctx.font_size * 1.2,
-            }
+            let mut sys = font_system.borrow_mut();
+            let text_layout = measure_text_with_cosmic(&mut sys, text, width_constraint, ctx.font_size);
+            
+            let size = taffy::geometry::Size {
+                width: text_layout.width,
+                height: text_layout.height,
+            };
+            
+            measured_text_nodes.borrow_mut().insert(ctx.node_id, text_layout);
+            size
         },
     )
     .unwrap();
@@ -145,53 +149,6 @@ fn measure_text_with_cosmic(
         width,
         height,
     }
-}
-
-fn measure_wrapped_text(text: &str, width_constraint: f32, font_size: f32) -> (f32, usize) {
-    let char_width = (font_size * 0.55).max(1.0);
-    let max_width = width_constraint.max(char_width);
-
-    if text.is_empty() {
-        return (0.0, 1);
-    }
-
-    let mut line_width: f32 = 0.0;
-    let mut max_line_width: f32 = 0.0;
-    let mut lines = 1usize;
-
-    for word in text.split_whitespace() {
-        let word_width = (word.chars().count() as f32) * char_width;
-        let sep_width = if line_width > 0.0 { char_width } else { 0.0 };
-
-        if line_width > 0.0 && line_width + sep_width + word_width <= max_width {
-            line_width += sep_width + word_width;
-            continue;
-        }
-
-        if line_width > 0.0 {
-            max_line_width = max_line_width.max(line_width);
-            lines += 1;
-            line_width = 0.0;
-        }
-
-        if word_width <= max_width {
-            line_width = word_width;
-            continue;
-        }
-
-        // Long token fallback: force-wrap by character to avoid overflow.
-        for _ in word.chars() {
-            if line_width + char_width > max_width && line_width > 0.0 {
-                max_line_width = max_line_width.max(line_width);
-                lines += 1;
-                line_width = 0.0;
-            }
-            line_width += char_width;
-        }
-    }
-
-    max_line_width = max_line_width.max(line_width);
-    (max_line_width.min(max_width), lines.max(1))
 }
 
 fn build_taffy_node(

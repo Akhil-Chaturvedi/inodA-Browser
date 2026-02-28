@@ -10,16 +10,15 @@ Early development. The engine covers enough of the web platform to parse simple 
 
 ## Dependencies
 
-| Crate              | Version | Purpose                                     |
 | Crate                | Version | Purpose                                        |
 |----------------------|---------|------------------------------------------------|
-| `html5gum`           | 0.5     | Zero-allocation HTML tokenizer                 |
+| `html5gum`           | 0.5     | Streaming HTML tokenizer                       |
 | `cssparser`          | 0.36    | Mozilla CSS tokenizer (same one Servo uses)    |
-| `cosmic-text`        | 0.12    | Font shaping + wrapped text measurement        |
+| `cosmic-text`        | 0.12    | Font shaping and wrapped text measurement      |
 | `taffy`              | 0.9     | Flexbox and CSS Grid layout algorithm          |
 | `rquickjs`           | 0.11    | QuickJS JavaScript engine bindings             |
 | `generational-arena` | 0.2     | Generational index arena for the DOM           |
-| `string_cache`       | 0.9     | Atom string interning (DefaultAtom, etc.)      |
+| `string_cache`       | 0.9     | Atom string interning for tag names and keys   |
 
 No other runtime dependencies.
 
@@ -29,36 +28,39 @@ No other runtime dependencies.
 src/
   lib.rs        -- crate root, re-exports modules, integration tests
   dom/mod.rs    -- generational arena DOM: Document, Node, ElementData, StyledNode
-  html/mod.rs   -- TreeSink implementation, streams HTML directly into arena
+  html/mod.rs   -- html5gum token loop, streams HTML into the arena
   css/mod.rs    -- CSS parser, specificity, inheritance, shorthand expansion, inline style parsing
-  layout/mod.rs -- StyledNode -> Taffy tree builder, dimension parsing
+  layout/mod.rs -- StyledNode -> Taffy tree builder, text buffer pre-population, dimension parsing
   render/mod.rs -- Taffy layout -> renderer backend draw calls (backgrounds, borders, text)
   js/mod.rs     -- QuickJS runtime with document.*, console.*, cooperative setTimeout
 ```
 
 ### dom
 
-`generational_arena::Arena<Node>` indexed by `generational_arena::Index` (`NodeId`). No `RefCell`. Nodes are either `Element(ElementData)`, `Text(TextData)`, or `Root(RootData)`. The DOM structures form an intrusive linked list directly allocating `first_child`, `next_sibling`, `prev_sibling`, and `parent` fields inside the structs for $O(1)$ traversals without re-allocating interior Vectors. `ElementData.tag_name` and attribute keys use `markup5ever::LocalName` for string interning.
+`generational_arena::Arena<Node>` indexed by `generational_arena::Index` (aliased as `NodeId`). Nodes are `Element(ElementData)`, `Text(TextData)`, or `Root(RootData)`. The tree is wired as an intrusive linked list: each node stores `first_child`, `last_child`, `next_sibling`, `prev_sibling`, and `parent` pointers directly, giving O(1) traversal and mutation without allocating child vectors.
 
-Generational indices allow $O(1)$ insertion and deletion without invalidating other handles. Previous versions used a flat `Vec<Node>` indexed by `usize`, which leaked memory on deletion and could not safely track parents. Nodes are queried in $O(1)$ time via a document-level `id_map`.
+Tag names and attribute keys are interned as `string_cache::DefaultAtom`. Element classes are stored in a `Vec<DefaultAtom>` (not a `HashSet`) to reduce per-element memory overhead on constrained devices. Node deletion is iterative (queue-based) rather than recursive to avoid stack overflow on deeply nested trees with small thread stacks.
+
+Documents maintain an `id_map: HashMap<String, NodeId>` for O(1) `getElementById` lookups.
 
 ### html
 
-Implements a purely custom byte-stream loop using `html5gum` token emitters. HTML tokens stream into the generational arena in a single allocation pass utilizing `std::str::from_utf8`. Implicit native HTML tag auto-closures (e.g. `<p>`, `<li>`) are boundary checked strictly during the parser's `StartTag` emissions. Extracts raw CSS text from `<style>` elements and stores it on `Document::style_texts`. Whitespace text nodes are preserved so inline spacing semantics are not lost.
+Streams `html5gum` tokens into the arena in a single pass. Each token is converted using `std::str::from_utf8` directly on the byte slices, avoiding intermediate `String` allocations. Implicit tag auto-closing rules are applied during the `StartTag` handler (e.g., a `<li>` closes an open `<li>` sibling, a `<p>` closes an open `<p>`). Extracts raw CSS text from `<style>` elements and stores it on `Document::style_texts`. Whitespace-only text nodes are preserved for inline spacing.
 
 ### css
 
 - Parses CSS text into a `StyleSheet` containing pre-parsed `ComplexSelector` ASTs.
-- Combines cascaded string structures into strongly typed `crate::dom::StyleValue` Enums ensuring layout and render loops run numerical primitives natively instead of dynamically matching float parsings continuously.
-- Computes specificity as `(id_count, class_count, tag_count)` at parse time. Merges pre-calculated Hash Buckets in $O(N)$ logic over dynamically evaluating `$O(N \log N)$` sorts per target struct boundary.
-- Supports tag, class, ID, compound, and complex combinators (`>`, ` `). Class attribute subsets are stored in $O(1)$ HashSets on `ElementData`.
-- Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent to child via `Rc` memory sharing to avoid tree explode bounds cascading.
+- Property values are parsed into typed `StyleValue` enums (`LengthPx`, `Percent`, `Color`, `Keyword`, `Number`, `Auto`) during the cascade, so downstream consumers do not parse strings at runtime.
+- Computes specificity as `(id_count, class_count, tag_count)` at parse time.
+- Rules are distributed into `HashMap<DefaultAtom, Vec<IndexedRule>>` buckets keyed by tag, class, and ID. During style resolution, matching buckets are merged in a single O(N) pass using a k-way pointer walk over the pre-sorted slices, without allocating a temporary merged vector.
+- Supports tag, class, ID, compound, and complex combinators (`>`, ` `).
+- Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent to child. Inherited style vectors are shared via `Rc` to avoid redundant cloning.
 - Expands `margin`, `padding` shorthands (1/2/4-value syntax) and maps `background` to `background-color`.
-- Inline `style=""` attributes are parsed via `cssparser`'s `DeclarationParser` trait securely resolving strings into `StyleValue` outputs.
+- Inline `style=""` attributes are parsed via `cssparser`'s `DeclarationParser` trait.
 
 ### layout
 
-Walks the `StyledNode` tree and builds a parallel `TaffyTree<TextMeasureContext>`. Text nodes become leaf nodes utilizing `cosmic-text` and a strictly persistent global `TextLayoutCache`. By lifting HarfBuzz instantiation entirely out of the solver loop (`compute_layout_with_measure`), layouts do not execute consecutive buffer cycles recursively preventing core CPU timeouts seamlessly.
+Walks the `StyledNode` tree and builds a parallel `TaffyTree<TextMeasureContext>`. Before running Taffy's layout solver, a pre-pass traverses the DOM and creates `cosmic-text::Buffer` objects for every text node, performing HarfBuzz shaping once. The Taffy measure closure then only calls `buffer.set_size()` to adjust the width constraint on the already-shaped buffer, avoiding repeated shaping work.
 
 Supported CSS properties mapped to Taffy:
 - `display`: flex, grid, block, none (inline/inline-block are recognized but not yet laid out differently)
@@ -78,7 +80,7 @@ Recursively walks the Taffy layout tree alongside the `StyledNode` tree and issu
 
 Color parsing handles the named colors `red`, `green`, `blue`, `black`, `white` and 6-digit hex (`#rrggbb`). No `rgb()`, `rgba()`, `hsl()`, shorthand hex, or alpha support.
 
-Font loading is backend-specific and is handled by the host renderer implementation.
+Font loading is backend-specific and must be provided by the host renderer implementation.
 
 ### js
 
@@ -86,18 +88,20 @@ Embeds QuickJS via `rquickjs`. The `JsEngine` holds the `Document` behind `Rc<Re
 
 Exposed globals:
 - `console.log(msg)`, `console.warn(msg)`, `console.error(msg)` -- print to stdout
-- `document.getElementById(id)` -- returns a native `NodeHandle` object seamlessly sharing identical JavaScript closures natively tracked inside a global `__nodeCache` (preserving equality integrity via `===`).
-- `document.querySelector(selector)` -- supports complex combinators, returning identically cached JS representations per Arena ID.
-- `document.createElement(tagName)` -- dynamically parses nodes bound strictly inside the cache.
-- `document.appendChild(parent, child)` -- appends a child node using native object handles
-- `document.addEventListener(event, callback)` -- logs registration (scaffold)
+- `document.getElementById(id)` -- returns a `NodeHandle` object. Repeated calls for the same node return the same JS object (identity preserved via a `WeakRef`-based `__nodeCache`).
+- `document.querySelector(selector)` -- tag, class, and ID selectors. Returns a cached `NodeHandle` or null.
+- `document.createElement(tagName)` -- creates a detached element node in the arena, returns a cached `NodeHandle`.
+- `document.appendChild(parent, child)` -- appends a child node
+- `document.addEventListener(event, callback)` -- logs registration (scaffold; does not dispatch events)
 - `setTimeout(callback, delay)` -- registers a cooperative timer; host must call `pump()`
 
 `NodeHandle` class methods:
 - `handle.tagName` -- returns the tag name string
 - `handle.getAttribute(key)` -- returns value or null
 - `handle.setAttribute(key, value)` -- updates or inserts attribute
-- `handle.removeChild(child)` -- detaches child from node
+- `handle.removeChild(child)` -- detaches child from parent
+
+The `__nodeCache` uses a `Map` of `WeakRef` objects so that cached node wrappers do not prevent QuickJS garbage collection. When a `WeakRef` is dereferenced and found dead, the wrapper is re-created.
 
 Timer callbacks are stored as `rquickjs::Persistent<Function>` to survive context boundaries. The host application should call `pump()` on its event loop tick to dispatch expired timers.
 
@@ -113,7 +117,7 @@ cargo build
 cargo test
 ```
 
-Key tests in `lib.rs` cover parsing/layout, JS bridge behavior, CSS combinator matching, recursive DOM node deletion, and whitespace text preservation.
+Tests in `lib.rs` cover HTML parsing, CSS combinator matching, JS bridge round-trips, iterative DOM node deletion, and whitespace text node preservation.
 
 ## Limitations
 
@@ -121,7 +125,7 @@ This list is not exhaustive. The engine is a working skeleton, not a production 
 
 - No networking, resource loading, or URL resolution.
 - No `<img>`, `<video>`, `<canvas>`, `<iframe>`, or form elements.
-- Inline formatting context is still incomplete regarding baseline alignment and specific float rules interactions.
+- Inline formatting context is incomplete (no baseline alignment or float interaction).
 - Font loading and fallback are backend-specific and must be provided by the host.
 - `display: inline` and `inline-block` are parsed but laid out identically to block.
 - Layout properties `margin`, `padding`, `border-width`, `position`, `overflow`, `z-index`, `float` are not wired to Taffy.

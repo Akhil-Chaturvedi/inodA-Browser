@@ -2,13 +2,14 @@
 //!
 //! Parses CSS text into a `StyleSheet` of rules with pre-parsed `ComplexSelector`
 //! ASTs. Matches selectors against DOM elements using pre-computed specificity
-//! and O(1) in-node parent pointers for complex combinators (`>`, ` `).
+//! and in-node parent pointers for complex combinators (`>`, ` `).
 //!
-//! Property names are interned as `string_cache::DefaultAtom` to minimize
-//! memory allocations during style tree construction. Supports compound
-//! selectors, comma-separated lists, CSS inheritance for text properties,
-//! and shorthand expansion for `margin`, `padding`, and `background`. Inline
-//! `style` attributes are parsed natively.
+//! Property values are parsed into typed `StyleValue` enums at cascade time.
+//! Property names are interned as `string_cache::DefaultAtom`. Supports
+//! compound selectors, comma-separated lists, CSS inheritance for text
+//! properties, and shorthand expansion for `margin`, `padding`, and
+//! `background`. Inline `style` attributes are parsed via `cssparser`'s
+//! `DeclarationParser` trait.
 
 use cssparser::{
     AtRuleParser, DeclarationParser, ParserState, QualifiedRuleParser, RuleBodyItemParser,
@@ -316,7 +317,7 @@ fn match_compound_selector(
     compound: &CompoundSelector,
     tag_name: &string_cache::DefaultAtom,
     attributes: &[(string_cache::DefaultAtom, String)],
-    classes: &std::collections::HashSet<string_cache::DefaultAtom>,
+    classes: &[string_cache::DefaultAtom],
 ) -> bool {
     if compound.parts.is_empty() {
         return false;
@@ -473,7 +474,6 @@ fn build_styled_node(
                     .find(|(k, _)| &**k == "id")
                     .map(|(_, v)| string_cache::DefaultAtom::from(v.as_str()));
 
-                let mut candidate_rules: Vec<&IndexedRule> = Vec::new();
                 let mut lists: Vec<&[IndexedRule]> = Vec::new();
 
                 if let Some(id) = &id_attr {
@@ -501,14 +501,8 @@ fn build_styled_node(
                             min_idx = i;
                         }
                     }
-                    candidate_rules.push(&lists[min_idx][0]);
-                    lists[min_idx] = &lists[min_idx][1..];
-                    if lists[min_idx].is_empty() {
-                        lists.remove(min_idx);
-                    }
-                }
 
-                for rule in candidate_rules {
+                    let rule = &lists[min_idx][0];
                     if match_complex_selector(&rule.selector, node_id, document) {
                         for decl in rule.declarations.iter() {
                             if let Some(pos) = new_declarations.iter().position(|(k, _)| k == &decl.name) {
@@ -517,6 +511,11 @@ fn build_styled_node(
                                 new_declarations.push((decl.name.clone(), decl.value.clone()));
                             }
                         }
+                    }
+
+                    lists[min_idx] = &lists[min_idx][1..];
+                    if lists[min_idx].is_empty() {
+                        lists.remove(min_idx);
                     }
                 }
 

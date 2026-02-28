@@ -1,11 +1,10 @@
 //! Layout computation module.
 //!
 //! Converts a `StyledNode` tree into a `TaffyTree` and runs the Flexbox/Grid
-//! layout algorithm.
-//!
-//! Text nodes are measured against the available width so long text can wrap
-//! into multiple lines. Taffy delegates `cosmic-text` measurements strictly matching
-//! a persistent hoisted `TextLayoutCache` avoiding CPU loop lockups over re-evaluating shapes.
+//! layout algorithm. Before running the solver, a pre-pass creates
+//! `cosmic-text::Buffer` objects for all text nodes so that HarfBuzz shaping
+//! runs once. The Taffy measure closure then only adjusts width constraints
+//! on the already-shaped buffers.
 //!
 //! Supported dimension units: px, %, vw, vh, em, rem, auto.
 //! Supported display modes: flex, grid, block, none.
@@ -52,6 +51,9 @@ pub fn compute_layout(
     buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
 ) -> (TaffyTree<TextMeasureContext>, NodeId, TextLayoutCache) {
     let mut tree: TaffyTree<TextMeasureContext> = TaffyTree::new();
+
+    prepare_text_buffers(document, styled_node, font_system, buffer_cache);
+
     let root_taffy_node = build_taffy_node(
         &mut tree,
         document,
@@ -66,7 +68,6 @@ pub fn compute_layout(
     };
 
     let font_system = RefCell::new(font_system);
-    let measured_text_nodes: RefCell<TextLayoutCache> = RefCell::new(HashMap::new());
     let buffer_cache_cell = RefCell::new(buffer_cache);
 
     tree.compute_layout_with_measure(
@@ -89,24 +90,95 @@ pub fn compute_layout(
             let mut sys = font_system.borrow_mut();
             let mut b_cache = buffer_cache_cell.borrow_mut();
             
-            let buffer = b_cache.entry(ctx.node_id).or_insert_with(|| {
-                let text = match document.nodes.get(ctx.node_id) {
-                    Some(crate::dom::Node::Text(txt)) => txt.text.as_str(),
-                    _ => "",
-                };
-                let line_height = (ctx.font_size * 1.2).max(1.0);
-                let mut b = Buffer::new(&mut sys, Metrics::new(ctx.font_size, line_height));
-                b.set_wrap(&mut sys, Wrap::WordOrGlyph);
-                b.set_text(&mut sys, text, Attrs::new(), Shaping::Advanced);
-                b
-            });
+            let buffer = b_cache.get_mut(&ctx.node_id).unwrap();
 
             buffer.set_size(
                 &mut sys,
                 Some(width_constraint.max(1.0)),
                 Some(f32::INFINITY),
             );
-            buffer.shape_until_scroll(&mut sys, false);
+
+            let mut lines_count = 0;
+            let mut max_width: f32 = 0.0;
+            for run in buffer.layout_runs() {
+                max_width = max_width.max(run.line_w);
+                lines_count += 1;
+            }
+
+            if lines_count == 0 {
+                lines_count = 1;
+            }
+
+            let width = max_width.min(width_constraint.max(1.0));
+            let line_height = (ctx.font_size * 1.2).max(1.0);
+            let height = (lines_count as f32) * line_height;
+
+            taffy::geometry::Size { width, height }
+        },
+    )
+    .unwrap();
+
+    let mut final_cache = HashMap::new();
+    finalize_text_measurements(
+        &tree,
+        root_taffy_node,
+        font_system.into_inner(),
+        buffer_cache_cell.into_inner(),
+        &mut final_cache,
+    );
+
+    (tree, root_taffy_node, final_cache)
+}
+
+fn prepare_text_buffers(
+    document: &crate::dom::Document,
+    styled_node: &StyledNode,
+    font_system: &mut FontSystem,
+    buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
+) {
+    if let Some(crate::dom::Node::Text(txt)) = document.nodes.get(styled_node.node_id) {
+        let font_size = styled_node
+            .specified_values
+            .iter()
+            .find(|(k, _)| &**k == "font-size")
+            .and_then(|(_, v)| match v {
+                crate::dom::StyleValue::LengthPx(num) => Some(*num),
+                crate::dom::StyleValue::Number(num) => Some(*num),
+                _ => None,
+            })
+            .unwrap_or(16.0);
+
+        let line_height = (font_size * 1.2).max(1.0);
+        let _buffer = buffer_cache.entry(styled_node.node_id).or_insert_with(|| {
+            let mut b = Buffer::new(font_system, Metrics::new(font_size, line_height));
+            b.set_wrap(font_system, Wrap::WordOrGlyph);
+            b.set_text(font_system, &txt.text, Attrs::new(), Shaping::Advanced);
+            b
+        });
+    }
+
+    for child in &styled_node.children {
+        prepare_text_buffers(document, child, font_system, buffer_cache);
+    }
+}
+
+fn finalize_text_measurements(
+    tree: &TaffyTree<TextMeasureContext>,
+    taffy_node: NodeId,
+    font_system: &mut FontSystem,
+    buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
+    measured_text_nodes: &mut TextLayoutCache,
+) {
+    if let Some(ctx) = tree.get_node_context(taffy_node) {
+        if let Ok(layout) = tree.layout(taffy_node) {
+            let width_constraint = layout.size.width;
+
+            let buffer = buffer_cache.get_mut(&ctx.node_id).unwrap();
+            buffer.set_size(
+                font_system,
+                Some(width_constraint.max(1.0)),
+                Some(f32::INFINITY),
+            );
 
             let mut lines = Vec::new();
             let mut max_width: f32 = 0.0;
@@ -129,21 +201,23 @@ pub fn compute_layout(
             let line_height = (ctx.font_size * 1.2).max(1.0);
             let height = (lines.len() as f32) * line_height;
 
-            let layout = TextNodeLayout {
-                lines,
-                line_height,
-                width,
-                height,
-            };
+            measured_text_nodes.insert(
+                ctx.node_id,
+                TextNodeLayout {
+                    lines,
+                    line_height,
+                    width,
+                    height,
+                },
+            );
+        }
+    }
 
-            measured_text_nodes.borrow_mut().insert(ctx.node_id, layout);
-            
-            taffy::geometry::Size { width, height }
-        },
-    )
-    .unwrap();
-
-    (tree, root_taffy_node, measured_text_nodes.into_inner())
+    if let Ok(children) = tree.children(taffy_node) {
+        for child in children {
+            finalize_text_measurements(tree, child, font_system, buffer_cache, measured_text_nodes);
+        }
+    }
 }
 
 fn build_taffy_node(

@@ -37,7 +37,7 @@ pub enum Node {
 pub struct ElementData {
     pub tag_name: string_cache::DefaultAtom,
     pub attributes: Vec<(string_cache::DefaultAtom, String)>,
-    pub classes: std::collections::HashSet<string_cache::DefaultAtom>,
+    pub classes: Vec<string_cache::DefaultAtom>,
     pub parent: Option<NodeId>,
     pub first_child: Option<NodeId>,
     pub last_child: Option<NodeId>,
@@ -115,21 +115,29 @@ impl Document {
             self.remove_child(parent_id, id);
         }
 
-        // 2. Remove id from id_map
-        if let Some(Node::Element(data)) = self.nodes.get(id) {
-            if let Some((_, id_val)) = data.attributes.iter().find(|(k, _)| &**k == "id") {
-                self.id_map.remove(id_val);
+        let mut delete_queue = vec![id];
+        let mut root_node = None;
+
+        while let Some(current_id) = delete_queue.pop() {
+            let mut current_child = self.first_child_of(current_id);
+            while let Some(child_id) = current_child {
+                current_child = self.next_sibling_of(child_id);
+                delete_queue.push(child_id);
+            }
+
+            if let Some(node) = self.nodes.remove(current_id) {
+                if let Node::Element(ref data) = node {
+                    if let Some((_, id_val)) = data.attributes.iter().find(|(k, _)| &**k == "id") {
+                        self.id_map.remove(id_val);
+                    }
+                }
+                if current_id == id {
+                    root_node = Some(node);
+                }
             }
         }
 
-        // 3. Recursively remove children using intrusive list
-        let mut current_child = self.first_child_of(id);
-        while let Some(child_id) = current_child {
-            current_child = self.next_sibling_of(child_id);
-            self.remove_node(child_id);
-        }
-
-        self.nodes.remove(id)
+        root_node
     }
 
     pub fn append_child(&mut self, parent_id: NodeId, child_id: NodeId) {

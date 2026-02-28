@@ -206,7 +206,10 @@ impl JsEngine {
                         if &*local_attr == "class" {
                             data.classes.clear();
                             for c in value.split_whitespace() {
-                                data.classes.insert(string_cache::DefaultAtom::from(c));
+                                let class_atom = string_cache::DefaultAtom::from(c);
+                                if !data.classes.contains(&class_atom) {
+                                    data.classes.push(class_atom);
+                                }
                             }
                         }
                     }
@@ -344,7 +347,7 @@ impl JsEngine {
                     let node = crate::dom::Node::Element(crate::dom::ElementData {
                         tag_name: string_cache::DefaultAtom::from(tag_name.as_str()),
                         attributes: Vec::new(),
-                        classes: std::collections::HashSet::new(),
+                        classes: Vec::new(),
                         parent: None,
                         first_child: None,
                         last_child: None,
@@ -389,15 +392,17 @@ impl JsEngine {
             let _: () = ctx
                 .eval(
                     r#"
-                document.__nodeCache = {};
+                document.__nodeCache = new Map();
 
                 document._wrapNode = function(rawNode) {
                     if (!rawNode) return null;
                     let key = rawNode.__nodeKey;
-                    if (document.__nodeCache[key]) {
-                        return document.__nodeCache[key];
+                    let cachedRef = document.__nodeCache.get(key);
+                    if (cachedRef) {
+                        let cachedObj = cachedRef.deref();
+                        if (cachedObj) return cachedObj;
                     }
-                    document.__nodeCache[key] = rawNode;
+                    document.__nodeCache.set(key, new WeakRef(rawNode));
                     return rawNode;
                 };
 

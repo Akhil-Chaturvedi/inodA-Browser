@@ -1,6 +1,6 @@
 # inodA Browser
 
-An experimental web browser engine for resource-constrained embedded systems. The engine is deliberately restricted to parse and render elementary HTML, CSS, and JavaScript with static memory bounds and bounded CPU overhead, serving as an inflexible but ultra-lightweight alternative to Chromium or Firefox for specialized hardware.
+An experimental web browser engine for resource-constrained embedded systems. The engine parses a subset of HTML, CSS, and JavaScript with bounded memory usage and CPU overhead. It is not a replacement for Chromium or Firefox; it is a minimal rendering engine for specialized hardware where those browsers cannot run.
 
 ## Repository structure
 
@@ -14,7 +14,7 @@ inodA-Browser/
 
 The engine library. It handles:
 
-- HTML parsing (spec-compliant via html5ever, streamed directly into a generational arena DOM)
+- HTML parsing (streaming tokenizer via html5gum, single-pass into a generational arena DOM)
 - CSS parsing and style computation (specificity, inheritance, shorthand expansion)
 - Flexbox/Grid layout (via the Taffy crate)
 - 2D rendering (via an abstract backend trait implemented by the host)
@@ -26,9 +26,13 @@ See [inoda-core/ARCHITECTURE.md](inoda-core/ARCHITECTURE.md) for data flow, data
 
 ## Current state
 
-The engine parses HTML elements via synchronous blocking sequences, allocating tokens natively into an intrusive linked list arena-based DOM. This structure supports precise $O(1)$ parent traversals and $O(1)$ constant insertions/removals. The CSS layout engine requires `cosmic-text` glyph rendering mapped internally against $O(1)$ specific selectors (tag, class, ID). Combinators traverse recursively natively up the document structure. The JS engine is solely single-threaded and synchronously blocked, exposing a `NodeHandle` mapping structure allowing manual Javascript logic.
+The engine tokenizes HTML via `html5gum` into an intrusive linked-list arena-based DOM. Nodes store parent, child, and sibling pointers directly for O(1) traversal and O(1) insertion/removal. CSS selectors are pre-parsed into an AST and distributed into hash-map buckets by tag, class, and ID for sublinear lookup. Combinators (child `>`, descendant ` `) are evaluated by walking parent pointers. Property values are parsed into typed enums (`StyleValue`) during the cascade, so the layout and render loops operate on numbers and enum variants rather than strings.
 
-Memory pointers map statically back to interning (via `string_cache`), strictly pooling native DOM elements to identical cache points. There is zero networking, asset streaming, image loading, or complex iframe nesting built in. The host system strictly requires independent application definitions spanning Event Loops and graphical Canvas bindings.
+Text measurement uses `cosmic-text` for HarfBuzz-based shaping. Text buffers are pre-populated before Taffy's layout solver runs, so the measure closure only adjusts width constraints on already-shaped buffers.
+
+The JS engine is single-threaded, exposing DOM handles as `NodeHandle` class instances backed by arena indices. A `WeakRef`-based identity cache ensures `===` equality across repeated queries for the same node.
+
+There is no networking, asset loading, image support, or iframe handling. The host application must provide a window, event loop, and graphics backend.
 
 ## Building
 

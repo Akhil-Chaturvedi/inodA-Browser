@@ -1,15 +1,16 @@
 //! inoda-core: a minimal browser engine library.
 //!
-//! Parses HTML into an intrusive linked list arena-based DOM with O(1) parent traversing 
-//! and zero-allocation mutations. Applies $O(1)$ CSS matching with specificity and combinator 
-//! support, computes Flexbox/Grid layout via Taffy, renders through an abstract backend 
-//! trait, and exposes a native object-based DOM API through an embedded QuickJS runtime.
+//! Parses HTML into an arena-based DOM with intrusive linked-list child/sibling
+//! pointers for O(1) traversal. Applies CSS with specificity-based matching
+//! and combinator support, computes Flexbox/Grid layout via Taffy, renders
+//! through an abstract backend trait, and exposes a DOM API through an
+//! embedded QuickJS runtime.
 //!
-//! The engine leverages string interning for tag names and CSS property names
-//! to minimize memory allocations in resource-constrained environments.
+//! Tag names, attribute keys, and CSS property names are interned via
+//! `string_cache::DefaultAtom` to reduce allocations on constrained devices.
 //!
 //! This crate is a library. The host application must provide a window,
-//! event loop, and graphics backend implementation.
+//! event loop, and graphics backend.
 
 pub mod css;
 pub mod dom;
@@ -167,7 +168,7 @@ mod tests {
         let parent = doc.add_node(dom::Node::Element(dom::ElementData {
             tag_name: string_cache::DefaultAtom::from("div"),
             attributes: Vec::new(),
-            classes: std::collections::HashSet::new(),
+            classes: Vec::new(),
             parent: None,
             first_child: None,
             last_child: None,
@@ -178,7 +179,7 @@ mod tests {
         let child = doc.add_node(dom::Node::Element(dom::ElementData {
             tag_name: string_cache::DefaultAtom::from("span"),
             attributes: Vec::new(),
-            classes: std::collections::HashSet::new(),
+            classes: Vec::new(),
             parent: None,
             first_child: None,
             last_child: None,

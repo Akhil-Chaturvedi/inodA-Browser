@@ -5,7 +5,6 @@
 //!
 //! Extracts raw CSS text from `<style>` elements into `Document::style_texts`.
 
-use std::collections::HashSet;
 use html5gum::{Token, Tokenizer};
 use string_cache::DefaultAtom;
 use crate::dom::{Document, ElementData, Node, TextData};
@@ -42,7 +41,7 @@ pub fn parse_html(html: &str) -> Document {
                 }
 
                 let mut attributes = Vec::new();
-                let mut classes = HashSet::new();
+                let mut classes = Vec::new();
                 let mut id_val = None;
 
                 for (key, value) in tag.attributes {
@@ -51,7 +50,10 @@ pub fn parse_html(html: &str) -> Document {
 
                         if &*k_atom == "class" {
                             for c in v_str.split_whitespace() {
-                                classes.insert(DefaultAtom::from(c));
+                                let class_atom = DefaultAtom::from(c);
+                                if !classes.contains(&class_atom) {
+                                    classes.push(class_atom);
+                                }
                             }
                         } else if &*k_atom == "id" {
                             id_val = Some(v_str.to_string());

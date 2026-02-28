@@ -118,7 +118,49 @@ pub struct StyleRule {
 #[derive(Debug, Clone)]
 pub struct Declaration {
     pub name: string_cache::DefaultAtom,
-    pub value: String,
+    pub value: crate::dom::StyleValue,
+}
+
+#[inline]
+fn parse_color(val: &str) -> Option<(u8, u8, u8)> {
+    match val {
+        "red" => Some((255, 0, 0)),
+        "green" => Some((0, 255, 0)),
+        "blue" => Some((0, 0, 255)),
+        "black" => Some((0, 0, 0)),
+        "white" => Some((255, 255, 255)),
+        hex if hex.starts_with('#') && hex.len() == 7 => {
+            let r = u8::from_str_radix(&hex[1..3], 16).ok()?;
+            let g = u8::from_str_radix(&hex[3..5], 16).ok()?;
+            let b = u8::from_str_radix(&hex[5..7], 16).ok()?;
+            Some((r, g, b))
+        }
+        _ => None,
+    }
+}
+
+pub fn parse_style_value(val: &str) -> crate::dom::StyleValue {
+    let trimmed = val.trim();
+    if trimmed == "auto" {
+        return crate::dom::StyleValue::Auto;
+    }
+    if let Some(num_str) = trimmed.strip_suffix("px") {
+        if let Ok(num) = num_str.parse::<f32>() {
+            return crate::dom::StyleValue::LengthPx(num);
+        }
+    }
+    if let Some(num_str) = trimmed.strip_suffix("%") {
+        if let Ok(num) = num_str.parse::<f32>() {
+            return crate::dom::StyleValue::Percent(num);
+        }
+    }
+    if let Some(color) = parse_color(trimmed) {
+        return crate::dom::StyleValue::Color(color.0, color.1, color.2);
+    }
+    if let Ok(num) = trimmed.parse::<f32>() {
+        return crate::dom::StyleValue::Number(num);
+    }
+    crate::dom::StyleValue::Keyword(string_cache::DefaultAtom::from(trimmed))
 }
 
 // ---------------------------------------------------------------------------
@@ -417,7 +459,7 @@ fn build_styled_node(
     document: &crate::dom::Document,
     node_id: crate::dom::NodeId,
     stylesheet: &StyleSheet,
-    parent_styles: &std::rc::Rc<Vec<(string_cache::DefaultAtom, String)>>,
+    parent_styles: &std::rc::Rc<Vec<(string_cache::DefaultAtom, crate::dom::StyleValue)>>,
 ) -> crate::dom::StyledNode {
     let mut new_declarations = Vec::new();
     let mut children_ids = Vec::new();
@@ -432,24 +474,39 @@ fn build_styled_node(
                     .map(|(_, v)| string_cache::DefaultAtom::from(v.as_str()));
 
                 let mut candidate_rules: Vec<&IndexedRule> = Vec::new();
+                let mut lists: Vec<&[IndexedRule]> = Vec::new();
 
                 if let Some(id) = &id_attr {
                     if let Some(rules) = stylesheet.by_id.get(id) {
-                        candidate_rules.extend(rules);
+                        lists.push(rules.as_slice());
                     }
                 }
                 for class in &data.classes {
                     if let Some(rules) = stylesheet.by_class.get(class) {
-                        candidate_rules.extend(rules);
+                        lists.push(rules.as_slice());
                     }
                 }
                 if let Some(rules) = stylesheet.by_tag.get(&data.tag_name) {
-                    candidate_rules.extend(rules);
+                    lists.push(rules.as_slice());
                 }
-                candidate_rules.extend(&stylesheet.universal);
+                if !stylesheet.universal.is_empty() {
+                    lists.push(stylesheet.universal.as_slice());
+                }
 
-                // Re-sort candidate rules since we pulled them from multiple buckets
-                candidate_rules.sort_by_key(|r| r.selector.specificity);
+                // $O(N)$ Linear merge of pre-sorted specificity buckets instead of $O(N \log N)$ dynamic sorting.
+                while !lists.is_empty() {
+                    let mut min_idx = 0;
+                    for i in 1..lists.len() {
+                        if lists[i][0].selector.specificity < lists[min_idx][0].selector.specificity {
+                            min_idx = i;
+                        }
+                    }
+                    candidate_rules.push(&lists[min_idx][0]);
+                    lists[min_idx] = &lists[min_idx][1..];
+                    if lists[min_idx].is_empty() {
+                        lists.remove(min_idx);
+                    }
+                }
 
                 for rule in candidate_rules {
                     if match_complex_selector(&rule.selector, node_id, document) {
@@ -494,7 +551,7 @@ fn build_styled_node(
     let final_styles = if new_declarations.is_empty() {
         std::rc::Rc::clone(parent_styles)
     } else {
-        let mut final_vec: Vec<(string_cache::DefaultAtom, String)> = parent_styles
+        let mut final_vec: Vec<(string_cache::DefaultAtom, crate::dom::StyleValue)> = parent_styles
             .iter()
             .filter(|(k, _)| is_inheritable(k))
             .cloned()
@@ -615,73 +672,73 @@ fn parse_rule<'i, 't>(
                         1 => {
                             declarations.push(Declaration {
                                 name: string_cache::DefaultAtom::from(top),
-                                value: parts[0].to_string(),
+                                value: parse_style_value(parts[0]),
                             });
                             declarations.push(Declaration {
                                 name: string_cache::DefaultAtom::from(right),
-                                value: parts[0].to_string(),
+                                value: parse_style_value(parts[0]),
                             });
                             declarations.push(Declaration {
                                 name: string_cache::DefaultAtom::from(bottom),
-                                value: parts[0].to_string(),
+                                value: parse_style_value(parts[0]),
                             });
                             declarations.push(Declaration {
                                 name: string_cache::DefaultAtom::from(left),
-                                value: parts[0].to_string(),
+                                value: parse_style_value(parts[0]),
                             });
                         }
                         2 => {
                             declarations.push(Declaration {
                                 name: string_cache::DefaultAtom::from(top),
-                                value: parts[0].to_string(),
+                                value: parse_style_value(parts[0]),
                             });
                             declarations.push(Declaration {
                                 name: string_cache::DefaultAtom::from(bottom),
-                                value: parts[0].to_string(),
+                                value: parse_style_value(parts[0]),
                             });
                             declarations.push(Declaration {
                                 name: string_cache::DefaultAtom::from(left),
-                                value: parts[1].to_string(),
+                                value: parse_style_value(parts[1]),
                             });
                             declarations.push(Declaration {
                                 name: string_cache::DefaultAtom::from(right),
-                                value: parts[1].to_string(),
+                                value: parse_style_value(parts[1]),
                             });
                         }
                         4 => {
                             declarations.push(Declaration {
                                 name: string_cache::DefaultAtom::from(top),
-                                value: parts[0].to_string(),
+                                value: parse_style_value(parts[0]),
                             });
                             declarations.push(Declaration {
                                 name: string_cache::DefaultAtom::from(right),
-                                value: parts[1].to_string(),
+                                value: parse_style_value(parts[1]),
                             });
                             declarations.push(Declaration {
                                 name: string_cache::DefaultAtom::from(bottom),
-                                value: parts[2].to_string(),
+                                value: parse_style_value(parts[2]),
                             });
                             declarations.push(Declaration {
                                 name: string_cache::DefaultAtom::from(left),
-                                value: parts[3].to_string(),
+                                value: parse_style_value(parts[3]),
                             });
                         }
                         _ => {
                             declarations.push(Declaration {
                                 name: string_cache::DefaultAtom::from(name_str),
-                                value,
+                                value: parse_style_value(&value),
                             });
                         }
                     }
                 } else if name_str == "background" {
                     declarations.push(Declaration {
                         name: string_cache::DefaultAtom::from("background-color"),
-                        value,
+                        value: parse_style_value(&value),
                     });
                 } else {
                     declarations.push(Declaration {
                         name: string_cache::DefaultAtom::from(name_str),
-                        value,
+                        value: parse_style_value(&value),
                     });
                 }
             } else {
@@ -743,7 +800,7 @@ impl<'i> DeclarationParser<'i> for InlineStyleParser {
         }
         Ok(Declaration {
             name: string_cache::DefaultAtom::from(name.as_ref()),
-            value: value.trim().to_string(),
+            value: parse_style_value(&value),
         })
     }
 }

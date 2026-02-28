@@ -37,7 +37,8 @@ mod tests {
         let styled_tree = css::compute_styles(&doc, &stylesheet);
 
         let mut font_system = cosmic_text::FontSystem::new();
-        let (layout_tree, root_node, _text_cache) = layout::compute_layout(&doc, &styled_tree, 320.0, 240.0, &mut font_system);
+        let mut buffer_cache = std::collections::HashMap::new();
+        let (layout_tree, root_node, _text_cache) = layout::compute_layout(&doc, &styled_tree, 320.0, 240.0, &mut font_system, &mut buffer_cache);
         taffy::print_tree(&layout_tree, root_node);
 
         // Test Renderer Bridge Compile
@@ -255,20 +256,20 @@ mod tests {
         assert!(
             span.specified_values
                 .iter()
-                .any(|(k, v)| &**k == "color" && v == "red"),
+                .any(|(k, v)| &**k == "color" && v == &crate::dom::StyleValue::Color(255, 0, 0)),
             "Descendant combinator failed"
         );
         assert!(
             !span
                 .specified_values
                 .iter()
-                .any(|(k, v)| &**k == "color" && v == "blue"),
+                .any(|(k, v)| &**k == "color" && v == &crate::dom::StyleValue::Color(0, 0, 255)),
             "Child combinator incorrectly matched descendant"
         );
         assert!(
             span.specified_values
                 .iter()
-                .any(|(k, v)| &**k == "font-weight" && v == "bold"),
+                .any(|(k, v)| &**k == "font-weight" && v == &crate::dom::StyleValue::Keyword(string_cache::DefaultAtom::from("bold"))),
             "Child combinator failed"
         );
     }

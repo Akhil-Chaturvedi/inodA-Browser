@@ -2,7 +2,7 @@
 //!
 //! Embeds QuickJS via `rquickjs`. Exposes a subset of the Web API:
 //! - `console.log`, `console.warn`, `console.error` (print to stdout)
-//! - `document.getElementById`, `document.querySelector` (return native `NodeHandle` objects)
+//! - `document.getElementById`, `document.querySelector` (return native `NodeHandle` objects globally cached via `__nodeCache` to explicitly preserve `===` identity)
 //! - `document.createElement`, `document.appendChild` (mutate the arena DOM)
 //! - `document.addEventListener` (logs registration, does not dispatch events)
 //! - `setTimeout` (cooperative timer queue via `pump()`)
@@ -389,14 +389,26 @@ impl JsEngine {
             let _: () = ctx
                 .eval(
                     r#"
+                document.__nodeCache = {};
+
+                document._wrapNode = function(rawNode) {
+                    if (!rawNode) return null;
+                    let key = rawNode.__nodeKey;
+                    if (document.__nodeCache[key]) {
+                        return document.__nodeCache[key];
+                    }
+                    document.__nodeCache[key] = rawNode;
+                    return rawNode;
+                };
+
                 document.getElementById = function(id) {
-                    return this._getElementByIdRaw(id);
+                    return this._wrapNode(this._getElementByIdRaw(id));
                 };
                 document.querySelector = function(selector) {
-                    return this._querySelectorRaw(selector);
+                    return this._wrapNode(this._querySelectorRaw(selector));
                 };
                 document.createElement = function(tag) {
-                    return this._createElementRaw(tag);
+                    return this._wrapNode(this._createElementRaw(tag));
                 };
             "#,
                 )

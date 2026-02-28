@@ -4,7 +4,8 @@
 //! layout algorithm.
 //!
 //! Text nodes are measured against the available width so long text can wrap
-//! into multiple lines, allowing Taffy to receive a realistic block height.
+//! into multiple lines. Taffy delegates `cosmic-text` measurements strictly matching
+//! a persistent hoisted `TextLayoutCache` avoiding CPU loop lockups over re-evaluating shapes.
 //!
 //! Supported dimension units: px, %, vw, vh, em, rem, auto.
 //! Supported display modes: flex, grid, block, none.
@@ -48,6 +49,7 @@ pub fn compute_layout(
     viewport_width: f32,
     viewport_height: f32,
     font_system: &mut FontSystem,
+    buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
 ) -> (TaffyTree<TextMeasureContext>, NodeId, TextLayoutCache) {
     let mut tree: TaffyTree<TextMeasureContext> = TaffyTree::new();
     let root_taffy_node = build_taffy_node(
@@ -65,7 +67,7 @@ pub fn compute_layout(
 
     let font_system = RefCell::new(font_system);
     let measured_text_nodes: RefCell<TextLayoutCache> = RefCell::new(HashMap::new());
-    let mut buffer_cache = HashMap::<crate::dom::NodeId, Buffer>::new();
+    let buffer_cache_cell = RefCell::new(buffer_cache);
 
     tree.compute_layout_with_measure(
         root_taffy_node,
@@ -85,8 +87,9 @@ pub fn compute_layout(
             };
 
             let mut sys = font_system.borrow_mut();
+            let mut b_cache = buffer_cache_cell.borrow_mut();
             
-            let buffer = buffer_cache.entry(ctx.node_id).or_insert_with(|| {
+            let buffer = b_cache.entry(ctx.node_id).or_insert_with(|| {
                 let text = match document.nodes.get(ctx.node_id) {
                     Some(crate::dom::Node::Text(txt)) => txt.text.as_str(),
                     _ => "",
@@ -156,7 +159,11 @@ fn build_taffy_node(
         .specified_values
         .iter()
         .find(|(k, _)| &**k == "font-size")
-        .and_then(|(_, v)| v.trim_end_matches("px").parse::<f32>().ok())
+        .and_then(|(_, v)| match v {
+            crate::dom::StyleValue::LengthPx(num) => Some(*num),
+            crate::dom::StyleValue::Number(num) => Some(*num),
+            _ => None,
+        })
         .unwrap_or(16.0);
 
     if let Some((_, display_val)) = styled_node
@@ -164,13 +171,15 @@ fn build_taffy_node(
         .iter()
         .find(|(k, _)| &**k == "display")
     {
-        match display_val.as_str() {
-            "flex" => style.display = Display::Flex,
-            "grid" => style.display = Display::Grid,
-            "none" => style.display = Display::None,
-            "block" => style.display = Display::Block,
-            "inline" | "inline-block" => {}
-            _ => {}
+        if let crate::dom::StyleValue::Keyword(kw) = display_val {
+            match &**kw {
+                "flex" => style.display = Display::Flex,
+                "grid" => style.display = Display::Grid,
+                "none" => style.display = Display::None,
+                "block" => style.display = Display::Block,
+                "inline" | "inline-block" => {}
+                _ => {}
+            }
         }
     }
 
@@ -179,10 +188,12 @@ fn build_taffy_node(
         .iter()
         .find(|(k, _)| &**k == "flex-direction")
     {
-        match dir_val.as_str() {
-            "row" => style.flex_direction = FlexDirection::Row,
-            "column" => style.flex_direction = FlexDirection::Column,
-            _ => {}
+        if let crate::dom::StyleValue::Keyword(kw) = dir_val {
+            match &**kw {
+                "row" => style.flex_direction = FlexDirection::Row,
+                "column" => style.flex_direction = FlexDirection::Column,
+                _ => {}
+            }
         }
     }
 
@@ -190,8 +201,8 @@ fn build_taffy_node(
         .specified_values
         .iter()
         .find(|(k, _)| &**k == "display")
-        .map(|(_, s)| s.as_str())
-        != Some("flex")
+        .map(|(_, s)| s)
+        != Some(&crate::dom::StyleValue::Keyword(string_cache::DefaultAtom::from("flex")))
     {
         if styled_node
             .specified_values
@@ -247,33 +258,27 @@ fn build_taffy_node(
 }
 
 #[inline]
-fn parse_dimension(val: &str, vw: f32, vh: f32, font_size: f32) -> Option<Dimension> {
-    let val = val.trim();
-    if val == "auto" {
-        return Some(Dimension::auto());
+fn parse_dimension(val: &crate::dom::StyleValue, vw: f32, vh: f32, font_size: f32) -> Option<Dimension> {
+    match val {
+        crate::dom::StyleValue::Auto => Some(Dimension::auto()),
+        crate::dom::StyleValue::LengthPx(num) => Some(Dimension::length(*num)),
+        crate::dom::StyleValue::Percent(p) => Some(Dimension::percent(*p / 100.0)),
+        crate::dom::StyleValue::Keyword(kw) => {
+             let s = &**kw;
+             if s.ends_with("vw") {
+                 let num = s.trim_end_matches("vw").parse::<f32>().ok()?;
+                 return Some(Dimension::length((num / 100.0) * vw));
+             }
+             if s.ends_with("vh") {
+                 let num = s.trim_end_matches("vh").parse::<f32>().ok()?;
+                 return Some(Dimension::length((num / 100.0) * vh));
+             }
+             if s.ends_with("em") || s.ends_with("rem") {
+                 let num = s.trim_end_matches("rem").trim_end_matches("em").parse::<f32>().ok()?;
+                 return Some(Dimension::length(num * font_size));
+             }
+             None
+        }
+        _ => None,
     }
-
-    if val.ends_with("px") {
-        if let Ok(num) = val.trim_end_matches("px").parse::<f32>() {
-            return Some(Dimension::length(num));
-        }
-    } else if val.ends_with('%') {
-        if let Ok(num) = val.trim_end_matches('%').parse::<f32>() {
-            return Some(Dimension::percent(num / 100.0));
-        }
-    } else if val.ends_with("vw") {
-        if let Ok(num) = val.trim_end_matches("vw").parse::<f32>() {
-            return Some(Dimension::length(vw * num / 100.0));
-        }
-    } else if val.ends_with("vh") {
-        if let Ok(num) = val.trim_end_matches("vh").parse::<f32>() {
-            return Some(Dimension::length(vh * num / 100.0));
-        }
-    } else if val.ends_with("rem") || val.ends_with("em") {
-        let trim_str = if val.ends_with("rem") { "rem" } else { "em" };
-        if let Ok(num) = val.trim_end_matches(trim_str).parse::<f32>() {
-            return Some(Dimension::length(font_size * num));
-        }
-    }
-    None
 }

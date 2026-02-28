@@ -59,11 +59,22 @@ pub struct RootData {
     pub last_child: Option<NodeId>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum StyleValue {
+    Keyword(string_cache::DefaultAtom),
+    LengthPx(f32),
+    Percent(f32),
+    Color(u8, u8, u8),
+    Auto,
+    Number(f32),
+    Str(String),
+}
+
 /// A node mapped with its active computed CSS style properties.
 #[derive(Debug)]
 pub struct StyledNode {
     pub node_id: NodeId,
-    pub specified_values: std::rc::Rc<Vec<(string_cache::DefaultAtom, String)>>,
+    pub specified_values: std::rc::Rc<Vec<(string_cache::DefaultAtom, StyleValue)>>,
     pub children: Vec<StyledNode>,
 }
 

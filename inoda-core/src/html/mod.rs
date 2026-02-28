@@ -19,9 +19,23 @@ pub fn parse_html(html: &str) -> Document {
     for token in Tokenizer::new(html).infallible() {
         match token {
             Token::StartTag(tag) => {
-                let tag_name_str = String::from_utf8_lossy(&tag.name);
-                let tag_name = DefaultAtom::from(tag_name_str.as_ref());
+                let tag_name_str = std::str::from_utf8(&tag.name).unwrap_or("");
+                let tag_name = DefaultAtom::from(tag_name_str);
                 
+                if let Some(Node::Element(parent_data)) = doc.nodes.get(current_parent) {
+                    let p_tag = &*parent_data.tag_name;
+                    let auto_close = match &*tag_name {
+                        "li" => p_tag == "li",
+                        "td" | "th" => p_tag == "td" || p_tag == "th",
+                        "tr" => p_tag == "tr",
+                        "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "ul" | "ol" | "table" => p_tag == "p",
+                        _ => false,
+                    };
+                    if auto_close {
+                        current_parent = doc.parent_of(current_parent).unwrap_or(doc.root_id);
+                    }
+                }
+
                 if &*tag_name == "style" {
                     inside_style = true;
                     current_style_text.clear();
@@ -32,18 +46,18 @@ pub fn parse_html(html: &str) -> Document {
                 let mut id_val = None;
 
                 for (key, value) in tag.attributes {
-                    let k_str = String::from_utf8_lossy(&key);
-                    let v_str = String::from_utf8_lossy(&value);
-                    let k_atom = DefaultAtom::from(k_str.as_ref());
+                    if let (Ok(k_str), Ok(v_str)) = (std::str::from_utf8(&key), std::str::from_utf8(&value)) {
+                        let k_atom = DefaultAtom::from(k_str);
 
-                    if &*k_atom == "class" {
-                        for c in v_str.split_whitespace() {
-                            classes.insert(DefaultAtom::from(c));
+                        if &*k_atom == "class" {
+                            for c in v_str.split_whitespace() {
+                                classes.insert(DefaultAtom::from(c));
+                            }
+                        } else if &*k_atom == "id" {
+                            id_val = Some(v_str.to_string());
                         }
-                    } else if &*k_atom == "id" {
-                        id_val = Some(v_str.to_string());
+                        attributes.push((k_atom, v_str.to_string()));
                     }
-                    attributes.push((k_atom, v_str.to_string()));
                 }
 
                 let node = Node::Element(ElementData {
@@ -74,8 +88,8 @@ pub fn parse_html(html: &str) -> Document {
                 }
             }
             Token::EndTag(tag) => {
-                let tag_name_str = String::from_utf8_lossy(&tag.name);
-                let tag_name = DefaultAtom::from(tag_name_str.as_ref());
+                let tag_name_str = std::str::from_utf8(&tag.name).unwrap_or("");
+                let tag_name = DefaultAtom::from(tag_name_str);
 
                 if &*tag_name == "style" {
                     inside_style = false;
@@ -98,7 +112,11 @@ pub fn parse_html(html: &str) -> Document {
                 }
             }
             Token::String(s) => {
-                let text_str = String::from_utf8_lossy(&s).to_string();
+                let text_str = std::str::from_utf8(&s).unwrap_or("").to_string();
+                if text_str.is_empty() {
+                    continue;
+                }
+                
                 if inside_style {
                     current_style_text.push_str(&text_str);
                     continue;

@@ -11,15 +11,15 @@ Early development. The engine covers enough of the web platform to parse simple 
 ## Dependencies
 
 | Crate              | Version | Purpose                                     |
-|--------------------|---------|---------------------------------------------|
-| `html5ever`        | 0.38    | Spec-compliant HTML tokenizer and parser    |
-| `markup5ever`      | 0.38    | Shared types for html5ever (LocalName, etc.) |
-| `cssparser`        | 0.36    | Mozilla CSS tokenizer (same one Servo uses) |
-| `cosmic-text`      | 0.12    | Font shaping + wrapped text measurement      |
-| `taffy`            | 0.9     | Flexbox and CSS Grid layout algorithm       |
-| `rquickjs`         | 0.11    | QuickJS JavaScript engine bindings          |
-| `generational-arena`| 0.2    | Generational index arena for the DOM        |
-| `string_cache`     | 0.9     | Atom string interning (DefaultAtom, etc.)    |
+| Crate                | Version | Purpose                                        |
+|----------------------|---------|------------------------------------------------|
+| `html5gum`           | 0.5     | Zero-allocation HTML tokenizer                 |
+| `cssparser`          | 0.36    | Mozilla CSS tokenizer (same one Servo uses)    |
+| `cosmic-text`        | 0.12    | Font shaping + wrapped text measurement        |
+| `taffy`              | 0.9     | Flexbox and CSS Grid layout algorithm          |
+| `rquickjs`           | 0.11    | QuickJS JavaScript engine bindings             |
+| `generational-arena` | 0.2     | Generational index arena for the DOM           |
+| `string_cache`       | 0.9     | Atom string interning (DefaultAtom, etc.)      |
 
 No other runtime dependencies.
 
@@ -44,21 +44,21 @@ Generational indices allow $O(1)$ insertion and deletion without invalidating ot
 
 ### html
 
-Implements `html5ever::TreeSink` directly on a `DocumentBuilder` wrapper. HTML tokens stream into the generational arena in a single allocation pass. There is no intermediate `RcDom` tree. Extracts raw CSS text from `<style>` elements and stores it on `Document::style_texts`. Whitespace text nodes are preserved so inline spacing semantics are not lost.
+Implements a purely custom byte-stream loop using `html5gum` token emitters. HTML tokens stream into the generational arena in a single allocation pass utilizing `std::str::from_utf8`. Implicit native HTML tag auto-closures (e.g. `<p>`, `<li>`) are boundary checked strictly during the parser's `StartTag` emissions. Extracts raw CSS text from `<style>` elements and stores it on `Document::style_texts`. Whitespace text nodes are preserved so inline spacing semantics are not lost.
 
 ### css
 
 - Parses CSS text into a `StyleSheet` containing pre-parsed `ComplexSelector` ASTs.
-- Supports tag, class, ID, compound, and complex combinators (`>`, ` `). Class attribute subsets are stored in $O(1)$ hash maps on `ElementData`.
-- Computes specificity as `(id_count, class_count, tag_count)` at parse time.
-- Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent to child via `Rc` memory sharing to avoid explosion memory costs cascading through sub-DOMs.
+- Combines cascaded string structures into strongly typed `crate::dom::StyleValue` Enums ensuring layout and render loops run numerical primitives natively instead of dynamically matching float parsings continuously.
+- Computes specificity as `(id_count, class_count, tag_count)` at parse time. Merges pre-calculated Hash Buckets in $O(N)$ logic over dynamically evaluating `$O(N \log N)$` sorts per target struct boundary.
+- Supports tag, class, ID, compound, and complex combinators (`>`, ` `). Class attribute subsets are stored in $O(1)$ HashSets on `ElementData`.
+- Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent to child via `Rc` memory sharing to avoid tree explode bounds cascading.
 - Expands `margin`, `padding` shorthands (1/2/4-value syntax) and maps `background` to `background-color`.
-- Uses `string_cache::DefaultAtom` for property names to minimize memory overhead during style resolution.
-- Inline `style=""` attributes are parsed natively via `cssparser`'s `DeclarationParser` trait.
+- Inline `style=""` attributes are parsed via `cssparser`'s `DeclarationParser` trait securely resolving strings into `StyleValue` outputs.
 
 ### layout
 
-Walks the `StyledNode` tree and builds a parallel `TaffyTree<TextMeasureContext>`. Text nodes become leaf nodes utilizing `cosmic-text` and a `TextLayoutCache` inside Taffy's contextual measurement system closures to produce accurate wrapping blocks bounding the element layouts prior to pixel rasterization execution.
+Walks the `StyledNode` tree and builds a parallel `TaffyTree<TextMeasureContext>`. Text nodes become leaf nodes utilizing `cosmic-text` and a strictly persistent global `TextLayoutCache`. By lifting HarfBuzz instantiation entirely out of the solver loop (`compute_layout_with_measure`), layouts do not execute consecutive buffer cycles recursively preventing core CPU timeouts seamlessly.
 
 Supported CSS properties mapped to Taffy:
 - `display`: flex, grid, block, none (inline/inline-block are recognized but not yet laid out differently)
@@ -86,9 +86,9 @@ Embeds QuickJS via `rquickjs`. The `JsEngine` holds the `Document` behind `Rc<Re
 
 Exposed globals:
 - `console.log(msg)`, `console.warn(msg)`, `console.error(msg)` -- print to stdout
-- `document.getElementById(id)` -- returns a native `NodeHandle` object, or null
-- `document.querySelector(selector)` -- supports complex combinators, returns a `NodeHandle`, or null
-- `document.createElement(tagName)` -- inserts an Element into the arena, returns a `NodeHandle`
+- `document.getElementById(id)` -- returns a native `NodeHandle` object seamlessly sharing identical JavaScript closures natively tracked inside a global `__nodeCache` (preserving equality integrity via `===`).
+- `document.querySelector(selector)` -- supports complex combinators, returning identically cached JS representations per Arena ID.
+- `document.createElement(tagName)` -- dynamically parses nodes bound strictly inside the cache.
 - `document.appendChild(parent, child)` -- appends a child node using native object handles
 - `document.addEventListener(event, callback)` -- logs registration (scaffold)
 - `setTimeout(callback, delay)` -- registers a cooperative timer; host must call `pump()`

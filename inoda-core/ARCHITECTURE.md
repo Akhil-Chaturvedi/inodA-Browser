@@ -24,7 +24,9 @@ render::draw_layout_tree()  -- walks Layout + StyledNode in parallel,
                                stroke_rect (border), draw_text (text content)
 ```
 
-JavaScript execution happens outside this pipeline. The host application creates a `JsEngine`, passing in the `Document`. JS code can read and mutate the DOM via `Rc<RefCell<Document>>`. QuickJS is single-threaded; access is serialized. There is currently no mechanism to trigger re-style or re-layout from JS mutations. Timer callbacks registered via `setTimeout` fire only when the host calls `JsEngine::pump()`.
+```
+
+JavaScript execution happens outside this pipeline. The host application creates a `JsEngine`, passing in the `Document`. JS code can read and mutate the DOM via `Rc<RefCell<Document>>`. QuickJS is single-threaded; access is serialized. Extracted nodes persist object identity bindings back to the Javascript context via a global `__nodeCache`. There is currently no mechanism to trigger re-style or re-layout from JS mutations. Timer callbacks registered via `setTimeout` fire only when the host calls `JsEngine::pump()`.
 
 ## Data structures
 
@@ -70,7 +72,7 @@ Generational indices provide O(1) insertion and deletion without index invalidat
 ```
 StyledNode {
     node_id: NodeId,                            // generational_arena::Index
-    specified_values: std::rc::Rc<Vec<(string_cache::DefaultAtom, String)>>, // shared computed CSS properties
+    specified_values: std::rc::Rc<Vec<(string_cache::DefaultAtom, crate::dom::StyleValue)>>, // strongly typed layout properties
     children: Vec<StyledNode>                   // mirrors DOM children
 }
 ```
@@ -89,7 +91,7 @@ StyleSheet {
 IndexedRule { selector: ComplexSelector, declarations: std::rc::Rc<Vec<Declaration>> }
 ComplexSelector { last: CompoundSelector, ancestors: Vec<(Combinator, CompoundSelector)>, specificity: (u32, u32, u32) }
 Combinator = Descendant | Child
-Declaration { name: string_cache::DefaultAtom, value: String }
+Declaration { name: string_cache::DefaultAtom, value: crate::dom::StyleValue }
 ```
 
 Selectors are pre-parsed into a `ComplexSelector` AST at stylesheet creation time. Specificity is calculated once during parsing, and rules are distributed into $O(1)$ Hash Maps (`by_tag`, `by_class`, etc.) based on their right-most matching segment. Combinators (`>` for child, space for descendant) are evaluated using recursive tree backtracking logic against `generational_arena` node pointers. Inline `style` attributes are parsed using `cssparser`'s `DeclarationParser` trait directly.
@@ -112,7 +114,7 @@ Selectors are scored as `(id_count, class_count, tag_count)`. Matched rules are 
 
 ## Text measurement
 
-Text nodes are inserted into Taffy as leaf nodes with a measurement context. During `compute_layout_with_measure`, text uses `cosmic-text` and `fontdb` to perform actual text shaping and font metric calculation via a `TextLayoutCache`. This provides accurate glyph sizing and wrapping based on system or hosted fonts rather than approximations.
+Text nodes are inserted into Taffy as leaf nodes with a measurement context. During `compute_layout_with_measure`, text uses `cosmic-text` and `fontdb` to perform actual text shaping and font metric calculation natively reusing a fully globalized `TextLayoutCache`. Evaluating layout outside the solver iteratively skips string tracking loops and safely resolves Taffy measurements persistently over continuous layout recalculations preventing 100% CPU bounds lockups.
 
 ## Thread safety
 
@@ -120,4 +122,4 @@ Text nodes are inserted into Taffy as leaf nodes with a measurement context. Dur
 
 ## HTML parsing
 
-The HTML module implements a purely custom structural byte-stream using `html5gum` token emitters. This structure entirely ditches abstract `TreeSink` logic. It maps byte slices from the emitter sequentially into `generational_arena` ID allocations natively, executing at $O(1)$ token parsing cost with precisely zero runtime heap allocations.
+The HTML module implements a purely custom structural byte-stream using `html5gum` token emitters. This structure entirely ditches abstract `TreeSink` logic. It maps byte slices from the emitter sequentially into `generational_arena` ID allocations natively spanning `std::str::from_utf8` validation iteratively without allocating strings over intermediate heap boundaries. Standard implicit tag closures (e.g., `<p>`) implicitly check sibling chains across loop intervals resolving zero depth limit recursion securely.

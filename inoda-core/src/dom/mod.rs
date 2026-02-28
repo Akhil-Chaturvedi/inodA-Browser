@@ -4,7 +4,7 @@
 //! index invalidation. Nodes can be safely removed and their indices
 //! will not be reused until the generation wraps.
 //!
-//! Tag names and attribute keys are interned using `markup5ever::LocalName`
+//! Tag names and attribute keys are interned using `string_cache::DefaultAtom`
 //! to minimize memory usage and enable O(1) comparison.
 //!
 //! Parent pointers are stored directly on nodes to keep parent traversal
@@ -35,9 +35,9 @@ pub enum Node {
 
 #[derive(Debug, Clone)]
 pub struct ElementData {
-    pub tag_name: markup5ever::LocalName,
-    pub attributes: Vec<(markup5ever::LocalName, String)>,
-    pub classes: std::collections::HashSet<markup5ever::LocalName>,
+    pub tag_name: string_cache::DefaultAtom,
+    pub attributes: Vec<(string_cache::DefaultAtom, String)>,
+    pub classes: std::collections::HashSet<string_cache::DefaultAtom>,
     pub parent: Option<NodeId>,
     pub first_child: Option<NodeId>,
     pub last_child: Option<NodeId>,

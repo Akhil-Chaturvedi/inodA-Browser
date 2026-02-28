@@ -65,6 +65,7 @@ pub fn compute_layout(
 
     let font_system = RefCell::new(font_system);
     let measured_text_nodes: RefCell<TextLayoutCache> = RefCell::new(HashMap::new());
+    let mut buffer_cache = HashMap::<crate::dom::NodeId, Buffer>::new();
 
     tree.compute_layout_with_measure(
         root_taffy_node,
@@ -83,72 +84,63 @@ pub fn compute_layout(
                 _ => viewport_width.max(1.0),
             };
 
-            let text = match document.nodes.get(ctx.node_id) {
-                Some(crate::dom::Node::Text(txt)) => txt.text.as_str(),
-                _ => "",
+            let mut sys = font_system.borrow_mut();
+            
+            let buffer = buffer_cache.entry(ctx.node_id).or_insert_with(|| {
+                let text = match document.nodes.get(ctx.node_id) {
+                    Some(crate::dom::Node::Text(txt)) => txt.text.as_str(),
+                    _ => "",
+                };
+                let line_height = (ctx.font_size * 1.2).max(1.0);
+                let mut b = Buffer::new(&mut sys, Metrics::new(ctx.font_size, line_height));
+                b.set_wrap(&mut sys, Wrap::WordOrGlyph);
+                b.set_text(&mut sys, text, Attrs::new(), Shaping::Advanced);
+                b
+            });
+
+            buffer.set_size(
+                &mut sys,
+                Some(width_constraint.max(1.0)),
+                Some(f32::INFINITY),
+            );
+            buffer.shape_until_scroll(&mut sys, false);
+
+            let mut lines = Vec::new();
+            let mut max_width: f32 = 0.0;
+            for run in buffer.layout_runs() {
+                max_width = max_width.max(run.line_w);
+                lines.push(TextLineLayout {
+                    text: run.text.to_string(),
+                    line_width: run.line_w,
+                });
+            }
+
+            if lines.is_empty() {
+                lines.push(TextLineLayout {
+                    text: String::new(),
+                    line_width: 0.0,
+                });
+            }
+
+            let width = max_width.min(width_constraint.max(1.0));
+            let line_height = (ctx.font_size * 1.2).max(1.0);
+            let height = (lines.len() as f32) * line_height;
+
+            let layout = TextNodeLayout {
+                lines,
+                line_height,
+                width,
+                height,
             };
 
-            let mut sys = font_system.borrow_mut();
-            let text_layout = measure_text_with_cosmic(&mut sys, text, width_constraint, ctx.font_size);
+            measured_text_nodes.borrow_mut().insert(ctx.node_id, layout);
             
-            let size = taffy::geometry::Size {
-                width: text_layout.width,
-                height: text_layout.height,
-            };
-            
-            measured_text_nodes.borrow_mut().insert(ctx.node_id, text_layout);
-            size
+            taffy::geometry::Size { width, height }
         },
     )
     .unwrap();
 
     (tree, root_taffy_node, measured_text_nodes.into_inner())
-}
-
-fn measure_text_with_cosmic(
-    font_system: &mut FontSystem,
-    text: &str,
-    width_constraint: f32,
-    font_size: f32,
-) -> TextNodeLayout {
-    let line_height = (font_size * 1.2).max(1.0);
-
-    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
-    buffer.set_wrap(font_system, Wrap::WordOrGlyph);
-    buffer.set_size(
-        font_system,
-        Some(width_constraint.max(1.0)),
-        Some(f32::INFINITY),
-    );
-    buffer.set_text(font_system, text, Attrs::new(), Shaping::Advanced);
-    buffer.shape_until_scroll(font_system, false);
-
-    let mut lines = Vec::new();
-    let mut max_width: f32 = 0.0;
-    for run in buffer.layout_runs() {
-        max_width = max_width.max(run.line_w);
-        lines.push(TextLineLayout {
-            text: run.text.to_string(),
-            line_width: run.line_w,
-        });
-    }
-
-    if lines.is_empty() {
-        lines.push(TextLineLayout {
-            text: String::new(),
-            line_width: 0.0,
-        });
-    }
-
-    let width = max_width.min(width_constraint.max(1.0));
-    let height = (lines.len() as f32) * line_height;
-
-    TextNodeLayout {
-        lines,
-        line_height,
-        width,
-        height,
-    }
 }
 
 fn build_taffy_node(

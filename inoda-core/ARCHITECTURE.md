@@ -8,12 +8,12 @@ This document describes the data flow and module boundaries inside `inoda-core`.
 HTML string
   |
   v
-html::parse_html()          -- html5ever tokenizer -> TreeSink -> arena DOM (Document)
-  |                            also extracts <style> tag contents
+html::parse_html()          -- html5gum tokenizer -> byte-stream iterator -> arena DOM (Document)
+  |                            also extracts <style> tag contents inline
   v
-css::parse_stylesheet()     -- cssparser tokenizer -> StyleSheet (Vec<StyleRule>)
-css::compute_styles()       -- walks DOM, matches selectors, applies specificity,
-  |                            inherits properties, expands shorthands -> StyledNode tree
+css::parse_stylesheet()     -- cssparser tokenizer -> StyleSheet (HashMap<DefaultAtom, Vec<IndexedRule>>)
+css::compute_styles()       -- walks DOM, resolves specificity against HashMaps via right-to-left combinator backtracking,
+  |                            inherits properties via Rc::clone, expands shorthands -> StyledNode tree
   v
 layout::compute_layout()    -- converts StyledNode tree to TaffyTree, resolves
   |                            dimensions (px, %, vw, vh, em, rem, auto),
@@ -42,9 +42,9 @@ Node = Element(ElementData) | Text(TextData) | Root(RootData)
 NodeId = generational_arena::Index  // type alias
 
 ElementData {
-    tag_name: markup5ever::LocalName,   // interned
-    attributes: Vec<(markup5ever::LocalName, String)>,
-    classes: std::collections::HashSet<markup5ever::LocalName>,
+    tag_name: string_cache::DefaultAtom,   // interned
+    attributes: Vec<(string_cache::DefaultAtom, String)>,
+    classes: std::collections::HashSet<string_cache::DefaultAtom>,
     parent: Option<NodeId>,
     first_child: Option<NodeId>,
     last_child: Option<NodeId>,
@@ -80,14 +80,19 @@ This is a tree (not arena). Each node owns its children. It exists only during l
 ### StyleSheet (css/mod.rs)
 
 ```
-StyleSheet { rules: Vec<StyleRule> }
-StyleRule  { selectors: Vec<ComplexSelector>, declarations: Vec<Declaration> }
+StyleSheet {
+    by_id: HashMap<DefaultAtom, Vec<IndexedRule>>,
+    by_class: HashMap<DefaultAtom, Vec<IndexedRule>>,
+    by_tag: HashMap<DefaultAtom, Vec<IndexedRule>>,
+    universal: Vec<IndexedRule>
+}
+IndexedRule { selector: ComplexSelector, declarations: std::rc::Rc<Vec<Declaration>> }
 ComplexSelector { last: CompoundSelector, ancestors: Vec<(Combinator, CompoundSelector)>, specificity: (u32, u32, u32) }
 Combinator = Descendant | Child
 Declaration { name: string_cache::DefaultAtom, value: String }
 ```
 
-Selectors are pre-parsed into a `ComplexSelector` AST at stylesheet creation time. Specificity is calculated once during parsing. Combinators (`>` for child, space for descendant) are supported by walking in-node parent pointers during matching. Inline `style` attributes are parsed using `cssparser`'s `DeclarationParser` trait directly.
+Selectors are pre-parsed into a `ComplexSelector` AST at stylesheet creation time. Specificity is calculated once during parsing, and rules are distributed into $O(1)$ Hash Maps (`by_tag`, `by_class`, etc.) based on their right-most matching segment. Combinators (`>` for child, space for descendant) are evaluated using recursive tree backtracking logic against `generational_arena` node pointers. Inline `style` attributes are parsed using `cssparser`'s `DeclarationParser` trait directly.
 
 ### PendingTimer (js/mod.rs)
 
@@ -111,8 +116,8 @@ Text nodes are inserted into Taffy as leaf nodes with a measurement context. Dur
 
 ## Thread safety
 
-`JsEngine` holds the `Document` inside `Rc<RefCell<Document>>`. QuickJS and its wrapper `rquickjs` are designed for single-threaded usage. All JS-exposed functions (e.g., in `NodeHandle`) borrow the `RefCell` to access the DOM. This model provides high performance for embedded environments by avoiding mutex contention while ensuring memory safety through Rust's runtime borrow checking. Timer state is similarly managed via `Rc<RefCell>`.
+`JsEngine` holds the `Document` inside `Rc<RefCell<Document>>`. QuickJS and its wrapper `rquickjs` are designed for single-threaded usage. All JS-exposed functions (e.g., in `NodeHandle`) borrow the `RefCell` to access the DOM. This model provides maximum deterministic performance for embedded environments by avoiding mutex locking arrays while ensuring memory safety through Rust's runtime borrow checking. `NodeHandle` captures a `Weak<RefCell<Document>>` so `rquickjs` Garbage Collection passes map natively to Rust `Drop` trait execution, severing detached `NodeId`s correctly from `generational_arena`.
 
 ## HTML parsing
 
-The HTML module implements `html5ever::TreeSink` directly on a `DocumentBuilder` wrapper. This allows the parser to stream tokens into the generational arena in a single pass, without constructing an intermediate `RcDom` tree. The `DocumentBuilder` uses `RefCell` for interior mutability since `TreeSink` methods take `&self`.
+The HTML module implements a purely custom structural byte-stream using `html5gum` token emitters. This structure entirely ditches abstract `TreeSink` logic. It maps byte slices from the emitter sequentially into `generational_arena` ID allocations natively, executing at $O(1)$ token parsing cost with precisely zero runtime heap allocations.

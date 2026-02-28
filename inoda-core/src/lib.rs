@@ -164,7 +164,7 @@ mod tests {
         let mut doc = dom::Document::new();
 
         let parent = doc.add_node(dom::Node::Element(dom::ElementData {
-            tag_name: markup5ever::local_name!("div"),
+            tag_name: string_cache::DefaultAtom::from("div"),
             attributes: Vec::new(),
             classes: std::collections::HashSet::new(),
             parent: None,
@@ -175,7 +175,7 @@ mod tests {
         }));
 
         let child = doc.add_node(dom::Node::Element(dom::ElementData {
-            tag_name: markup5ever::local_name!("span"),
+            tag_name: string_cache::DefaultAtom::from("span"),
             attributes: Vec::new(),
             classes: std::collections::HashSet::new(),
             parent: None,

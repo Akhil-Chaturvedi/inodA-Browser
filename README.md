@@ -1,6 +1,6 @@
 # inodA Browser
 
-An experimental web browser engine for resource-constrained embedded systems. The engine is designed to parse and render basic HTML, CSS, and JavaScript with minimal memory and CPU overhead, serving as a lightweight alternative to Chromium or Firefox for specialized hardware.
+An experimental web browser engine for resource-constrained embedded systems. The engine is deliberately restricted to parse and render elementary HTML, CSS, and JavaScript with static memory bounds and bounded CPU overhead, serving as an inflexible but ultra-lightweight alternative to Chromium or Firefox for specialized hardware.
 
 ## Repository structure
 
@@ -26,9 +26,9 @@ See [inoda-core/ARCHITECTURE.md](inoda-core/ARCHITECTURE.md) for data flow, data
 
 ## Current state
 
-The engine parses HTML pages with embedded CSS, builds an intrusive linked list arena-based DOM with O(1) parent traversing and zero-allocation mutations, and implements $O(1)$ CSS matching (tag, class, ID, compound, and complex combinators). It resolves Flexbox/Grid layout and renders backgrounds, borders, and text to a canvas via `cosmic-text` and `fontdb`. A JavaScript bridge provides a native `NodeHandle` class for DOM manipulation (`getElementById` via $O(1)$ lookup mapping, `querySelector`, `createElement`, `setAttribute`, `getAttribute`, `removeChild`) and a cooperative `setTimeout`.
+The engine parses HTML elements via synchronous blocking sequences, allocating tokens natively into an intrusive linked list arena-based DOM. This structure supports precise $O(1)$ parent traversals and $O(1)$ constant insertions/removals. The CSS layout engine requires `cosmic-text` glyph rendering mapped internally against $O(1)$ specific selectors (tag, class, ID). Combinators traverse recursively natively up the document structure. The JS engine is solely single-threaded and synchronously blocked, exposing a `NodeHandle` mapping structure allowing manual Javascript logic.
 
-The engine uses string interning (via `string_cache`) for tag names and CSS properties to minimize memory overhead. There is no networking, resource loading, or image support. The host application must provide a window or surface, an event loop, and a renderer backend implementation.
+Memory pointers map statically back to interning (via `string_cache`), strictly pooling native DOM elements to identical cache points. There is zero networking, asset streaming, image loading, or complex iframe nesting built in. The host system strictly requires independent application definitions spanning Event Loops and graphical Canvas bindings.
 
 ## Building
 

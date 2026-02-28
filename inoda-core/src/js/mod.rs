@@ -35,14 +35,19 @@ use std::time::Instant;
 pub struct NodeHandle {
     arena_index: usize,
     arena_generation: u64,
+    document: std::rc::Weak<std::cell::RefCell<crate::dom::Document>>,
 }
 
 impl NodeHandle {
-    pub fn from_node_id(id: crate::dom::NodeId) -> Self {
+    pub fn from_node_id(
+        id: crate::dom::NodeId,
+        doc: &std::rc::Rc<std::cell::RefCell<crate::dom::Document>>,
+    ) -> Self {
         let (idx, generation) = id.into_raw_parts();
         NodeHandle {
             arena_index: idx,
             arena_generation: generation,
+            document: std::rc::Rc::downgrade(doc),
         }
     }
 
@@ -53,7 +58,20 @@ impl NodeHandle {
 
 impl<'js> Trace<'js> for NodeHandle {
     fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {
-        // No JS values to trace; NodeHandle only contains plain integers.
+        // No JS values to trace; NodeHandle only contains plain integers and a weak ref.
+    }
+}
+
+impl Drop for NodeHandle {
+    fn drop(&mut self) {
+        if let Some(doc_rc) = self.document.upgrade() {
+            if let Ok(mut doc) = doc_rc.try_borrow_mut() {
+                let id = self.to_node_id();
+                if id != doc.root_id && doc.parent_of(id).is_none() {
+                    doc.remove_node(id);
+                }
+            }
+        }
     }
 }
 
@@ -176,7 +194,7 @@ impl JsEngine {
                     let mut doc = doc_ref.borrow_mut();
                     let node_id = this.borrow().to_node_id();
                     if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
-                        let local_attr = markup5ever::LocalName::from(attr.as_str());
+                        let local_attr = string_cache::DefaultAtom::from(attr.as_str());
                         if let Some(pos) =
                             data.attributes.iter().position(|(k, _)| *k == local_attr)
                         {
@@ -188,7 +206,7 @@ impl JsEngine {
                         if &*local_attr == "class" {
                             data.classes.clear();
                             for c in value.split_whitespace() {
-                                data.classes.insert(markup5ever::LocalName::from(c));
+                                data.classes.insert(string_cache::DefaultAtom::from(c));
                             }
                         }
                     }
@@ -247,7 +265,7 @@ impl JsEngine {
                     if let Some(&node_id) = doc.id_map.get(&id) {
                         if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
                             return Some(NodeHandleWithTag {
-                                handle: NodeHandle::from_node_id(node_id),
+                                handle: NodeHandle::from_node_id(node_id, &doc_ref),
                                 tag_name: data.tag_name.to_string(),
                                 node_key: format!(
                                     "{}:{}",
@@ -285,7 +303,7 @@ impl JsEngine {
 
                             if is_match {
                                 return Some(NodeHandleWithTag {
-                                    handle: NodeHandle::from_node_id(node_id),
+                                    handle: NodeHandle::from_node_id(node_id, &doc_ref),
                                     tag_name: data.tag_name.to_string(),
                                     node_key: format!(
                                         "{}:{}",
@@ -324,7 +342,7 @@ impl JsEngine {
                     let mut doc = doc_ref.borrow_mut();
                     let tag_name_clone = tag_name.clone();
                     let node = crate::dom::Node::Element(crate::dom::ElementData {
-                        tag_name: markup5ever::LocalName::from(tag_name.as_str()),
+                        tag_name: string_cache::DefaultAtom::from(tag_name.as_str()),
                         attributes: Vec::new(),
                         classes: std::collections::HashSet::new(),
                         parent: None,
@@ -337,7 +355,7 @@ impl JsEngine {
                     drop(doc);
 
                     NodeHandleWithTag {
-                        handle: NodeHandle::from_node_id(index),
+                        handle: NodeHandle::from_node_id(index, &doc_ref),
                         tag_name: tag_name_clone,
                         node_key: format!(
                             "{}:{}",

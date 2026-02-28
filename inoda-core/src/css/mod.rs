@@ -52,15 +52,65 @@ pub struct ComplexSelector {
     pub specificity: (u32, u32, u32),
 }
 
-/// A simple structure storing the selectors matching a rule block
+#[derive(Debug, Clone)]
+pub struct IndexedRule {
+    pub selector: ComplexSelector,
+    pub declarations: std::rc::Rc<Vec<Declaration>>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct StyleSheet {
-    pub rules: Vec<StyleRule>,
+    pub by_id: std::collections::HashMap<string_cache::DefaultAtom, Vec<IndexedRule>>,
+    pub by_class: std::collections::HashMap<string_cache::DefaultAtom, Vec<IndexedRule>>,
+    pub by_tag: std::collections::HashMap<string_cache::DefaultAtom, Vec<IndexedRule>>,
+    pub universal: Vec<IndexedRule>,
+}
+
+impl StyleSheet {
+    pub fn add_rule(&mut self, rule: StyleRule) {
+        let decls = std::rc::Rc::new(rule.declarations);
+        for selector in rule.selectors {
+            let indexed = IndexedRule {
+                selector: selector.clone(),
+                declarations: std::rc::Rc::clone(&decls),
+            };
+
+            let mut id_key = None;
+            let mut class_key = None;
+            let mut tag_key = None;
+
+            for part in &selector.last.parts {
+                match part {
+                    SimpleSelector::Id(id) => { id_key = Some(id.clone()); }
+                    SimpleSelector::Class(c) => { if class_key.is_none() { class_key = Some(c.clone()); } }
+                    SimpleSelector::Tag(t) => { tag_key = Some(t.clone()); }
+                    _ => {}
+                }
+            }
+
+            if let Some(id) = id_key {
+                self.by_id.entry(string_cache::DefaultAtom::from(id.as_str())).or_default().push(indexed);
+            } else if let Some(class) = class_key {
+                self.by_class.entry(string_cache::DefaultAtom::from(class.as_str())).or_default().push(indexed);
+            } else if let Some(tag) = tag_key {
+                self.by_tag.entry(string_cache::DefaultAtom::from(tag.as_str())).or_default().push(indexed);
+            } else {
+                self.universal.push(indexed);
+            }
+        }
+    }
+
+    pub fn sort_rules(&mut self) {
+        let sort_fn = |a: &IndexedRule, b: &IndexedRule| a.selector.specificity.cmp(&b.selector.specificity);
+        for list in self.by_id.values_mut() { list.sort_by(sort_fn); }
+        for list in self.by_class.values_mut() { list.sort_by(sort_fn); }
+        for list in self.by_tag.values_mut() { list.sort_by(sort_fn); }
+        self.universal.sort_by(sort_fn);
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct StyleRule {
-    /// Pre-parsed complex selector list (comma-separated selectors become separate entries).
     pub selectors: Vec<ComplexSelector>,
     pub declarations: Vec<Declaration>,
 }
@@ -222,9 +272,9 @@ fn parse_compound_selector(s: &str) -> CompoundSelector {
 /// Match a pre-parsed compound selector against an element's tag name and attributes.
 fn match_compound_selector(
     compound: &CompoundSelector,
-    tag_name: &markup5ever::LocalName,
-    attributes: &[(markup5ever::LocalName, String)],
-    classes: &std::collections::HashSet<markup5ever::LocalName>,
+    tag_name: &string_cache::DefaultAtom,
+    attributes: &[(string_cache::DefaultAtom, String)],
+    classes: &std::collections::HashSet<string_cache::DefaultAtom>,
 ) -> bool {
     if compound.parts.is_empty() {
         return false;
@@ -243,7 +293,7 @@ fn match_compound_selector(
                 }
             }
             SimpleSelector::Class(c) => {
-                let atom = markup5ever::LocalName::from(c.as_str());
+                let atom = string_cache::DefaultAtom::from(c.as_str());
                 if !classes.contains(&atom) {
                     return false;
                 }
@@ -265,12 +315,43 @@ fn match_compound_selector(
     true
 }
 
+fn match_ancestors_recursive(
+    ancestors: &[(Combinator, CompoundSelector)],
+    ancestor_idx: usize,
+    current_node_id: crate::dom::NodeId,
+    document: &crate::dom::Document,
+) -> bool {
+    if ancestor_idx == ancestors.len() {
+        return true;
+    }
+
+    let (comb, compound) = &ancestors[ancestor_idx];
+    let mut check_id = document.parent_of(current_node_id);
+
+    while let Some(pid) = check_id {
+        if let Some(crate::dom::Node::Element(data)) = document.nodes.get(pid) {
+            if match_compound_selector(compound, &data.tag_name, &data.attributes, &data.classes) {
+                if match_ancestors_recursive(ancestors, ancestor_idx + 1, pid, document) {
+                    return true;
+                }
+            }
+        }
+        
+        if *comb == Combinator::Child {
+            break;
+        }
+
+        check_id = document.parent_of(pid);
+    }
+
+    false
+}
+
 fn match_complex_selector(
     complex: &ComplexSelector,
     node_id: crate::dom::NodeId,
     document: &crate::dom::Document,
 ) -> bool {
-    // Fast path: does the right-most part match the current element?
     if let Some(crate::dom::Node::Element(data)) = document.nodes.get(node_id) {
         if !match_compound_selector(&complex.last, &data.tag_name, &data.attributes, &data.classes) {
             return false;
@@ -279,46 +360,7 @@ fn match_complex_selector(
         return false;
     }
 
-    // Now walk up the ancestors based on combinators
-    let mut current_id = node_id;
-
-    for (comb, ancestor_compound) in &complex.ancestors {
-        let mut matched = false;
-
-        loop {
-            // Move to parent
-            if let Some(parent_id) = document.parent_of(current_id) {
-                current_id = parent_id;
-
-                if let Some(crate::dom::Node::Element(parent_data)) = document.nodes.get(current_id)
-                {
-                    if match_compound_selector(
-                        ancestor_compound,
-                        &parent_data.tag_name,
-                        &parent_data.attributes,
-                        &parent_data.classes,
-                    ) {
-                        matched = true;
-                        break;
-                    }
-                }
-
-                // If it's a direct child combinator and we didn't match the immediate parent, we fail this sequence.
-                if *comb == Combinator::Child {
-                    break;
-                }
-            } else {
-                // Root of document
-                break;
-            }
-        }
-
-        if !matched {
-            return false;
-        }
-    }
-
-    true
+    match_ancestors_recursive(&complex.ancestors, 0, node_id, document)
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +373,7 @@ pub fn parse_stylesheet(css: &str) -> StyleSheet {
     let mut stylesheet = StyleSheet::default();
 
     parse_rules_list(&mut parser, &mut stylesheet);
+    stylesheet.sort_rules();
     stylesheet
 }
 
@@ -341,9 +384,12 @@ pub fn compute_styles(
     let mut combined_sheet = base_stylesheet.clone();
 
     for style_text in &document.style_texts {
-        let inline_sheet = parse_stylesheet(style_text);
-        combined_sheet.rules.extend(inline_sheet.rules);
+        let mut input = ParserInput::new(style_text);
+        let mut parser = Parser::new(&mut input);
+        parse_rules_list(&mut parser, &mut combined_sheet);
     }
+    
+    combined_sheet.sort_rules();
 
     build_styled_node(
         document,
@@ -373,58 +419,61 @@ fn build_styled_node(
     stylesheet: &StyleSheet,
     parent_styles: &std::rc::Rc<Vec<(string_cache::DefaultAtom, String)>>,
 ) -> crate::dom::StyledNode {
-    let mut specified_values = Vec::new();
-
-    for (k, v) in parent_styles.iter() {
-        if is_inheritable(k) {
-            specified_values.push((k.clone(), v.clone()));
-        }
-    }
-
+    let mut new_declarations = Vec::new();
     let mut children_ids = Vec::new();
 
     if let Some(node) = document.nodes.get(node_id) {
         match node {
             crate::dom::Node::Element(data) => {
-                let mut matched_rules: Vec<((u32, u32, u32), &StyleRule)> = Vec::new();
-                for rule in &stylesheet.rules {
-                    // Check each complex selector in the pre-parsed list
-                    for complex in &rule.selectors {
-                        if match_complex_selector(complex, node_id, document) {
-                            matched_rules.push((complex.specificity, rule));
-                            break; // matched this rule via at least one selector
+                let id_attr = data
+                    .attributes
+                    .iter()
+                    .find(|(k, _)| &**k == "id")
+                    .map(|(_, v)| string_cache::DefaultAtom::from(v.as_str()));
+
+                let mut candidate_rules: Vec<&IndexedRule> = Vec::new();
+
+                if let Some(id) = &id_attr {
+                    if let Some(rules) = stylesheet.by_id.get(id) {
+                        candidate_rules.extend(rules);
+                    }
+                }
+                for class in &data.classes {
+                    if let Some(rules) = stylesheet.by_class.get(class) {
+                        candidate_rules.extend(rules);
+                    }
+                }
+                if let Some(rules) = stylesheet.by_tag.get(&data.tag_name) {
+                    candidate_rules.extend(rules);
+                }
+                candidate_rules.extend(&stylesheet.universal);
+
+                // Re-sort candidate rules since we pulled them from multiple buckets
+                candidate_rules.sort_by_key(|r| r.selector.specificity);
+
+                for rule in candidate_rules {
+                    if match_complex_selector(&rule.selector, node_id, document) {
+                        for decl in rule.declarations.iter() {
+                            if let Some(pos) = new_declarations.iter().position(|(k, _)| k == &decl.name) {
+                                new_declarations[pos].1 = decl.value.clone();
+                            } else {
+                                new_declarations.push((decl.name.clone(), decl.value.clone()));
+                            }
                         }
                     }
                 }
 
-                // Sort stably to preserve source-order precedence for equal specificities
-                matched_rules.sort_by_key(|(spec, _)| *spec);
-
-                for (_, rule) in matched_rules {
-                    for decl in &rule.declarations {
-                        if let Some(pos) =
-                            specified_values.iter().position(|(k, _)| k == &decl.name)
-                        {
-                            specified_values[pos].1 = decl.value.clone();
-                        } else {
-                            specified_values.push((decl.name.clone(), decl.value.clone()));
-                        }
-                    }
-                }
-
-                if let Some((_, style_attr)) = data.attributes.iter().find(|(k, _)| &**k == "style")
-                {
+                if let Some((_, style_attr)) = data.attributes.iter().find(|(k, _)| &**k == "style") {
                     let inline_decls = parse_inline_declarations(style_attr);
                     for decl in &inline_decls {
-                        if let Some(pos) =
-                            specified_values.iter().position(|(k, _)| k == &decl.name)
-                        {
-                            specified_values[pos].1 = decl.value.clone();
+                        if let Some(pos) = new_declarations.iter().position(|(k, _)| k == &decl.name) {
+                            new_declarations[pos].1 = decl.value.clone();
                         } else {
-                            specified_values.push((decl.name.clone(), decl.value.clone()));
+                            new_declarations.push((decl.name.clone(), decl.value.clone()));
                         }
                     }
                 }
+
                 let mut child = document.first_child_of(node_id);
                 while let Some(c) = child {
                     children_ids.push(c);
@@ -442,16 +491,33 @@ fn build_styled_node(
         }
     }
 
-    let specified_values_rc = std::rc::Rc::new(specified_values);
+    let final_styles = if new_declarations.is_empty() {
+        std::rc::Rc::clone(parent_styles)
+    } else {
+        let mut final_vec: Vec<(string_cache::DefaultAtom, String)> = parent_styles
+            .iter()
+            .filter(|(k, _)| is_inheritable(k))
+            .cloned()
+            .collect();
+            
+        for (k, v) in new_declarations {
+            if let Some(pos) = final_vec.iter().position(|(ek, _)| ek == &k) {
+                final_vec[pos].1 = v;
+            } else {
+                final_vec.push((k, v));
+            }
+        }
+        std::rc::Rc::new(final_vec)
+    };
 
     let children = children_ids
         .into_iter()
-        .map(|id| build_styled_node(document, id, stylesheet, &specified_values_rc))
+        .map(|id| build_styled_node(document, id, stylesheet, &final_styles))
         .collect();
 
     crate::dom::StyledNode {
         node_id,
-        specified_values: specified_values_rc,
+        specified_values: final_styles,
         children,
     }
 }
@@ -459,7 +525,7 @@ fn build_styled_node(
 fn parse_rules_list<'i, 't>(parser: &mut Parser<'i, 't>, stylesheet: &mut StyleSheet) {
     while !parser.is_exhausted() {
         match parse_rule(parser) {
-            Ok(Some(rule)) => stylesheet.rules.push(rule),
+            Ok(Some(rule)) => stylesheet.add_rule(rule),
             Ok(None) => {}
             Err(_) => {
                 let _ = parser.parse_until_before(cssparser::Delimiter::CurlyBracketBlock, |p| {

@@ -57,6 +57,7 @@ pub struct ComplexSelector {
 pub struct IndexedRule {
     pub selector: ComplexSelector,
     pub declarations: std::rc::Rc<Vec<Declaration>>,
+    pub rule_index: usize,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -65,6 +66,7 @@ pub struct StyleSheet {
     pub by_class: std::collections::HashMap<string_cache::DefaultAtom, Vec<IndexedRule>>,
     pub by_tag: std::collections::HashMap<string_cache::DefaultAtom, Vec<IndexedRule>>,
     pub universal: Vec<IndexedRule>,
+    pub next_rule_index: usize,
 }
 
 impl StyleSheet {
@@ -74,7 +76,9 @@ impl StyleSheet {
             let indexed = IndexedRule {
                 selector: selector.clone(),
                 declarations: std::rc::Rc::clone(&decls),
+                rule_index: self.next_rule_index,
             };
+            self.next_rule_index += 1;
 
             let mut id_key = None;
             let mut class_key = None;
@@ -102,7 +106,9 @@ impl StyleSheet {
     }
 
     pub fn sort_rules(&mut self) {
-        let sort_fn = |a: &IndexedRule, b: &IndexedRule| a.selector.specificity.cmp(&b.selector.specificity);
+        let sort_fn = |a: &IndexedRule, b: &IndexedRule| {
+            a.selector.specificity.cmp(&b.selector.specificity).then_with(|| a.rule_index.cmp(&b.rule_index))
+        };
         for list in self.by_id.values_mut() { list.sort_by(sort_fn); }
         for list in self.by_class.values_mut() { list.sort_by(sort_fn); }
         for list in self.by_tag.values_mut() { list.sort_by(sort_fn); }
@@ -513,11 +519,13 @@ fn build_styled_node(
                     lists.push(stylesheet.universal.as_slice());
                 }
 
-                // $O(N)$ Linear merge of pre-sorted specificity buckets instead of $O(N \log N)$ dynamic sorting.
+                // Linear merge of pre-sorted specificity buckets instead of dynamic sorting.
                 while !lists.is_empty() {
                     let mut min_idx = 0;
                     for i in 1..lists.len() {
-                        if lists[i][0].selector.specificity < lists[min_idx][0].selector.specificity {
+                        let a = &lists[i][0];
+                        let b = &lists[min_idx][0];
+                        if a.selector.specificity.cmp(&b.selector.specificity).then_with(|| a.rule_index.cmp(&b.rule_index)) == std::cmp::Ordering::Less {
                             min_idx = i;
                         }
                     }

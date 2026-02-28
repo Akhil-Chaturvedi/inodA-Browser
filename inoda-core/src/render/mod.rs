@@ -1,9 +1,11 @@
 //! Rendering module.
 //!
 //! Walks the Taffy layout tree alongside the `StyledNode` tree and issues
-//! draw commands to an abstract renderer backend. `inoda-core` does not
-//! depend on OpenGL APIs; platform binaries can implement this trait using
-//! tiny-skia, LVGL, or any other raster target.
+//! draw commands to an abstract renderer backend. Text is rendered via
+//! pre-shaped `cosmic_text::LayoutGlyph` arrays rather than raw strings.
+//! `inoda-core` does not depend on OpenGL APIs; platform binaries can
+//! implement the `RendererBackend` trait using tiny-skia, LVGL, or any
+//! other raster target.
 
 use crate::{dom::StyledNode, layout::TextLayoutCache};
 use taffy::TaffyTree;
@@ -19,17 +21,17 @@ pub struct Color {
 pub struct TextDrawLine {
     pub x: f32,
     pub baseline_y: f32,
-    pub text: String,
+    pub glyphs: Vec<cosmic_text::LayoutGlyph>,
 }
 
 pub trait RendererBackend {
     fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color);
     fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32, line_width: f32, color: Color);
-    fn draw_text(&mut self, x: f32, y: f32, text: &str, size: f32, color: Color);
+    fn draw_glyphs(&mut self, x: f32, y: f32, glyphs: &[cosmic_text::LayoutGlyph], size: f32, color: Color);
 
     fn draw_text_layout(&mut self, lines: &[TextDrawLine], size: f32, color: Color) {
         for line in lines {
-            self.draw_text(line.x, line.baseline_y, &line.text, size, color);
+            self.draw_glyphs(line.x, line.baseline_y, &line.glyphs, size, color);
         }
     }
 }
@@ -75,7 +77,7 @@ pub fn draw_layout_tree<R: RendererBackend>(
             }
         }
 
-        if let Some(crate::dom::Node::Text(txt)) = document.nodes.get(styled_node.node_id) {
+        if let Some(crate::dom::Node::Text(_txt)) = document.nodes.get(styled_node.node_id) {
             let mut color = Color { r: 0, g: 0, b: 0 };
             if let Some((_, color_val)) = styled_node
                 .specified_values
@@ -108,12 +110,10 @@ pub fn draw_layout_tree<R: RendererBackend>(
                     .map(|(line_index, line)| TextDrawLine {
                         x: abs_x,
                         baseline_y: abs_y + (line_index as f32 * cache.line_height) + font_size,
-                        text: line.text.clone(),
+                        glyphs: line.glyphs.clone(),
                     })
                     .collect::<Vec<_>>();
                 renderer.draw_text_layout(&lines, font_size, color);
-            } else {
-                renderer.draw_text(abs_x, abs_y + font_size, &txt.text, font_size, color);
             }
         }
 

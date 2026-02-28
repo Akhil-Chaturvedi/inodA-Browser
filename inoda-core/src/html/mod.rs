@@ -4,7 +4,9 @@
 //! `Document` in a single pass. Implicit tag auto-closing walks up the
 //! ancestor chain to find the matching tag before block-level boundaries.
 //!
-//! Extracts raw CSS text from `<style>` elements into `Document::style_texts`.
+//! Content inside `<script>` and `<style>` tags is treated as raw text and
+//! not parsed as HTML. CSS text from `<style>` elements is collected into
+//! `Document::style_texts`.
 
 use html5gum::{Token, Tokenizer};
 use string_cache::DefaultAtom;
@@ -13,7 +15,7 @@ use crate::dom::{Document, ElementData, Node, TextData};
 pub fn parse_html(html: &str) -> Document {
     let mut doc = Document::default();
     let mut current_parent = doc.root_id;
-    let mut inside_style = false;
+    let mut inside_raw_tag: Option<DefaultAtom> = None;
     let mut current_style_text = String::new();
 
     for token in Tokenizer::new(html).infallible() {
@@ -22,6 +24,30 @@ pub fn parse_html(html: &str) -> Document {
                 let tag_name_str = std::str::from_utf8(&tag.name).unwrap_or("");
                 let tag_name = DefaultAtom::from(tag_name_str);
                 
+                if let Some(ref raw) = inside_raw_tag {
+                    let mut s = format!("<{}", tag_name_str);
+                    for (k, v) in tag.attributes.iter() {
+                        let k_str = std::str::from_utf8(k).unwrap_or("");
+                        s.push_str(&format!(" {}=\"{}\"", k_str, std::str::from_utf8(v).unwrap_or("")));
+                    }
+                    if tag.self_closing { s.push_str("/>"); } else { s.push_str(">"); }
+                    
+                    if &**raw == "style" {
+                        current_style_text.push_str(&s);
+                    } else {
+                        if let Some(last_child) = doc.last_child_of(current_parent) {
+                            if let Some(Node::Text(existing)) = doc.nodes.get_mut(last_child) {
+                                existing.text.push_str(&s);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                
+                if &*tag_name == "style" || &*tag_name == "script" {
+                    inside_raw_tag = Some(tag_name.clone());
+                }
+
                 let mut check_node = current_parent;
                 let mut found_close_target = false;
                 
@@ -51,10 +77,7 @@ pub fn parse_html(html: &str) -> Document {
                     current_parent = doc.parent_of(check_node).unwrap_or(doc.root_id);
                 }
 
-                if &*tag_name == "style" {
-                    inside_style = true;
-                    current_style_text.clear();
-                }
+
 
                 let mut attributes = Vec::new();
                 let mut classes = Vec::new();
@@ -109,10 +132,24 @@ pub fn parse_html(html: &str) -> Document {
                 let tag_name_str = std::str::from_utf8(&tag.name).unwrap_or("");
                 let tag_name = DefaultAtom::from(tag_name_str);
 
-                if &*tag_name == "style" {
-                    inside_style = false;
-                    if !current_style_text.is_empty() {
-                        doc.style_texts.push(std::mem::take(&mut current_style_text));
+                if let Some(ref raw) = inside_raw_tag {
+                    if raw != &tag_name {
+                        let s = format!("</{}>", tag_name_str);
+                        if &**raw == "style" {
+                            current_style_text.push_str(&s);
+                        } else {
+                            if let Some(last_child) = doc.last_child_of(current_parent) {
+                                if let Some(Node::Text(existing)) = doc.nodes.get_mut(last_child) {
+                                    existing.text.push_str(&s);
+                                }
+                            }
+                        }
+                        continue;
+                    } else {
+                        inside_raw_tag = None;
+                        if &*tag_name == "style" && !current_style_text.is_empty() {
+                            doc.style_texts.push(std::mem::take(&mut current_style_text));
+                        }
                     }
                 }
 
@@ -130,26 +167,28 @@ pub fn parse_html(html: &str) -> Document {
                 }
             }
             Token::String(s) => {
-                let text_str = std::str::from_utf8(&s).unwrap_or("").to_string();
+                let text_str = std::str::from_utf8(&s).unwrap_or("");
                 if text_str.is_empty() {
                     continue;
                 }
                 
-                if inside_style {
-                    current_style_text.push_str(&text_str);
-                    continue;
+                if let Some(ref raw) = inside_raw_tag {
+                    if &**raw == "style" {
+                        current_style_text.push_str(text_str);
+                        continue;
+                    }
                 }
 
                 let mut combined = false;
                 if let Some(last_child) = doc.last_child_of(current_parent) {
                     if let Some(Node::Text(existing)) = doc.nodes.get_mut(last_child) {
-                        existing.text.push_str(&text_str);
+                        existing.text.push_str(text_str);
                         combined = true;
                     }
                 }
                 if !combined {
                     let id = doc.add_node(Node::Text(TextData {
-                        text: text_str,
+                        text: text_str.to_string(),
                         parent: None,
                         prev_sibling: None,
                         next_sibling: None,

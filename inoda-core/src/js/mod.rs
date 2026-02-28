@@ -35,19 +35,16 @@ use std::time::Instant;
 pub struct NodeHandle {
     arena_index: usize,
     arena_generation: u64,
-    document: std::rc::Weak<std::cell::RefCell<crate::dom::Document>>,
 }
 
 impl NodeHandle {
     pub fn from_node_id(
         id: crate::dom::NodeId,
-        doc: &std::rc::Rc<std::cell::RefCell<crate::dom::Document>>,
     ) -> Self {
         let (idx, generation) = id.into_raw_parts();
         NodeHandle {
             arena_index: idx,
             arena_generation: generation,
-            document: std::rc::Rc::downgrade(doc),
         }
     }
 
@@ -62,19 +59,10 @@ impl<'js> Trace<'js> for NodeHandle {
     }
 }
 
-impl Drop for NodeHandle {
-    fn drop(&mut self) {
-        if let Some(doc_rc) = self.document.upgrade() {
-            if let Ok(mut doc) = doc_rc.try_borrow_mut() {
-                let id = self.to_node_id();
-                if id != doc.root_id && doc.parent_of(id).is_none() {
-                    doc.remove_node(id);
-                }
-            }
-        }
-    }
-}
-
+// NodeHandle intentionally omits a `Drop` trait implementation.
+// Nodes created by JavaScript live in the Rust Arena until explicitly removed via `removeChild()`.
+// Automatically calling `remove_node` on drop causes ABA memory corruption if a JS wrapper
+// goes out of scope while the node is still attached or referenced elsewhere.
 unsafe impl<'js> rquickjs::JsLifetime<'js> for NodeHandle {
     type Changed<'to> = NodeHandle;
 }
@@ -115,12 +103,35 @@ impl<'js> rquickjs::IntoJs<'js> for NodeHandleWithTag {
 // Timer queue
 // ---------------------------------------------------------------------------
 
+use std::cmp::Ordering;
+
 /// A pending timer entry storing a persistent JS callback.
 struct PendingTimer {
     #[allow(dead_code)]
     id: u32,
     fire_at: Instant,
     callback: Persistent<rquickjs::Function<'static>>,
+}
+
+impl PartialEq for PendingTimer {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for PendingTimer {}
+
+impl PartialOrd for PendingTimer {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PendingTimer {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse order for min-heap behavior based on fire_at
+        other.fire_at.cmp(&self.fire_at).then_with(|| other.id.cmp(&self.id))
+    }
 }
 
 /// Wrapper around the QuickJS Runtime and Context.
@@ -131,8 +142,8 @@ pub struct JsEngine {
     pub document: Rc<RefCell<Document>>,
     /// Monotonically increasing timer ID counter.
     next_timer_id: Rc<Cell<u32>>,
-    /// List of pending timers waiting to fire.
-    pending_timers: Rc<RefCell<Vec<PendingTimer>>>,
+    /// Min-Heap of pending timers waiting to fire.
+    pending_timers: Rc<RefCell<std::collections::BinaryHeap<PendingTimer>>>,
 }
 
 impl JsEngine {
@@ -145,7 +156,7 @@ impl JsEngine {
             context,
             document: Rc::new(RefCell::new(document)),
             next_timer_id: Rc::new(Cell::new(1)),
-            pending_timers: Rc::new(RefCell::new(Vec::new())),
+            pending_timers: Rc::new(RefCell::new(std::collections::BinaryHeap::new())),
         };
 
         engine.init_web_api();
@@ -193,7 +204,30 @@ impl JsEngine {
                       value: String| {
                     let mut doc = doc_ref.borrow_mut();
                     let node_id = this.borrow().to_node_id();
-                    if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
+                    
+                    if attr == "id" {
+                        // Securely remove the old ID from the ABA mapping
+                        let mut old_id_to_remove = None;
+                        if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
+                            if let Some((_, old_val)) = data.attributes.iter().find(|(k, _)| &**k == "id") {
+                                old_id_to_remove = Some(old_val.clone());
+                            }
+                        }
+                        if let Some(old_id) = old_id_to_remove {
+                            doc.id_map.remove(&old_id);
+                        }
+                        
+                        if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
+                            let local_attr = string_cache::DefaultAtom::from("id");
+                            if let Some(pos) = data.attributes.iter().position(|(k, _)| *k == local_attr) {
+                                data.attributes[pos].1 = value.clone();
+                            } else {
+                                data.attributes.push((local_attr, value.clone()));
+                            }
+                        }
+
+                        doc.id_map.insert(value.clone(), node_id);
+                    } else if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
                         let local_attr = string_cache::DefaultAtom::from(attr.as_str());
                         if let Some(pos) =
                             data.attributes.iter().position(|(k, _)| *k == local_attr)
@@ -212,9 +246,6 @@ impl JsEngine {
                                 }
                             }
                         }
-                    }
-                    if attr == "id" {
-                        doc.id_map.insert(value.clone(), node_id);
                     }
                 }
             })
@@ -268,7 +299,7 @@ impl JsEngine {
                     if let Some(&node_id) = doc.id_map.get(&id) {
                         if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
                             return Some(NodeHandleWithTag {
-                                handle: NodeHandle::from_node_id(node_id, &doc_ref),
+                                handle: NodeHandle::from_node_id(node_id),
                                 tag_name: data.tag_name.to_string(),
                                 node_key: format!(
                                     "{}:{}",
@@ -306,7 +337,7 @@ impl JsEngine {
 
                             if is_match {
                                 return Some(NodeHandleWithTag {
-                                    handle: NodeHandle::from_node_id(node_id, &doc_ref),
+                                    handle: NodeHandle::from_node_id(node_id),
                                     tag_name: data.tag_name.to_string(),
                                     node_key: format!(
                                         "{}:{}",
@@ -358,7 +389,7 @@ impl JsEngine {
                     drop(doc);
 
                     NodeHandleWithTag {
-                        handle: NodeHandle::from_node_id(index, &doc_ref),
+                        handle: NodeHandle::from_node_id(index),
                         tag_name: tag_name_clone,
                         node_key: format!(
                             "{}:{}",
@@ -393,6 +424,9 @@ impl JsEngine {
                 .eval(
                     r#"
                 document.__nodeCache = new Map();
+                document.__nodeRegistry = new FinalizationRegistry(key => {
+                    document.__nodeCache.delete(key);
+                });
 
                 document._wrapNode = function(rawNode) {
                     if (!rawNode) return null;
@@ -403,6 +437,7 @@ impl JsEngine {
                         if (cachedObj) return cachedObj;
                     }
                     document.__nodeCache.set(key, new WeakRef(rawNode));
+                    document.__nodeRegistry.register(rawNode, key);
                     return rawNode;
                 };
 
@@ -450,13 +485,17 @@ impl JsEngine {
     /// The host application should call this on each iteration of its event loop.
     pub fn pump(&self) -> u32 {
         let now = Instant::now();
-        let expired: Vec<Persistent<rquickjs::Function<'static>>>;
+        let mut expired = Vec::new();
         {
             let mut timers = self.pending_timers.borrow_mut();
-            let (ready, remaining): (Vec<_>, Vec<_>) =
-                timers.drain(..).partition(|t| t.fire_at <= now);
-            expired = ready.into_iter().map(|t| t.callback).collect();
-            *timers = remaining;
+            while let Some(top) = timers.peek() {
+                if top.fire_at <= now {
+                    let timer = timers.pop().unwrap();
+                    expired.push(timer.callback);
+                } else {
+                    break;
+                }
+            }
         }
 
         let count = expired.len() as u32;

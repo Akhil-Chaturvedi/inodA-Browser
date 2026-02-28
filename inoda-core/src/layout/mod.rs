@@ -3,12 +3,12 @@
 //! Converts a `StyledNode` tree into a `TaffyTree` and runs the Flexbox/Grid
 //! layout algorithm. Before running the solver, a pre-pass creates
 //! `cosmic-text::Buffer` objects for all text nodes so that HarfBuzz shaping
-//! runs once. The Taffy measure closure then only adjusts width constraints
-//! on the already-shaped buffers.
+//! runs once. The Taffy measure closure calls `buffer.set_size()` followed by
+//! `buffer.shape_until_scroll()` to re-wrap text at the new width constraint.
 //!
 //! Supported dimension units: px, %, vw, vh, em, rem, auto.
 //! Supported display modes: flex, grid, block, none.
-//! Properties like margin, padding, and alignment are not yet wired.
+//! Box model properties mapped: margin-*, padding-*, border-*-width.
 
 use std::{cell::RefCell, collections::HashMap};
 
@@ -24,7 +24,7 @@ pub type TextLayoutCache = HashMap<crate::dom::NodeId, TextNodeLayout>;
 
 #[derive(Debug, Clone)]
 pub struct TextLineLayout {
-    pub text: String,
+    pub glyphs: Vec<cosmic_text::LayoutGlyph>,
     pub line_width: f32,
 }
 
@@ -51,8 +51,6 @@ pub fn compute_layout(
     buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
 ) -> (TaffyTree<TextMeasureContext>, NodeId, TextLayoutCache) {
     let mut tree: TaffyTree<TextMeasureContext> = TaffyTree::new();
-
-    buffer_cache.clear();
 
     prepare_text_buffers(document, styled_node, font_system, buffer_cache);
 
@@ -99,6 +97,7 @@ pub fn compute_layout(
                 Some(width_constraint.max(1.0)),
                 Some(f32::INFINITY),
             );
+            buffer.shape_until_scroll(&mut sys, false);
 
             let mut lines_count = 0;
             let mut max_width: f32 = 0.0;
@@ -181,20 +180,21 @@ fn finalize_text_measurements(
                 Some(width_constraint.max(1.0)),
                 Some(f32::INFINITY),
             );
+            buffer.shape_until_scroll(font_system, false);
 
             let mut lines = Vec::new();
             let mut max_width: f32 = 0.0;
             for run in buffer.layout_runs() {
                 max_width = max_width.max(run.line_w);
                 lines.push(TextLineLayout {
-                    text: run.text.to_string(),
+                    glyphs: run.glyphs.to_vec(),
                     line_width: run.line_w,
                 });
             }
 
             if lines.is_empty() {
                 lines.push(TextLineLayout {
-                    text: String::new(),
+                    glyphs: Vec::new(),
                     line_width: 0.0,
                 });
             }
@@ -310,6 +310,30 @@ fn build_taffy_node(
         }
     }
 
+    for (k, v) in styled_node.specified_values.iter() {
+        match &**k {
+            "margin-top" => if let Some(dim) = parse_length_percentage_auto(v, vw, vh, font_size) { style.margin.top = dim; },
+            "margin-right" => if let Some(dim) = parse_length_percentage_auto(v, vw, vh, font_size) { style.margin.right = dim; },
+            "margin-bottom" => if let Some(dim) = parse_length_percentage_auto(v, vw, vh, font_size) { style.margin.bottom = dim; },
+            "margin-left" => if let Some(dim) = parse_length_percentage_auto(v, vw, vh, font_size) { style.margin.left = dim; },
+            "padding-top" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) { style.padding.top = dim; },
+            "padding-right" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) { style.padding.right = dim; },
+            "padding-bottom" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) { style.padding.bottom = dim; },
+            "padding-left" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) { style.padding.left = dim; },
+            "border-width" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) {
+                style.border.top = dim;
+                style.border.right = dim;
+                style.border.bottom = dim;
+                style.border.left = dim;
+            },
+            "border-top-width" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) { style.border.top = dim; },
+            "border-right-width" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) { style.border.right = dim; },
+            "border-bottom-width" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) { style.border.bottom = dim; },
+            "border-left-width" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) { style.border.left = dim; },
+            _ => {}
+        }
+    }
+
     if matches!(
         document.nodes.get(styled_node.node_id),
         Some(crate::dom::Node::Text(_))
@@ -343,6 +367,33 @@ fn parse_dimension(val: &crate::dom::StyleValue, vw: f32, vh: f32, font_size: f3
         crate::dom::StyleValue::ViewportHeight(num) => Some(Dimension::length((num / 100.0) * vh)),
         crate::dom::StyleValue::Em(num) => Some(Dimension::length(num * font_size)),
         crate::dom::StyleValue::Rem(num) => Some(Dimension::length(num * font_size)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn parse_length_percentage_auto(val: &crate::dom::StyleValue, vw: f32, vh: f32, font_size: f32) -> Option<taffy::style::LengthPercentageAuto> {
+    match val {
+        crate::dom::StyleValue::Auto => Some(taffy::style::LengthPercentageAuto::auto()),
+        crate::dom::StyleValue::LengthPx(num) => Some(taffy::style::LengthPercentageAuto::length(*num)),
+        crate::dom::StyleValue::Percent(p) => Some(taffy::style::LengthPercentageAuto::percent(*p / 100.0)),
+        crate::dom::StyleValue::ViewportWidth(num) => Some(taffy::style::LengthPercentageAuto::length((num / 100.0) * vw)),
+        crate::dom::StyleValue::ViewportHeight(num) => Some(taffy::style::LengthPercentageAuto::length((num / 100.0) * vh)),
+        crate::dom::StyleValue::Em(num) => Some(taffy::style::LengthPercentageAuto::length(num * font_size)),
+        crate::dom::StyleValue::Rem(num) => Some(taffy::style::LengthPercentageAuto::length(num * font_size)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn parse_length_percentage(val: &crate::dom::StyleValue, vw: f32, vh: f32, font_size: f32) -> Option<taffy::style::LengthPercentage> {
+    match val {
+        crate::dom::StyleValue::LengthPx(num) => Some(taffy::style::LengthPercentage::length(*num)),
+        crate::dom::StyleValue::Percent(p) => Some(taffy::style::LengthPercentage::percent(*p / 100.0)),
+        crate::dom::StyleValue::ViewportWidth(num) => Some(taffy::style::LengthPercentage::length((num / 100.0) * vw)),
+        crate::dom::StyleValue::ViewportHeight(num) => Some(taffy::style::LengthPercentage::length((num / 100.0) * vh)),
+        crate::dom::StyleValue::Em(num) => Some(taffy::style::LengthPercentage::length(num * font_size)),
+        crate::dom::StyleValue::Rem(num) => Some(taffy::style::LengthPercentage::length(num * font_size)),
         _ => None,
     }
 }

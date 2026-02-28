@@ -45,14 +45,14 @@ Documents maintain an `id_map: HashMap<String, NodeId>` for O(1) `getElementById
 
 ### html
 
-Streams `html5gum` tokens into the arena in a single pass. Each token is converted using `std::str::from_utf8` directly on the byte slices, avoiding intermediate `String` allocations. Implicit tag auto-closing walks up the ancestor chain from `current_parent` until it either finds the tag that should be closed (e.g., a `<div>` walks up past `<span>` and `<b>` to find and close an open `<p>`) or hits a block-level boundary (`div`, `body`, `td`, `th`, `table`) and stops. Extracts raw CSS text from `<style>` elements and stores it on `Document::style_texts`. Whitespace-only text nodes are preserved for inline spacing.
+Streams `html5gum` tokens into the arena in a single pass. Each token is converted using `std::str::from_utf8` directly on the byte slices, avoiding intermediate `String` allocations. Implicit tag auto-closing walks up the ancestor chain from `current_parent` until it either finds the tag that should be closed (e.g., a `<div>` walks up past `<span>` and `<b>` to find and close an open `<p>`) or hits a block-level boundary (`div`, `body`, `td`, `th`, `table`) and stops. Content inside `<script>` and `<style>` tags is treated as raw text -- inner tokens are not parsed as HTML tags or appended to the DOM tree. CSS text from `<style>` elements is collected into `Document::style_texts`. Whitespace-only text nodes are preserved for inline spacing.
 
 ### css
 
 - Parses CSS text into a `StyleSheet` containing pre-parsed `ComplexSelector` ASTs.
 - Property values are parsed into typed `StyleValue` enums (`LengthPx`, `Percent`, `ViewportWidth`, `ViewportHeight`, `Em`, `Rem`, `Color`, `Keyword`, `Number`, `Auto`, `None`) during the cascade, so downstream consumers do not parse strings at runtime.
 - Computes specificity as `(id_count, class_count, tag_count)` at parse time.
-- Rules are distributed into `HashMap<DefaultAtom, Vec<IndexedRule>>` buckets keyed by tag, class, and ID. During style resolution, matching buckets are merged in a single O(N) pass using a k-way pointer walk over the pre-sorted slices, without allocating a temporary merged vector.
+- Rules are distributed into `HashMap<DefaultAtom, Vec<IndexedRule>>` buckets keyed by tag, class, and ID. Each rule records its source index for stable ordering. During style resolution, matching buckets are merged in a single O(N) pass using a k-way pointer walk over the pre-sorted slices, breaking specificity ties by source order, without allocating a temporary merged vector.
 - Supports tag, class, ID, compound, and complex combinators (`>`, ` `).
 - Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent to child. Only inheritable properties are passed to children; non-inheritable properties like `width` or `margin` are filtered out before recursing. Inherited style vectors are shared via `Rc` when no new declarations apply.
 - Expands `margin`, `padding` shorthands (1/2/4-value syntax) and maps `background` to `background-color`.
@@ -60,23 +60,28 @@ Streams `html5gum` tokens into the arena in a single pass. Each token is convert
 
 ### layout
 
-Walks the `StyledNode` tree and builds a parallel `TaffyTree<TextMeasureContext>`. The buffer cache is cleared at the start of each `compute_layout` call to evict stale entries from removed or JS-mutated nodes. A pre-pass then traverses the DOM and creates `cosmic-text::Buffer` objects for every text node, performing HarfBuzz shaping once. The Taffy measure closure then only calls `buffer.set_size()` to adjust the width constraint on the already-shaped buffer, avoiding repeated shaping work.
+Walks the `StyledNode` tree and builds a parallel `TaffyTree<TextMeasureContext>`. A pre-pass traverses the styled DOM and creates `cosmic-text::Buffer` objects for every text node, performing HarfBuzz shaping once. The buffer cache is caller-owned and persists across frames; it is not cleared internally. The Taffy measure closure calls `buffer.set_size()` followed by `buffer.shape_until_scroll()` to re-wrap text at the new width constraint. `TextLineLayout` stores `cosmic_text::LayoutGlyph` arrays directly rather than `String` copies, avoiding heap allocations during the layout pass.
 
 Supported CSS properties mapped to Taffy:
 - `display`: flex, grid, block, none (inline/inline-block are recognized but not yet laid out differently)
 - `flex-direction`: row, column
 - `width`, `height` with units: `px`, `%`, `vw`, `vh`, `em`, `rem`, `auto`
+- `margin-top`, `margin-right`, `margin-bottom`, `margin-left` (including `auto`)
+- `padding-top`, `padding-right`, `padding-bottom`, `padding-left`
+- `border-width`, `border-top-width`, `border-right-width`, `border-bottom-width`, `border-left-width`
 
 Non-flex elements default to `flex-direction: column` to approximate block stacking.
 
-Properties not yet wired: `margin-*`, `padding-*`, `border-*`, `align-items`, `justify-content`, `gap`, `flex-wrap`, `flex-grow`, `flex-shrink`, `min-*`, `max-*`, `position`, `overflow`.
+Properties not yet wired: `align-items`, `justify-content`, `gap`, `flex-wrap`, `flex-grow`, `flex-shrink`, `min-*`, `max-*`, `position`, `overflow`.
 
 ### render
 
 Recursively walks the Taffy layout tree alongside the `StyledNode` tree and issues backend draw calls:
 - Background rectangles (`background-color`)
 - Border strokes (`border-color`, always 1px, no per-side control)
-- Text via `RendererBackend::draw_text()` using inherited `color` and `font-size`
+- Text via `RendererBackend::draw_glyphs()` using pre-shaped `cosmic_text::LayoutGlyph` arrays, inherited `color`, and `font-size`
+
+The `RendererBackend` trait requires implementing `fill_rect`, `stroke_rect`, and `draw_glyphs`. A default `draw_text_layout` method iterates over `TextDrawLine` entries and delegates to `draw_glyphs`.
 
 Color parsing handles the named colors `red`, `green`, `blue`, `black`, `white` and 6-digit hex (`#rrggbb`). No `rgb()`, `rgba()`, `hsl()`, shorthand hex, or alpha support.
 
@@ -101,9 +106,13 @@ Exposed globals:
 - `handle.setAttribute(key, value)` -- updates or inserts attribute
 - `handle.removeChild(child)` -- detaches child from parent
 
-The `__nodeCache` uses a `Map` of `WeakRef` objects so that cached node wrappers do not prevent QuickJS garbage collection. When a `WeakRef` is dereferenced and found dead, the wrapper is re-created.
+The `__nodeCache` uses a `Map` of `WeakRef` objects so that cached node wrappers do not prevent QuickJS garbage collection. A `FinalizationRegistry` is registered alongside each `WeakRef` entry to delete the corresponding `Map` key when QuickJS garbage-collects the wrapper object, preventing unbounded key accumulation.
 
-Timer callbacks are stored as `rquickjs::Persistent<Function>` to survive context boundaries. The host application should call `pump()` on its event loop tick to dispatch expired timers.
+`NodeHandle` does not implement `Drop`. Nodes created via JavaScript remain in the Rust arena until explicitly removed via `removeChild()`. This avoids ABA memory corruption that would occur if QuickJS garbage collection triggered arena deletions for nodes that are still attached to the DOM.
+
+`setAttribute('id', newId)` removes the old ID from `Document::id_map` before inserting the new one. `remove_node` verifies that the `id_map` entry points to the node being removed before deleting it, preventing stale entries from corrupting lookups.
+
+Timer callbacks are stored as `rquickjs::Persistent<Function>` to survive context boundaries. Pending timers are held in a `BinaryHeap` sorted by fire time. The host application should call `pump()` on its event loop tick; `pump()` pops expired timers from the heap without allocating temporary vectors.
 
 ## Building
 
@@ -128,7 +137,7 @@ This list is not exhaustive. The engine is a working skeleton, not a production 
 - Inline formatting context is incomplete (no baseline alignment or float interaction).
 - Font loading and fallback are backend-specific and must be provided by the host.
 - `display: inline` and `inline-block` are parsed but laid out identically to block.
-- Layout properties `margin`, `padding`, `border-width`, `position`, `overflow`, `z-index`, `float` are not wired to Taffy.
+- Layout properties `position`, `overflow`, `z-index`, `float`, `align-items`, `justify-content` are not wired to Taffy.
 - Color parsing is limited to 5 named colors and 6-digit hex.
 - No `@media`, `@import`, `@keyframes`, CSS variables, or `calc()`.
 - Selector matching supports combinators (`>`, ` `) but not `+`, `~`, attribute selectors, or pseudo-classes with arguments.

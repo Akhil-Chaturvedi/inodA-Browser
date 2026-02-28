@@ -132,7 +132,9 @@ impl Document {
             if let Some(node) = self.nodes.remove(current_id) {
                 if let Node::Element(ref data) = node {
                     if let Some((_, id_val)) = data.attributes.iter().find(|(k, _)| &**k == "id") {
-                        self.id_map.remove(id_val);
+                        if self.id_map.get(id_val) == Some(&current_id) {
+                            self.id_map.remove(id_val);
+                        }
                     }
                 }
                 if current_id == id {

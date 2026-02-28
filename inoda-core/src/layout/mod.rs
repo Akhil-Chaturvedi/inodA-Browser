@@ -52,6 +52,8 @@ pub fn compute_layout(
 ) -> (TaffyTree<TextMeasureContext>, NodeId, TextLayoutCache) {
     let mut tree: TaffyTree<TextMeasureContext> = TaffyTree::new();
 
+    buffer_cache.clear();
+
     prepare_text_buffers(document, styled_node, font_system, buffer_cache);
 
     let root_taffy_node = build_taffy_node(
@@ -337,22 +339,10 @@ fn parse_dimension(val: &crate::dom::StyleValue, vw: f32, vh: f32, font_size: f3
         crate::dom::StyleValue::Auto => Some(Dimension::auto()),
         crate::dom::StyleValue::LengthPx(num) => Some(Dimension::length(*num)),
         crate::dom::StyleValue::Percent(p) => Some(Dimension::percent(*p / 100.0)),
-        crate::dom::StyleValue::Keyword(kw) => {
-             let s = &**kw;
-             if s.ends_with("vw") {
-                 let num = s.trim_end_matches("vw").parse::<f32>().ok()?;
-                 return Some(Dimension::length((num / 100.0) * vw));
-             }
-             if s.ends_with("vh") {
-                 let num = s.trim_end_matches("vh").parse::<f32>().ok()?;
-                 return Some(Dimension::length((num / 100.0) * vh));
-             }
-             if s.ends_with("em") || s.ends_with("rem") {
-                 let num = s.trim_end_matches("rem").trim_end_matches("em").parse::<f32>().ok()?;
-                 return Some(Dimension::length(num * font_size));
-             }
-             None
-        }
+        crate::dom::StyleValue::ViewportWidth(num) => Some(Dimension::length((num / 100.0) * vw)),
+        crate::dom::StyleValue::ViewportHeight(num) => Some(Dimension::length((num / 100.0) * vh)),
+        crate::dom::StyleValue::Em(num) => Some(Dimension::length(num * font_size)),
+        crate::dom::StyleValue::Rem(num) => Some(Dimension::length(num * font_size)),
         _ => None,
     }
 }

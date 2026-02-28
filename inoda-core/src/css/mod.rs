@@ -155,6 +155,26 @@ pub fn parse_style_value(val: &str) -> crate::dom::StyleValue {
             return crate::dom::StyleValue::Percent(num);
         }
     }
+    if let Some(num_str) = trimmed.strip_suffix("vw") {
+        if let Ok(num) = num_str.parse::<f32>() {
+            return crate::dom::StyleValue::ViewportWidth(num);
+        }
+    }
+    if let Some(num_str) = trimmed.strip_suffix("vh") {
+        if let Ok(num) = num_str.parse::<f32>() {
+            return crate::dom::StyleValue::ViewportHeight(num);
+        }
+    }
+    if let Some(num_str) = trimmed.strip_suffix("rem") {
+        if let Ok(num) = num_str.parse::<f32>() {
+            return crate::dom::StyleValue::Rem(num);
+        }
+    }
+    if let Some(num_str) = trimmed.strip_suffix("em") {
+        if let Ok(num) = num_str.parse::<f32>() {
+            return crate::dom::StyleValue::Em(num);
+        }
+    }
     if let Some(color) = parse_color(trimmed) {
         return crate::dom::StyleValue::Color(color.0, color.1, color.2);
     }
@@ -556,19 +576,30 @@ fn build_styled_node(
             .cloned()
             .collect();
             
-        for (k, v) in new_declarations {
-            if let Some(pos) = final_vec.iter().position(|(ek, _)| ek == &k) {
-                final_vec[pos].1 = v;
+        for (k, v) in &new_declarations {
+            if let Some(pos) = final_vec.iter().position(|(ek, _)| ek == k) {
+                final_vec[pos].1 = v.clone();
             } else {
-                final_vec.push((k, v));
+                final_vec.push((k.clone(), v.clone()));
             }
         }
         std::rc::Rc::new(final_vec)
     };
 
+    let inherited_rc = if new_declarations.is_empty() {
+        std::rc::Rc::clone(parent_styles)
+    } else {
+        let inheritable_only: Vec<_> = final_styles
+            .iter()
+            .filter(|(k, _)| is_inheritable(k))
+            .cloned()
+            .collect();
+        std::rc::Rc::new(inheritable_only)
+    };
+
     let children = children_ids
         .into_iter()
-        .map(|id| build_styled_node(document, id, stylesheet, &final_styles))
+        .map(|id| build_styled_node(document, id, stylesheet, &inherited_rc))
         .collect();
 
     crate::dom::StyledNode {

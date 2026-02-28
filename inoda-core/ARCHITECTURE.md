@@ -79,7 +79,7 @@ StyledNode {
 }
 ```
 
-This is a tree (not arena). Each node owns its children. It exists only during layout computation and rendering, then gets dropped. The `Rc` sharing means children with no new declarations reuse their parent's style vector without cloning.
+This is a tree (not arena). Each node owns its children. It exists only during layout computation and rendering, then gets dropped. When a node has no CSS declarations of its own, it receives a clone of its parent's `Rc`. When a node does have declarations, the parent's styles are filtered to only inheritable properties (e.g., `color`, `font-size`) before merging with the node's own declarations. Non-inheritable properties like `width` or `margin` are not passed to children.
 
 ### StyleSheet (css/mod.rs)
 
@@ -116,7 +116,7 @@ Selectors are scored as `(id_count, class_count, tag_count)`. Matched rules are 
 
 ## Text measurement
 
-Text nodes are inserted into Taffy as leaf nodes with a `TextMeasureContext`. Before running the layout solver, `compute_layout` traverses the DOM and pre-creates a `cosmic-text::Buffer` for each text node, performing HarfBuzz shaping once. During `compute_layout_with_measure`, the measure closure retrieves the already-shaped buffer and calls `buffer.set_size()` to adjust the width constraint, then counts layout lines to determine the height. This avoids creating new buffers or re-running shaping inside Taffy's multi-pass solver.
+Text nodes are inserted into Taffy as leaf nodes with a `TextMeasureContext`. At the start of each `compute_layout` call, the buffer cache is cleared to evict stale entries from removed or JS-mutated nodes. A pre-pass then traverses the DOM and creates a `cosmic-text::Buffer` for each text node, performing HarfBuzz shaping once. During `compute_layout_with_measure`, the measure closure retrieves the already-shaped buffer and calls `buffer.set_size()` to adjust the width constraint, then counts layout lines to determine the height. This avoids creating new buffers or re-running shaping inside Taffy's multi-pass solver.
 
 After layout completes, `finalize_text_measurements` walks the Taffy tree and extracts the final text run positions into a `TextLayoutCache` for the renderer.
 
@@ -126,4 +126,4 @@ After layout completes, `finalize_text_measurements` walks the Taffy tree and ex
 
 ## HTML parsing
 
-The HTML module iterates over `html5gum` tokens in a loop. Each `StartTag` token creates an `ElementData` node in the arena and appends it as a child of the current parent. Before appending, the parser checks whether the new tag should implicitly close the current parent (e.g., `<li>` closes an open `<li>`, `<p>` closes an open `<p>`). `EndTag` tokens pop the current parent back to its own parent. `String` tokens create `TextData` nodes. Byte slices are validated with `std::str::from_utf8` directly, without allocating through `from_utf8_lossy`. `<style>` element contents are accumulated into `Document::style_texts` rather than being inserted as DOM text nodes.
+The HTML module iterates over `html5gum` tokens in a loop. Each `StartTag` token creates an `ElementData` node in the arena and appends it as a child of the current parent. Before appending, the parser walks up the ancestor chain from `current_parent` to check whether the new tag should implicitly close an ancestor. For example, when a `<div>` is encountered inside `<p><span><b>`, the walk finds the `<p>` ancestor and pops `current_parent` back to the `<p>`'s parent. The walk stops at block-level boundaries (`div`, `body`, `td`, `th`, `table`) to prevent over-closing. `EndTag` tokens pop the current parent back to its own parent. `String` tokens create `TextData` nodes. Byte slices are validated with `std::str::from_utf8` directly, without allocating through `from_utf8_lossy`. `<style>` element contents are accumulated into `Document::style_texts` rather than being inserted as DOM text nodes.

@@ -45,22 +45,22 @@ Documents maintain an `id_map: HashMap<String, NodeId>` for O(1) `getElementById
 
 ### html
 
-Streams `html5gum` tokens into the arena in a single pass. Each token is converted using `std::str::from_utf8` directly on the byte slices, avoiding intermediate `String` allocations. Implicit tag auto-closing rules are applied during the `StartTag` handler (e.g., a `<li>` closes an open `<li>` sibling, a `<p>` closes an open `<p>`). Extracts raw CSS text from `<style>` elements and stores it on `Document::style_texts`. Whitespace-only text nodes are preserved for inline spacing.
+Streams `html5gum` tokens into the arena in a single pass. Each token is converted using `std::str::from_utf8` directly on the byte slices, avoiding intermediate `String` allocations. Implicit tag auto-closing walks up the ancestor chain from `current_parent` until it either finds the tag that should be closed (e.g., a `<div>` walks up past `<span>` and `<b>` to find and close an open `<p>`) or hits a block-level boundary (`div`, `body`, `td`, `th`, `table`) and stops. Extracts raw CSS text from `<style>` elements and stores it on `Document::style_texts`. Whitespace-only text nodes are preserved for inline spacing.
 
 ### css
 
 - Parses CSS text into a `StyleSheet` containing pre-parsed `ComplexSelector` ASTs.
-- Property values are parsed into typed `StyleValue` enums (`LengthPx`, `Percent`, `Color`, `Keyword`, `Number`, `Auto`) during the cascade, so downstream consumers do not parse strings at runtime.
+- Property values are parsed into typed `StyleValue` enums (`LengthPx`, `Percent`, `ViewportWidth`, `ViewportHeight`, `Em`, `Rem`, `Color`, `Keyword`, `Number`, `Auto`, `None`) during the cascade, so downstream consumers do not parse strings at runtime.
 - Computes specificity as `(id_count, class_count, tag_count)` at parse time.
 - Rules are distributed into `HashMap<DefaultAtom, Vec<IndexedRule>>` buckets keyed by tag, class, and ID. During style resolution, matching buckets are merged in a single O(N) pass using a k-way pointer walk over the pre-sorted slices, without allocating a temporary merged vector.
 - Supports tag, class, ID, compound, and complex combinators (`>`, ` `).
-- Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent to child. Inherited style vectors are shared via `Rc` to avoid redundant cloning.
+- Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent to child. Only inheritable properties are passed to children; non-inheritable properties like `width` or `margin` are filtered out before recursing. Inherited style vectors are shared via `Rc` when no new declarations apply.
 - Expands `margin`, `padding` shorthands (1/2/4-value syntax) and maps `background` to `background-color`.
 - Inline `style=""` attributes are parsed via `cssparser`'s `DeclarationParser` trait.
 
 ### layout
 
-Walks the `StyledNode` tree and builds a parallel `TaffyTree<TextMeasureContext>`. Before running Taffy's layout solver, a pre-pass traverses the DOM and creates `cosmic-text::Buffer` objects for every text node, performing HarfBuzz shaping once. The Taffy measure closure then only calls `buffer.set_size()` to adjust the width constraint on the already-shaped buffer, avoiding repeated shaping work.
+Walks the `StyledNode` tree and builds a parallel `TaffyTree<TextMeasureContext>`. The buffer cache is cleared at the start of each `compute_layout` call to evict stale entries from removed or JS-mutated nodes. A pre-pass then traverses the DOM and creates `cosmic-text::Buffer` objects for every text node, performing HarfBuzz shaping once. The Taffy measure closure then only calls `buffer.set_size()` to adjust the width constraint on the already-shaped buffer, avoiding repeated shaping work.
 
 Supported CSS properties mapped to Taffy:
 - `display`: flex, grid, block, none (inline/inline-block are recognized but not yet laid out differently)

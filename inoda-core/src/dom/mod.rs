@@ -64,10 +64,14 @@ pub enum StyleValue {
     Keyword(string_cache::DefaultAtom),
     LengthPx(f32),
     Percent(f32),
+    ViewportWidth(f32),
+    ViewportHeight(f32),
+    Em(f32),
+    Rem(f32),
+    Number(f32),
     Color(u8, u8, u8),
     Auto,
-    Number(f32),
-    Str(String),
+    None,
 }
 
 /// A node mapped with its active computed CSS style properties.

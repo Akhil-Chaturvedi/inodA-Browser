@@ -1,7 +1,8 @@
 //! HTML parsing module.
 //!
-//! Uses `html5gum` to stream atomized tokens into the `generational_arena`-backed
-//! `Document` in a single pass.
+//! Uses `html5gum` to stream tokens into the `generational_arena`-backed
+//! `Document` in a single pass. Implicit tag auto-closing walks up the
+//! ancestor chain to find the matching tag before block-level boundaries.
 //!
 //! Extracts raw CSS text from `<style>` elements into `Document::style_texts`.
 
@@ -21,18 +22,33 @@ pub fn parse_html(html: &str) -> Document {
                 let tag_name_str = std::str::from_utf8(&tag.name).unwrap_or("");
                 let tag_name = DefaultAtom::from(tag_name_str);
                 
-                if let Some(Node::Element(parent_data)) = doc.nodes.get(current_parent) {
-                    let p_tag = &*parent_data.tag_name;
-                    let auto_close = match &*tag_name {
+                let mut check_node = current_parent;
+                let mut found_close_target = false;
+                
+                while let Some(Node::Element(data)) = doc.nodes.get(check_node) {
+                    let p_tag = &*data.tag_name;
+                    let should_close = match &*tag_name {
                         "li" => p_tag == "li",
                         "td" | "th" => p_tag == "td" || p_tag == "th",
                         "tr" => p_tag == "tr",
                         "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "ul" | "ol" | "table" => p_tag == "p",
                         _ => false,
                     };
-                    if auto_close {
-                        current_parent = doc.parent_of(current_parent).unwrap_or(doc.root_id);
+                    
+                    if should_close {
+                        found_close_target = true;
+                        break;
                     }
+                    
+                    if matches!(p_tag, "div" | "body" | "td" | "th" | "table") {
+                        break;
+                    }
+                    
+                    check_node = doc.parent_of(check_node).unwrap_or(doc.root_id);
+                }
+                
+                if found_close_target {
+                    current_parent = doc.parent_of(check_node).unwrap_or(doc.root_id);
                 }
 
                 if &*tag_name == "style" {

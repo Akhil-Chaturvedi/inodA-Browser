@@ -8,6 +8,6 @@ cosmic-text = { version = "0.12", default-features = false, features = ["std", "
 cssparser = "0.36.0"
 generational-arena = "0.2.9"
 html5gum = "0.5"
-rquickjs = { version = "0.11.0", features = ["classes"] }
+rquickjs = { version = "0.11", features = ["macro", "classes"] }
 string_cache = "0.9.0"
 taffy = "0.9.2"

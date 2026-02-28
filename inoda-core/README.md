@@ -60,7 +60,7 @@ Streams `html5gum` tokens into the arena in a single pass. Each token is convert
 
 ### layout
 
-Walks the `StyledNode` tree and builds a parallel `TaffyTree<TextMeasureContext>`. A pre-pass traverses the styled DOM and creates `cosmic-text::Buffer` objects for every text node, performing HarfBuzz shaping once. The buffer cache is caller-owned and persists across frames; it is not cleared internally. The Taffy measure closure calls `buffer.set_size()` followed by `buffer.shape_until_scroll()` to re-wrap text at the new width constraint. `TextLineLayout` stores `cosmic_text::LayoutGlyph` arrays directly rather than `String` copies, avoiding heap allocations during the layout pass.
+Walks the `StyledNode` tree and builds a parallel `TaffyTree<TextMeasureContext>`. A pre-pass traverses the styled DOM and creates `cosmic-text::Buffer` objects for every text node, performing HarfBuzz shaping once. The buffer cache is caller-owned and persists across frames; it is not cleared internally. The Taffy measure closure calls `buffer.set_size()` followed by `buffer.shape_until_scroll()` to re-wrap text at the new width constraint. After layout completes, `finalize_text_measurements` reshapes each buffer at its final width. The renderer reads glyphs directly from buffered `layout_runs()` -- there is no intermediate cache struct or string copying.
 
 Supported CSS properties mapped to Taffy:
 - `display`: flex, grid, block, none (inline/inline-block are recognized but not yet laid out differently)

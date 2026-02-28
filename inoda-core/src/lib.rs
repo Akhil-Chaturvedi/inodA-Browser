@@ -255,21 +255,24 @@ mod tests {
         // p > span matches (Child) => font-weight: bold
 
         assert!(
-            span.specified_values
+            span.local
                 .iter()
+                .chain(span.inherited.as_deref().unwrap_or(&vec![]).iter())
                 .any(|(k, v)| &**k == "color" && v == &crate::dom::StyleValue::Color(255, 0, 0)),
             "Descendant combinator failed"
         );
         assert!(
             !span
-                .specified_values
+                .local
                 .iter()
+                .chain(span.inherited.as_deref().unwrap_or(&vec![]).iter())
                 .any(|(k, v)| &**k == "color" && v == &crate::dom::StyleValue::Color(0, 0, 255)),
             "Child combinator incorrectly matched descendant"
         );
         assert!(
-            span.specified_values
+            span.local
                 .iter()
+                .chain(span.inherited.as_deref().unwrap_or(&vec![]).iter())
                 .any(|(k, v)| &**k == "font-weight" && v == &crate::dom::StyleValue::Keyword(string_cache::DefaultAtom::from("bold"))),
             "Child combinator failed"
         );

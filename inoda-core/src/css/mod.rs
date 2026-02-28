@@ -464,7 +464,7 @@ pub fn compute_styles(
         document,
         document.root_id,
         &combined_sheet,
-        &std::rc::Rc::new(Vec::new()),
+        &None,
     )
 }
 
@@ -486,7 +486,7 @@ fn build_styled_node(
     document: &crate::dom::Document,
     node_id: crate::dom::NodeId,
     stylesheet: &StyleSheet,
-    parent_styles: &std::rc::Rc<Vec<(string_cache::DefaultAtom, crate::dom::StyleValue)>>,
+    parent_styles: &Option<std::rc::Rc<Vec<(string_cache::DefaultAtom, crate::dom::StyleValue)>>>,
 ) -> crate::dom::StyledNode {
     let mut new_declarations = Vec::new();
     let mut children_ids = Vec::new();
@@ -575,46 +575,39 @@ fn build_styled_node(
         }
     }
 
-    let final_styles = if new_declarations.is_empty() {
-        std::rc::Rc::clone(parent_styles)
+    let inherited_styles = if new_declarations.is_empty() {
+        parent_styles.clone()
     } else {
-        let mut final_vec: Vec<(string_cache::DefaultAtom, crate::dom::StyleValue)> = parent_styles
-            .iter()
-            .filter(|(k, _)| is_inheritable(k))
-            .cloned()
-            .collect();
-            
+        let mut appended_styles = if let Some(parent) = parent_styles {
+            parent.iter().cloned().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         for (k, v) in &new_declarations {
-            if let Some(pos) = final_vec.iter().position(|(ek, _)| ek == k) {
-                final_vec[pos].1 = v.clone();
-            } else {
-                final_vec.push((k.clone(), v.clone()));
+            if is_inheritable(k) {
+                if let Some(pos) = appended_styles.iter().position(|(ek, _)| ek == k) {
+                    appended_styles[pos].1 = v.clone();
+                } else {
+                    appended_styles.push((k.clone(), v.clone()));
+                }
             }
         }
-        std::rc::Rc::new(final_vec)
+        if appended_styles.is_empty() { None } else { Some(std::rc::Rc::new(appended_styles)) }
     };
-
-    let inherited_rc = if new_declarations.is_empty() {
-        std::rc::Rc::clone(parent_styles)
-    } else {
-        let inheritable_only: Vec<_> = final_styles
-            .iter()
-            .filter(|(k, _)| is_inheritable(k))
-            .cloned()
-            .collect();
-        std::rc::Rc::new(inheritable_only)
-    };
-
+            
     let children = children_ids
         .into_iter()
-        .map(|id| build_styled_node(document, id, stylesheet, &inherited_rc))
+        .map(|id| build_styled_node(document, id, stylesheet, &inherited_styles))
         .collect();
 
     crate::dom::StyledNode {
         node_id,
-        specified_values: final_styles,
+        local: new_declarations,
+        inherited: inherited_styles,
         children,
     }
+
+
 }
 
 fn parse_rules_list<'i, 't>(parser: &mut Parser<'i, 't>, stylesheet: &mut StyleSheet) {

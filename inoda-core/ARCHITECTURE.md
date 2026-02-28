@@ -37,7 +37,8 @@ Document {
     nodes: Arena<Node>,             // generational_arena::Arena, indexed by Index
     root_id: generational_arena::Index,
     style_texts: Vec<String>,       // raw CSS from <style> tags
-    id_map: HashMap<String, NodeId> // O(1) getElementById lookup
+    id_map: HashMap<String, NodeId>, // O(1) getElementById lookup
+    dead_nodes: Vec<NodeId>         // iterative deletion queue for remove_node
 }
 
 Node = Element(ElementData) | Text(TextData) | Root(RootData)
@@ -74,12 +75,13 @@ Generational indices provide O(1) insertion and deletion without index invalidat
 ```
 StyledNode {
     node_id: NodeId,
-    specified_values: Rc<Vec<(DefaultAtom, StyleValue)>>,  // typed property values
+    local: Vec<(DefaultAtom, StyleValue)>,                     // properties declared on this node
+    inherited: Option<Rc<Vec<(DefaultAtom, StyleValue)>>>,      // inheritable properties from parent
     children: Vec<StyledNode>
 }
 ```
 
-This is a tree (not arena). Each node owns its children. It exists only during layout computation and rendering, then gets dropped. When a node has no CSS declarations of its own, it receives a clone of its parent's `Rc`. When a node does have declarations, the parent's styles are filtered to only inheritable properties (e.g., `color`, `font-size`) before merging with the node's own declarations. Non-inheritable properties like `width` or `margin` are not passed to children.
+This is a tree (not arena). Each node owns its children. It exists only during layout computation and rendering, then gets dropped. The `local` vector holds properties that matched this specific element. The `inherited` vector holds only inheritable properties (`color`, `font-size`, `font-family`, etc.) from the parent. Non-inheritable properties like `width` or `margin` are filtered out before being passed to children. When a child has no matched declarations and no new inheritable values, the parent's `Rc` is cloned without copying the underlying vector.
 
 ### StyleSheet (css/mod.rs)
 
@@ -118,7 +120,7 @@ Selectors are scored as `(id_count, class_count, tag_count)`. Matched rules are 
 
 Text nodes are inserted into Taffy as leaf nodes with a `TextMeasureContext`. A pre-pass traverses the styled DOM and creates a `cosmic-text::Buffer` for each text node, performing HarfBuzz shaping once. The buffer cache is caller-owned and persists across frames; it is not cleared internally. During `compute_layout_with_measure`, the measure closure retrieves the already-shaped buffer, calls `buffer.set_size()` to adjust the width constraint, then calls `buffer.shape_until_scroll()` to re-wrap the text. It then counts layout lines to determine the height.
 
-After layout completes, `finalize_text_measurements` walks the Taffy tree and extracts the final glyph arrays (not string copies) into a `TextLayoutCache` for the renderer.
+After layout completes, `finalize_text_measurements` walks the Taffy tree one last time and reshapes each text buffer at its final resolved width. The renderer reads glyphs directly from the `buffer_cache` via `buffer.layout_runs()` -- there is no intermediate `TextLayoutCache` or `TextLineLayout` struct.
 
 ## Thread safety
 

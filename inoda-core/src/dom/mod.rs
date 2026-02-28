@@ -21,6 +21,8 @@ pub struct Document {
     pub style_texts: Vec<String>,
     /// O(1) lookup map for `getElementById`.
     pub id_map: std::collections::HashMap<String, NodeId>,
+    /// Iterative deletion queue used by `remove_node` to avoid recursive stack overflow.
+    pub dead_nodes: Vec<NodeId>,
 }
 
 /// A handle into the arena. Generational indices prevent ABA problems.
@@ -78,7 +80,8 @@ pub enum StyleValue {
 #[derive(Debug)]
 pub struct StyledNode {
     pub node_id: NodeId,
-    pub specified_values: std::rc::Rc<Vec<(string_cache::DefaultAtom, StyleValue)>>,
+    pub local: Vec<(string_cache::DefaultAtom, StyleValue)>,
+    pub inherited: Option<std::rc::Rc<Vec<(string_cache::DefaultAtom, StyleValue)>>>,
     pub children: Vec<StyledNode>,
 }
 
@@ -94,6 +97,7 @@ impl Default for Document {
             root_id,
             style_texts: Vec::new(),
             id_map: std::collections::HashMap::new(),
+            dead_nodes: Vec::new(),
         }
     }
 }
@@ -119,14 +123,14 @@ impl Document {
             self.remove_child(parent_id, id);
         }
 
-        let mut delete_queue = vec![id];
+        self.dead_nodes.push(id);
         let mut root_node = None;
 
-        while let Some(current_id) = delete_queue.pop() {
+        while let Some(current_id) = self.dead_nodes.pop() {
             let mut current_child = self.first_child_of(current_id);
             while let Some(child_id) = current_child {
                 current_child = self.next_sibling_of(child_id);
-                delete_queue.push(child_id);
+                self.dead_nodes.push(child_id);
             }
 
             if let Some(node) = self.nodes.remove(current_id) {
@@ -200,6 +204,18 @@ impl Document {
         self.set_parent(child_id, None);
         self.set_prev_sibling(child_id, None);
         self.set_next_sibling(child_id, None);
+    }
+    
+    pub fn is_attached_to_root(&self, node_id: NodeId) -> bool {
+        let mut current_id = node_id;
+        while current_id != self.root_id {
+            if let Some(parent_id) = self.parent_of(current_id) {
+                current_id = parent_id;
+            } else {
+                return false;
+            }
+        }
+        true
     }
 
     fn set_parent(&mut self, node_id: NodeId, parent: Option<NodeId>) {

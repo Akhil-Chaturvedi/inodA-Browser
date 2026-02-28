@@ -17,8 +17,8 @@
 //! The Document is held behind `Rc<RefCell<Document>>` for single-threaded access.
 //! All JS operations are synchronous and serialized through this lock.
 
-use crate::dom::Document;
-use rquickjs::class::{JsClass, Readable, Trace, Tracer};
+use crate::dom::{Document, NodeId};
+use rquickjs::class::{Trace, Tracer};
 use rquickjs::function::This;
 use rquickjs::{Context, Persistent, Runtime};
 use std::cell::{Cell, RefCell};
@@ -29,27 +29,28 @@ use std::time::Instant;
 // NodeHandle: an opaque JS class wrapping a generational_arena::Index.
 // ---------------------------------------------------------------------------
 
-/// A DOM node handle exposed to JavaScript as a native class.
-/// Stores the raw parts of a `generational_arena::Index` to avoid
-/// string serialization on every DOM operation.
+/// A handle to a native DOM node exposed to JavaScript.
+/// The `NodeHandle` caches the NodeId structurally explicitly bypassing Drop.
+/// Actual memory lifecycles are resolved exclusively via explicit `removeChild()`
+/// bindings and JS QuickJS `FinalizationRegistry` background mappings.
+#[rquickjs::class]
+#[derive(Clone, Debug)]
 pub struct NodeHandle {
-    arena_index: usize,
-    arena_generation: u64,
+    pub index: u32,
+    pub generation: u64,
 }
 
 impl NodeHandle {
-    pub fn from_node_id(
-        id: crate::dom::NodeId,
-    ) -> Self {
-        let (idx, generation) = id.into_raw_parts();
+    pub fn from_node_id(id: NodeId) -> Self {
+        let (index, generation) = id.into_raw_parts();
         NodeHandle {
-            arena_index: idx,
-            arena_generation: generation,
+            index: index as u32,
+            generation,
         }
     }
 
-    pub fn to_node_id(&self) -> crate::dom::NodeId {
-        generational_arena::Index::from_raw_parts(self.arena_index, self.arena_generation)
+    pub fn to_node_id(&self) -> NodeId {
+        NodeId::from_raw_parts(self.index as usize, self.generation)
     }
 }
 
@@ -65,23 +66,6 @@ impl<'js> Trace<'js> for NodeHandle {
 // goes out of scope while the node is still attached or referenced elsewhere.
 unsafe impl<'js> rquickjs::JsLifetime<'js> for NodeHandle {
     type Changed<'to> = NodeHandle;
-}
-
-impl<'js> JsClass<'js> for NodeHandle {
-    const NAME: &'static str = "NodeHandle";
-    type Mutable = Readable;
-
-    fn prototype(ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<Option<rquickjs::Object<'js>>> {
-        let proto = rquickjs::Object::new(ctx.clone())?;
-        Ok(Some(proto))
-    }
-
-    fn constructor(
-        _ctx: &rquickjs::Ctx<'js>,
-    ) -> rquickjs::Result<Option<rquickjs::function::Constructor<'js>>> {
-        // NodeHandle cannot be constructed from JS -- only from Rust.
-        Ok(None)
-    }
 }
 
 pub struct NodeHandleWithTag {
@@ -325,15 +309,15 @@ impl JsEngine {
                     let doc = doc_ref.borrow();
                     for (node_id, node) in doc.nodes.iter() {
                         if let crate::dom::Node::Element(data) = node {
-                            let is_match = (selector.starts_with('.')
-                                && data.attributes.iter().any(|(k, v)| {
-                                    &**k == "class" && format!(".{}", v) == selector
-                                }))
-                                || (selector.starts_with('#')
-                                    && data.attributes.iter().any(|(k, v)| {
-                                        &**k == "id" && format!("#{}", v) == selector
-                                    }))
-                                || (&*data.tag_name == selector);
+                            let is_match = if selector.starts_with('.') {
+                                let class_name = &selector[1..];
+                                data.classes.iter().any(|c| &**c == class_name)
+                            } else if selector.starts_with('#') {
+                                let id_name = &selector[1..];
+                                data.attributes.iter().any(|(k, v)| &**k == "id" && v == id_name)
+                            } else {
+                                &*data.tag_name == selector
+                            };
 
                             if is_match {
                                 return Some(NodeHandleWithTag {
@@ -369,14 +353,26 @@ impl JsEngine {
                 .set("addEventListener", add_event_listener_func)
                 .unwrap();
 
-            // createElement: returns a NodeHandle JS object
+            // createElement: creates an unattached node, returns a NodeHandle JS object
             let create_element_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
                 move |tag_name: String| -> NodeHandleWithTag {
                     let mut doc = doc_ref.borrow_mut();
-                    let tag_name_clone = tag_name.clone();
+                    let safe_tag = tag_name.to_lowercase();
+                    
+                    let is_html5_tag = matches!(
+                        safe_tag.as_str(),
+                        "a" | "abbr" | "address" | "area" | "article" | "aside" | "audio" | "b" | "base" | "bdi" | "bdo" | "blockquote" | "body" | "br" | "button" | "canvas" | "caption" | "cite" | "code" | "col" | "colgroup" | "data" | "datalist" | "dd" | "del" | "details" | "dfn" | "dialog" | "div" | "dl" | "dt" | "em" | "embed" | "fieldset" | "figcaption" | "figure" | "footer" | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "head" | "header" | "hr" | "html" | "i" | "iframe" | "img" | "input" | "ins" | "kbd" | "label" | "legend" | "li" | "link" | "main" | "map" | "mark" | "meta" | "meter" | "nav" | "noscript" | "object" | "ol" | "optgroup" | "option" | "output" | "p" | "param" | "picture" | "pre" | "progress" | "q" | "rp" | "rt" | "ruby" | "s" | "samp" | "script" | "section" | "select" | "small" | "source" | "span" | "strong" | "style" | "sub" | "summary" | "sup" | "table" | "tbody" | "td" | "template" | "textarea" | "tfoot" | "th" | "thead" | "time" | "title" | "tr" | "track" | "u" | "ul" | "var" | "video" | "wbr"
+                    );
+
+                    let atom = if is_html5_tag {
+                        string_cache::DefaultAtom::from(safe_tag.as_str())
+                    } else {
+                        string_cache::DefaultAtom::from("div") // Fallback for invalid tags to prevent OOM
+                    };
+
                     let node = crate::dom::Node::Element(crate::dom::ElementData {
-                        tag_name: string_cache::DefaultAtom::from(tag_name.as_str()),
+                        tag_name: atom.clone(),
                         attributes: Vec::new(),
                         classes: Vec::new(),
                         parent: None,
@@ -390,7 +386,7 @@ impl JsEngine {
 
                     NodeHandleWithTag {
                         handle: NodeHandle::from_node_id(index),
-                        tag_name: tag_name_clone,
+                        tag_name: atom.to_string(),
                         node_key: format!(
                             "{}:{}",
                             index.into_raw_parts().0,
@@ -418,6 +414,27 @@ impl JsEngine {
             .unwrap();
             document_obj.set("appendChild", append_child_func).unwrap();
 
+            // _garbageCollectNodeRaw: invoked natively by JS FinalizationRegistry
+            let gc_func = rquickjs::Function::new(ctx.clone(), {
+                let doc_ref = doc_ref.clone();
+                move |node_key: String| {
+                    if let Some((idx_str, gen_str)) = node_key.split_once(':') {
+                        if let (Ok(idx), Ok(gen_val)) = (idx_str.parse::<usize>(), gen_str.parse::<u64>()) {
+                            let node_id = NodeId::from_raw_parts(idx, gen_val);
+                            let mut doc = doc_ref.borrow_mut();
+                            
+                            // If the JS wrapper is garbage collected AND the node is unattached,
+                            // safely wipe it from the Rust Arena freeing memory.
+                            if !doc.is_attached_to_root(node_id) && node_id != doc.root_id {
+                                doc.remove_node(node_id);
+                            }
+                        }
+                    }
+                }
+            })
+            .unwrap();
+            document_obj.set("_garbageCollectNodeRaw", gc_func).unwrap();
+
             globals.set("document", document_obj).unwrap();
 
             let _: () = ctx
@@ -426,6 +443,7 @@ impl JsEngine {
                 document.__nodeCache = new Map();
                 document.__nodeRegistry = new FinalizationRegistry(key => {
                     document.__nodeCache.delete(key);
+                    document._garbageCollectNodeRaw(key);
                 });
 
                 document._wrapNode = function(rawNode) {

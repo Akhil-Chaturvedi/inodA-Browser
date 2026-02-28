@@ -20,22 +20,6 @@ use taffy::{
     style::{Dimension, Style},
 };
 
-pub type TextLayoutCache = HashMap<crate::dom::NodeId, TextNodeLayout>;
-
-#[derive(Debug, Clone)]
-pub struct TextLineLayout {
-    pub glyphs: Vec<cosmic_text::LayoutGlyph>,
-    pub line_width: f32,
-}
-
-#[derive(Debug, Clone)]
-pub struct TextNodeLayout {
-    pub lines: Vec<TextLineLayout>,
-    pub line_height: f32,
-    pub width: f32,
-    pub height: f32,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct TextMeasureContext {
     pub node_id: crate::dom::NodeId,
@@ -49,7 +33,7 @@ pub fn compute_layout(
     viewport_height: f32,
     font_system: &mut FontSystem,
     buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
-) -> (TaffyTree<TextMeasureContext>, NodeId, TextLayoutCache) {
+) -> (TaffyTree<TextMeasureContext>, NodeId, HashMap<crate::dom::NodeId, Buffer>) {
     let mut tree: TaffyTree<TextMeasureContext> = TaffyTree::new();
 
     prepare_text_buffers(document, styled_node, font_system, buffer_cache);
@@ -57,7 +41,7 @@ pub fn compute_layout(
     let root_taffy_node = build_taffy_node(
         &mut tree,
         document,
-        styled_node,
+        styled_node, 
         viewport_width,
         viewport_height,
     );
@@ -68,7 +52,7 @@ pub fn compute_layout(
     };
 
     let font_system = RefCell::new(font_system);
-    let buffer_cache_cell = RefCell::new(buffer_cache);
+    let buffer_cache_cell = RefCell::new(&mut *buffer_cache);
 
     tree.compute_layout_with_measure(
         root_taffy_node,
@@ -119,16 +103,15 @@ pub fn compute_layout(
     )
     .unwrap();
 
-    let mut final_cache = HashMap::new();
+    // We walk the tree one last time to enforce exact text heights for empty nodes
     finalize_text_measurements(
         &tree,
         root_taffy_node,
         font_system.into_inner(),
-        buffer_cache_cell.into_inner(),
-        &mut final_cache,
+        buffer_cache,
     );
 
-    (tree, root_taffy_node, final_cache)
+    (tree, root_taffy_node, std::mem::take(buffer_cache))
 }
 
 fn prepare_text_buffers(
@@ -139,12 +122,18 @@ fn prepare_text_buffers(
 ) {
     if let Some(crate::dom::Node::Text(txt)) = document.nodes.get(styled_node.node_id) {
         let font_size = styled_node
-            .specified_values
+            .local
             .iter()
             .find(|(k, _)| &**k == "font-size")
+            .or_else(|| {
+                styled_node
+                    .inherited
+                    .as_ref()
+                    .and_then(|i| i.iter().find(|(k, _)| &**k == "font-size"))
+            })
             .and_then(|(_, v)| match v {
-                crate::dom::StyleValue::LengthPx(num) => Some(*num),
-                crate::dom::StyleValue::Number(num) => Some(*num),
+                crate::dom::StyleValue::LengthPx(num) => Some(num.clone()),
+                crate::dom::StyleValue::Number(num) => Some(num.clone()),
                 _ => None,
             })
             .unwrap_or(16.0);
@@ -168,7 +157,6 @@ fn finalize_text_measurements(
     taffy_node: NodeId,
     font_system: &mut FontSystem,
     buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
-    measured_text_nodes: &mut TextLayoutCache,
 ) {
     if let Some(ctx) = tree.get_node_context(taffy_node) {
         if let Ok(layout) = tree.layout(taffy_node) {
@@ -181,43 +169,12 @@ fn finalize_text_measurements(
                 Some(f32::INFINITY),
             );
             buffer.shape_until_scroll(font_system, false);
-
-            let mut lines = Vec::new();
-            let mut max_width: f32 = 0.0;
-            for run in buffer.layout_runs() {
-                max_width = max_width.max(run.line_w);
-                lines.push(TextLineLayout {
-                    glyphs: run.glyphs.to_vec(),
-                    line_width: run.line_w,
-                });
-            }
-
-            if lines.is_empty() {
-                lines.push(TextLineLayout {
-                    glyphs: Vec::new(),
-                    line_width: 0.0,
-                });
-            }
-
-            let width = max_width.min(width_constraint.max(1.0));
-            let line_height = (ctx.font_size * 1.2).max(1.0);
-            let height = (lines.len() as f32) * line_height;
-
-            measured_text_nodes.insert(
-                ctx.node_id,
-                TextNodeLayout {
-                    lines,
-                    line_height,
-                    width,
-                    height,
-                },
-            );
         }
     }
 
     if let Ok(children) = tree.children(taffy_node) {
         for child in children {
-            finalize_text_measurements(tree, child, font_system, buffer_cache, measured_text_nodes);
+            finalize_text_measurements(tree, child, font_system, buffer_cache);
         }
     }
 }
@@ -232,20 +189,32 @@ fn build_taffy_node(
     let mut style = Style::DEFAULT;
 
     let font_size = styled_node
-        .specified_values
+        .local
         .iter()
         .find(|(k, _)| &**k == "font-size")
+        .or_else(|| {
+            styled_node
+                .inherited
+                .as_ref()
+                .and_then(|i| i.iter().find(|(k, _)| &**k == "font-size"))
+        })
         .and_then(|(_, v)| match v {
-            crate::dom::StyleValue::LengthPx(num) => Some(*num),
-            crate::dom::StyleValue::Number(num) => Some(*num),
+            crate::dom::StyleValue::LengthPx(num) => Some(num.clone()),
+            crate::dom::StyleValue::Number(num) => Some(num.clone()),
             _ => None,
         })
         .unwrap_or(16.0);
 
-    if let Some((_, display_val)) = styled_node
-        .specified_values
+        if let Some((_, display_val)) = styled_node
+        .local
         .iter()
         .find(|(k, _)| &**k == "display")
+        .or_else(|| {
+            styled_node
+                .inherited
+                .as_ref()
+                .and_then(|i| i.iter().find(|(k, _)| &**k == "display"))
+        })
     {
         if let crate::dom::StyleValue::Keyword(kw) = display_val {
             match &**kw {
@@ -260,9 +229,15 @@ fn build_taffy_node(
     }
 
     if let Some((_, dir_val)) = styled_node
-        .specified_values
+        .local
         .iter()
         .find(|(k, _)| &**k == "flex-direction")
+        .or_else(|| {
+            styled_node
+                .inherited
+                .as_ref()
+                .and_then(|i| i.iter().find(|(k, _)| &**k == "flex-direction"))
+        })
     {
         if let crate::dom::StyleValue::Keyword(kw) = dir_val {
             match &**kw {
@@ -273,27 +248,45 @@ fn build_taffy_node(
         }
     }
 
-    if styled_node
-        .specified_values
+    let is_flex = styled_node
+        .local
         .iter()
         .find(|(k, _)| &**k == "display")
+        .or_else(|| {
+            styled_node
+                .inherited
+                .as_ref()
+                .and_then(|i| i.iter().find(|(k, _)| &**k == "display"))
+        })
         .map(|(_, s)| s)
-        != Some(&crate::dom::StyleValue::Keyword(string_cache::DefaultAtom::from("flex")))
-    {
-        if styled_node
-            .specified_values
-            .iter()
-            .find(|(k, _)| &**k == "flex-direction")
-            .is_none()
-        {
-            style.flex_direction = FlexDirection::Column;
-        }
+        == Some(&crate::dom::StyleValue::Keyword(string_cache::DefaultAtom::from("flex")));
+
+    let has_flex_dir = styled_node
+        .local
+        .iter()
+        .find(|(k, _)| &**k == "flex-direction")
+        .or_else(|| {
+            styled_node
+                .inherited
+                .as_ref()
+                .and_then(|i| i.iter().find(|(k, _)| &**k == "flex-direction"))
+        })
+        .is_some();
+
+    if !is_flex && !has_flex_dir {
+        style.flex_direction = FlexDirection::Column;
     }
 
     if let Some((_, width_val)) = styled_node
-        .specified_values
+        .local
         .iter()
         .find(|(k, _)| &**k == "width")
+        .or_else(|| {
+            styled_node
+                .inherited
+                .as_ref()
+                .and_then(|i| i.iter().find(|(k, _)| &**k == "width"))
+        })
     {
         if let Some(dim) = parse_dimension(width_val, vw, vh, font_size) {
             style.size.width = dim;
@@ -301,16 +294,24 @@ fn build_taffy_node(
     }
 
     if let Some((_, height_val)) = styled_node
-        .specified_values
+        .local
         .iter()
         .find(|(k, _)| &**k == "height")
+        .or_else(|| {
+            styled_node
+                .inherited
+                .as_ref()
+                .and_then(|i| i.iter().find(|(k, _)| &**k == "height"))
+        })
     {
         if let Some(dim) = parse_dimension(height_val, vw, vh, font_size) {
             style.size.height = dim;
         }
     }
 
-    for (k, v) in styled_node.specified_values.iter() {
+    let empty_vec = Vec::new();
+    let iter = styled_node.inherited.as_deref().unwrap_or(&empty_vec).iter().chain(styled_node.local.iter());
+    for (k, v) in iter {
         match &**k {
             "margin-top" => if let Some(dim) = parse_length_percentage_auto(v, vw, vh, font_size) { style.margin.top = dim; },
             "margin-right" => if let Some(dim) = parse_length_percentage_auto(v, vw, vh, font_size) { style.margin.right = dim; },

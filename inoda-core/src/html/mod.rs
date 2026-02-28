@@ -25,19 +25,34 @@ pub fn parse_html(html: &str) -> Document {
                 let tag_name = DefaultAtom::from(tag_name_str);
                 
                 if let Some(ref raw) = inside_raw_tag {
-                    let mut s = format!("<{}", tag_name_str);
-                    for (k, v) in tag.attributes.iter() {
-                        let k_str = std::str::from_utf8(k).unwrap_or("");
-                        s.push_str(&format!(" {}=\"{}\"", k_str, std::str::from_utf8(v).unwrap_or("")));
-                    }
-                    if tag.self_closing { s.push_str("/>"); } else { s.push_str(">"); }
-                    
                     if &**raw == "style" {
-                        current_style_text.push_str(&s);
+                        current_style_text.push_str("<");
+                        current_style_text.push_str(tag_name_str);
+                        for (k, v) in tag.attributes.iter() {
+                            let k_str = std::str::from_utf8(k).unwrap_or("");
+                            let v_str = std::str::from_utf8(v).unwrap_or("");
+                            current_style_text.push_str(" ");
+                            current_style_text.push_str(k_str);
+                            current_style_text.push_str("=\"");
+                            current_style_text.push_str(v_str);
+                            current_style_text.push_str("\"");
+                        }
+                        if tag.self_closing { current_style_text.push_str("/>"); } else { current_style_text.push_str(">"); }
                     } else {
                         if let Some(last_child) = doc.last_child_of(current_parent) {
                             if let Some(Node::Text(existing)) = doc.nodes.get_mut(last_child) {
-                                existing.text.push_str(&s);
+                                existing.text.push_str("<");
+                                existing.text.push_str(tag_name_str);
+                                for (k, v) in tag.attributes.iter() {
+                                    let k_str = std::str::from_utf8(k).unwrap_or("");
+                                    let v_str = std::str::from_utf8(v).unwrap_or("");
+                                    existing.text.push_str(" ");
+                                    existing.text.push_str(k_str);
+                                    existing.text.push_str("=\"");
+                                    existing.text.push_str(v_str);
+                                    existing.text.push_str("\"");
+                                }
+                                if tag.self_closing { existing.text.push_str("/>"); } else { existing.text.push_str(">"); }
                             }
                         }
                     }
@@ -134,13 +149,16 @@ pub fn parse_html(html: &str) -> Document {
 
                 if let Some(ref raw) = inside_raw_tag {
                     if raw != &tag_name {
-                        let s = format!("</{}>", tag_name_str);
                         if &**raw == "style" {
-                            current_style_text.push_str(&s);
+                            current_style_text.push_str("</");
+                            current_style_text.push_str(tag_name_str);
+                            current_style_text.push_str(">");
                         } else {
                             if let Some(last_child) = doc.last_child_of(current_parent) {
                                 if let Some(Node::Text(existing)) = doc.nodes.get_mut(last_child) {
-                                    existing.text.push_str(&s);
+                                    existing.text.push_str("</");
+                                    existing.text.push_str(tag_name_str);
+                                    existing.text.push_str(">");
                                 }
                             }
                         }

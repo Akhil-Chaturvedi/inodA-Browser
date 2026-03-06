@@ -2,7 +2,7 @@
 //!
 //! Embeds QuickJS via `rquickjs`. Exposes a subset of the Web API:
 //! - `console.log`, `console.warn`, `console.error` (print to stdout)
-//! - `document.getElementById`, `document.querySelector` (return native `NodeHandle` objects globally cached via `__nodeCache` to explicitly preserve `===` identity)
+//! - `document.getElementById`, `document.querySelector` (return native `NodeHandle` objects)
 //! - `document.createElement`, `document.appendChild` (mutate the arena DOM)
 //! - `document.addEventListener` (logs registration, does not dispatch events)
 //! - `setTimeout` (cooperative timer queue via `pump()`)
@@ -13,6 +13,14 @@
 //! - `handle.getAttribute(key)`
 //! - `handle.setAttribute(key, value)`
 //! - `handle.removeChild(child)`
+//!
+//! Each `NodeHandle` carries a `__nodeKey` property: a two-element JS array
+//! `[u32 index, u64 generation]`. The `__nodeCache` Map is keyed by the
+//! string `"index:generation"` built from that array. A `FinalizationRegistry`
+//! receives the integer array when a wrapper is GC'd and calls the native Rust
+//! `_garbageCollectNodeRaw`, which reconstructs the `NodeId` from the two
+//! integers without string parsing and removes the node from the arena if it
+//! is detached from the DOM tree.
 //!
 //! The Document is held behind `Rc<RefCell<Document>>` for single-threaded access.
 //! All JS operations are synchronous and serialized through this lock.
@@ -71,14 +79,20 @@ unsafe impl<'js> rquickjs::JsLifetime<'js> for NodeHandle {
 pub struct NodeHandleWithTag {
     handle: NodeHandle,
     tag_name: String,
-    node_key: String,
+    node_idx: u32,
+    node_gen: u64,
 }
 
 impl<'js> rquickjs::IntoJs<'js> for NodeHandleWithTag {
     fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
         let cls = rquickjs::Class::instance(ctx.clone(), self.handle)?;
         cls.set("tagName", self.tag_name)?;
-        cls.set("__nodeKey", self.node_key)?;
+        
+        let arr = rquickjs::Array::new(ctx.clone())?;
+        arr.set(0, self.node_idx)?;
+        arr.set(1, self.node_gen)?;
+        cls.set("__nodeKey", arr)?;
+        
         cls.into_js(ctx)
     }
 }
@@ -285,11 +299,8 @@ impl JsEngine {
                             return Some(NodeHandleWithTag {
                                 handle: NodeHandle::from_node_id(node_id),
                                 tag_name: data.tag_name.to_string(),
-                                node_key: format!(
-                                    "{}:{}",
-                                    node_id.into_raw_parts().0,
-                                    node_id.into_raw_parts().1
-                                ),
+                                node_idx: node_id.into_raw_parts().0 as u32,
+                                node_gen: node_id.into_raw_parts().1,
                             });
                         }
                     }
@@ -323,11 +334,8 @@ impl JsEngine {
                                 return Some(NodeHandleWithTag {
                                     handle: NodeHandle::from_node_id(node_id),
                                     tag_name: data.tag_name.to_string(),
-                                    node_key: format!(
-                                        "{}:{}",
-                                        node_id.into_raw_parts().0,
-                                        node_id.into_raw_parts().1
-                                    ),
+                                    node_idx: node_id.into_raw_parts().0 as u32,
+                                    node_gen: node_id.into_raw_parts().1,
                                 });
                             }
                         }
@@ -387,11 +395,8 @@ impl JsEngine {
                     NodeHandleWithTag {
                         handle: NodeHandle::from_node_id(index),
                         tag_name: atom.to_string(),
-                        node_key: format!(
-                            "{}:{}",
-                            index.into_raw_parts().0,
-                            index.into_raw_parts().1
-                        ),
+                        node_idx: index.into_raw_parts().0 as u32,
+                        node_gen: index.into_raw_parts().1,
                     }
                 }
             })
@@ -417,17 +422,15 @@ impl JsEngine {
             // _garbageCollectNodeRaw: invoked natively by JS FinalizationRegistry
             let gc_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
-                move |node_key: String| {
-                    if let Some((idx_str, gen_str)) = node_key.split_once(':') {
-                        if let (Ok(idx), Ok(gen_val)) = (idx_str.parse::<usize>(), gen_str.parse::<u64>()) {
-                            let node_id = NodeId::from_raw_parts(idx, gen_val);
-                            let mut doc = doc_ref.borrow_mut();
-                            
-                            // If the JS wrapper is garbage collected AND the node is unattached,
-                            // safely wipe it from the Rust Arena freeing memory.
-                            if !doc.is_attached_to_root(node_id) && node_id != doc.root_id {
-                                doc.remove_node(node_id);
-                            }
+                move |node_key: rquickjs::Array<'_>| {
+                    if let (Ok(idx), Ok(gen_val)) = (node_key.get::<u32>(0), node_key.get::<u64>(1)) {
+                        let node_id = NodeId::from_raw_parts(idx as usize, gen_val);
+                        let mut doc = doc_ref.borrow_mut();
+                        
+                        // If the JS wrapper is garbage collected AND the node is unattached,
+                        // safely wipe it from the Rust Arena freeing memory.
+                        if !doc.is_attached_to_root(node_id) && node_id != doc.root_id {
+                            doc.remove_node(node_id);
                         }
                     }
                 }
@@ -442,20 +445,22 @@ impl JsEngine {
                     r#"
                 document.__nodeCache = new Map();
                 document.__nodeRegistry = new FinalizationRegistry(key => {
-                    document.__nodeCache.delete(key);
+                    let mapKey = key[0] + ":" + key[1];
+                    document.__nodeCache.delete(mapKey);
                     document._garbageCollectNodeRaw(key);
                 });
 
                 document._wrapNode = function(rawNode) {
                     if (!rawNode) return null;
-                    let key = rawNode.__nodeKey;
-                    let cachedRef = document.__nodeCache.get(key);
+                    let keyPair = rawNode.__nodeKey; // [idx, gen]
+                    let mapKey = keyPair[0] + ":" + keyPair[1];
+                    let cachedRef = document.__nodeCache.get(mapKey);
                     if (cachedRef) {
                         let cachedObj = cachedRef.deref();
                         if (cachedObj) return cachedObj;
                     }
-                    document.__nodeCache.set(key, new WeakRef(rawNode));
-                    document.__nodeRegistry.register(rawNode, key);
+                    document.__nodeCache.set(mapKey, new WeakRef(rawNode));
+                    document.__nodeRegistry.register(rawNode, keyPair);
                     return rawNode;
                 };
 

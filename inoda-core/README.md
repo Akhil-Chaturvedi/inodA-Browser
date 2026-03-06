@@ -60,7 +60,7 @@ Streams `html5gum` tokens into the arena in a single pass. Each token is convert
 
 ### layout
 
-Walks the `StyledNode` tree and builds a parallel `TaffyTree<TextMeasureContext>`. A pre-pass traverses the styled DOM and creates `cosmic-text::Buffer` objects for every text node, performing HarfBuzz shaping once. The buffer cache is caller-owned and persists across frames; it is not cleared internally. The Taffy measure closure calls `buffer.set_size()` followed by `buffer.shape_until_scroll()` to re-wrap text at the new width constraint. After layout completes, `finalize_text_measurements` reshapes each buffer at its final width. The renderer reads glyphs directly from buffered `layout_runs()` -- there is no intermediate cache struct or string copying.
+Walks the `StyledNode` tree and builds a parallel `TaffyTree<TextMeasureContext>`. A pre-pass traverses the styled DOM and creates `cosmic-text::Buffer` objects for every text node, performing HarfBuzz shaping once. The buffer cache is caller-owned and persists across frames; entries for nodes that have been removed from the DOM are evicted at the start of each `compute_layout` call. The Taffy measure closure calls `buffer.set_size()` to adjust the width constraint, then calls `buffer.shape_until_scroll()` to re-wrap text. After layout completes, `finalize_text_measurements` reshapes each buffer at its final resolved width. Layout properties are read from `styled_node.computed` rather than scanning the style tuple vectors.
 
 Supported CSS properties mapped to Taffy:
 - `display`: flex, grid, block, none (inline/inline-block are recognized but not yet laid out differently)
@@ -79,9 +79,11 @@ Properties not yet wired: `align-items`, `justify-content`, `gap`, `flex-wrap`, 
 Recursively walks the Taffy layout tree alongside the `StyledNode` tree and issues backend draw calls:
 - Background rectangles (`background-color`)
 - Border strokes (`border-color`, always 1px, no per-side control)
-- Text via `RendererBackend::draw_glyphs()` using pre-shaped `cosmic_text::LayoutGlyph` arrays, inherited `color`, and `font-size`
+- Text via `RendererBackend::draw_glyphs()` using pre-shaped `cosmic_text::LayoutGlyph` arrays
 
-The `RendererBackend` trait requires implementing `fill_rect`, `stroke_rect`, and `draw_glyphs`. A default `draw_text_layout` method iterates over `TextDrawLine` entries and delegates to `draw_glyphs`.
+Draw properties (`bg_color`, `border_color`, `font_size`, `color`) are read directly from `styled_node.computed`. There is no intermediate `TextLayoutCache` or `TextDrawLine` struct.
+
+The `RendererBackend` trait requires implementing `fill_rect`, `stroke_rect`, and `draw_glyphs`.
 
 Color parsing handles the named colors `red`, `green`, `blue`, `black`, `white` and 6-digit hex (`#rrggbb`). No `rgb()`, `rgba()`, `hsl()`, shorthand hex, or alpha support.
 
@@ -106,7 +108,7 @@ Exposed globals:
 - `handle.setAttribute(key, value)` -- updates or inserts attribute
 - `handle.removeChild(child)` -- detaches child from parent
 
-The `__nodeCache` uses a `Map` of `WeakRef` objects so that cached node wrappers do not prevent QuickJS garbage collection. A `FinalizationRegistry` is registered alongside each `WeakRef` entry to delete the corresponding `Map` key when QuickJS garbage-collects the wrapper object, preventing unbounded key accumulation.
+The `__nodeCache` uses a `Map` of `WeakRef` objects keyed by `"index:generation"` strings. Each node exposed to JS carries a `__nodeKey` property which is a two-element JavaScript array `[u32 index, u64 generation]`. The cache key string is constructed from this array on the JS side. A `FinalizationRegistry` is given the integer array at registration time; when QuickJS garbage-collects the wrapper, the registry calls the native Rust `_garbageCollectNodeRaw` function passing the integer array directly (no string parsing). `_garbageCollectNodeRaw` reconstructs the `NodeId` from the two integers, then removes the node from the arena only if it is not currently attached to the DOM tree.
 
 `NodeHandle` does not implement `Drop`. Nodes created via JavaScript remain in the Rust arena until explicitly removed via `removeChild()`. This avoids ABA memory corruption that would occur if QuickJS garbage collection triggered arena deletions for nodes that are still attached to the DOM.
 

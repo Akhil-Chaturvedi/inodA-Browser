@@ -1,10 +1,16 @@
 //! Layout computation module.
 //!
 //! Converts a `StyledNode` tree into a `TaffyTree` and runs the Flexbox/Grid
-//! layout algorithm. Before running the solver, a pre-pass creates
-//! `cosmic-text::Buffer` objects for all text nodes so that HarfBuzz shaping
-//! runs once. The Taffy measure closure calls `buffer.set_size()` followed by
-//! `buffer.shape_until_scroll()` to re-wrap text at the new width constraint.
+//! layout algorithm. Before running the solver, orphaned `cosmic-text::Buffer`
+//! entries (for nodes removed from the DOM since the last frame) are evicted
+//! from the caller-owned buffer cache. A pre-pass then creates `Buffer` objects
+//! for all current text nodes, performing HarfBuzz shaping once per node.
+//!
+//! The Taffy measure closure calls `buffer.set_size()` to adjust the width
+//! constraint; if it returns a non-unit change signal `buffer.shape_until_scroll()`
+//! is called to re-wrap text. Layout properties (`width`, `height`, `margin`,
+//! `padding`, `border-width`, `display`, `flex-direction`) are read directly
+//! from `styled_node.computed` rather than scanning style tuple vectors.
 //!
 //! Supported dimension units: px, %, vw, vh, em, rem, auto.
 //! Supported display modes: flex, grid, block, none.
@@ -35,6 +41,9 @@ pub fn compute_layout(
     buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
 ) -> (TaffyTree<TextMeasureContext>, NodeId, HashMap<crate::dom::NodeId, Buffer>) {
     let mut tree: TaffyTree<TextMeasureContext> = TaffyTree::new();
+
+    // Evict cached text buffers for nodes that have been removed from the DOM
+    buffer_cache.retain(|node_id, _| document.nodes.contains(*node_id));
 
     prepare_text_buffers(document, styled_node, font_system, buffer_cache);
 
@@ -81,6 +90,7 @@ pub fn compute_layout(
                 Some(width_constraint.max(1.0)),
                 Some(f32::INFINITY),
             );
+            
             buffer.shape_until_scroll(&mut sys, false);
 
             let mut lines_count = 0;
@@ -121,22 +131,7 @@ fn prepare_text_buffers(
     buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
 ) {
     if let Some(crate::dom::Node::Text(txt)) = document.nodes.get(styled_node.node_id) {
-        let font_size = styled_node
-            .local
-            .iter()
-            .find(|(k, _)| &**k == "font-size")
-            .or_else(|| {
-                styled_node
-                    .inherited
-                    .as_ref()
-                    .and_then(|i| i.iter().find(|(k, _)| &**k == "font-size"))
-            })
-            .and_then(|(_, v)| match v {
-                crate::dom::StyleValue::LengthPx(num) => Some(num.clone()),
-                crate::dom::StyleValue::Number(num) => Some(num.clone()),
-                _ => None,
-            })
-            .unwrap_or(16.0);
+        let font_size = styled_node.computed.font_size;
 
         let line_height = (font_size * 1.2).max(1.0);
         let _buffer = buffer_cache.entry(styled_node.node_id).or_insert_with(|| {
@@ -188,152 +183,51 @@ fn build_taffy_node(
 ) -> NodeId {
     let mut style = Style::DEFAULT;
 
-    let font_size = styled_node
-        .local
-        .iter()
-        .find(|(k, _)| &**k == "font-size")
-        .or_else(|| {
-            styled_node
-                .inherited
-                .as_ref()
-                .and_then(|i| i.iter().find(|(k, _)| &**k == "font-size"))
-        })
-        .and_then(|(_, v)| match v {
-            crate::dom::StyleValue::LengthPx(num) => Some(num.clone()),
-            crate::dom::StyleValue::Number(num) => Some(num.clone()),
-            _ => None,
-        })
-        .unwrap_or(16.0);
+    let font_size = styled_node.computed.font_size;
 
-        if let Some((_, display_val)) = styled_node
-        .local
-        .iter()
-        .find(|(k, _)| &**k == "display")
-        .or_else(|| {
-            styled_node
-                .inherited
-                .as_ref()
-                .and_then(|i| i.iter().find(|(k, _)| &**k == "display"))
-        })
-    {
-        if let crate::dom::StyleValue::Keyword(kw) = display_val {
-            match &**kw {
-                "flex" => style.display = Display::Flex,
-                "grid" => style.display = Display::Grid,
-                "none" => style.display = Display::None,
-                "block" => style.display = Display::Block,
-                "inline" | "inline-block" => {}
-                _ => {}
-            }
-        }
+    match &*styled_node.computed.display {
+        "flex" => style.display = Display::Flex,
+        "grid" => style.display = Display::Grid,
+        "none" => style.display = Display::None,
+        "block" => style.display = Display::Block,
+        _ => {}
     }
 
-    if let Some((_, dir_val)) = styled_node
-        .local
-        .iter()
-        .find(|(k, _)| &**k == "flex-direction")
-        .or_else(|| {
-            styled_node
-                .inherited
-                .as_ref()
-                .and_then(|i| i.iter().find(|(k, _)| &**k == "flex-direction"))
-        })
-    {
-        if let crate::dom::StyleValue::Keyword(kw) = dir_val {
-            match &**kw {
-                "row" => style.flex_direction = FlexDirection::Row,
-                "column" => style.flex_direction = FlexDirection::Column,
-                _ => {}
-            }
-        }
+    match &*styled_node.computed.flex_direction {
+        "row" => style.flex_direction = FlexDirection::Row,
+        "column" => style.flex_direction = FlexDirection::Column,
+        _ => {}
     }
 
-    let is_flex = styled_node
-        .local
-        .iter()
-        .find(|(k, _)| &**k == "display")
-        .or_else(|| {
-            styled_node
-                .inherited
-                .as_ref()
-                .and_then(|i| i.iter().find(|(k, _)| &**k == "display"))
-        })
-        .map(|(_, s)| s)
-        == Some(&crate::dom::StyleValue::Keyword(string_cache::DefaultAtom::from("flex")));
-
-    let has_flex_dir = styled_node
-        .local
-        .iter()
-        .find(|(k, _)| &**k == "flex-direction")
-        .or_else(|| {
-            styled_node
-                .inherited
-                .as_ref()
-                .and_then(|i| i.iter().find(|(k, _)| &**k == "flex-direction"))
-        })
-        .is_some();
+    let is_flex = &*styled_node.computed.display == "flex";
+    let has_flex_dir = &*styled_node.computed.flex_direction == "row" || &*styled_node.computed.flex_direction == "column";
 
     if !is_flex && !has_flex_dir {
         style.flex_direction = FlexDirection::Column;
     }
 
-    if let Some((_, width_val)) = styled_node
-        .local
-        .iter()
-        .find(|(k, _)| &**k == "width")
-        .or_else(|| {
-            styled_node
-                .inherited
-                .as_ref()
-                .and_then(|i| i.iter().find(|(k, _)| &**k == "width"))
-        })
-    {
-        if let Some(dim) = parse_dimension(width_val, vw, vh, font_size) {
-            style.size.width = dim;
-        }
+    if let Some(dim) = parse_dimension(&styled_node.computed.width, vw, vh, font_size) {
+        style.size.width = dim;
+    }
+    
+    if let Some(dim) = parse_dimension(&styled_node.computed.height, vw, vh, font_size) {
+        style.size.height = dim;
     }
 
-    if let Some((_, height_val)) = styled_node
-        .local
-        .iter()
-        .find(|(k, _)| &**k == "height")
-        .or_else(|| {
-            styled_node
-                .inherited
-                .as_ref()
-                .and_then(|i| i.iter().find(|(k, _)| &**k == "height"))
-        })
-    {
-        if let Some(dim) = parse_dimension(height_val, vw, vh, font_size) {
-            style.size.height = dim;
-        }
-    }
+    if let Some(dim) = parse_length_percentage_auto(&styled_node.computed.margin[0], vw, vh, font_size) { style.margin.top = dim; }
+    if let Some(dim) = parse_length_percentage_auto(&styled_node.computed.margin[1], vw, vh, font_size) { style.margin.right = dim; }
+    if let Some(dim) = parse_length_percentage_auto(&styled_node.computed.margin[2], vw, vh, font_size) { style.margin.bottom = dim; }
+    if let Some(dim) = parse_length_percentage_auto(&styled_node.computed.margin[3], vw, vh, font_size) { style.margin.left = dim; }
 
-    let empty_vec = Vec::new();
-    let iter = styled_node.inherited.as_deref().unwrap_or(&empty_vec).iter().chain(styled_node.local.iter());
-    for (k, v) in iter {
-        match &**k {
-            "margin-top" => if let Some(dim) = parse_length_percentage_auto(v, vw, vh, font_size) { style.margin.top = dim; },
-            "margin-right" => if let Some(dim) = parse_length_percentage_auto(v, vw, vh, font_size) { style.margin.right = dim; },
-            "margin-bottom" => if let Some(dim) = parse_length_percentage_auto(v, vw, vh, font_size) { style.margin.bottom = dim; },
-            "margin-left" => if let Some(dim) = parse_length_percentage_auto(v, vw, vh, font_size) { style.margin.left = dim; },
-            "padding-top" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) { style.padding.top = dim; },
-            "padding-right" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) { style.padding.right = dim; },
-            "padding-bottom" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) { style.padding.bottom = dim; },
-            "padding-left" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) { style.padding.left = dim; },
-            "border-width" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) {
-                style.border.top = dim;
-                style.border.right = dim;
-                style.border.bottom = dim;
-                style.border.left = dim;
-            },
-            "border-top-width" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) { style.border.top = dim; },
-            "border-right-width" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) { style.border.right = dim; },
-            "border-bottom-width" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) { style.border.bottom = dim; },
-            "border-left-width" => if let Some(dim) = parse_length_percentage(v, vw, vh, font_size) { style.border.left = dim; },
-            _ => {}
-        }
-    }
+    if let Some(dim) = parse_length_percentage(&styled_node.computed.padding[0], vw, vh, font_size) { style.padding.top = dim; }
+    if let Some(dim) = parse_length_percentage(&styled_node.computed.padding[1], vw, vh, font_size) { style.padding.right = dim; }
+    if let Some(dim) = parse_length_percentage(&styled_node.computed.padding[2], vw, vh, font_size) { style.padding.bottom = dim; }
+    if let Some(dim) = parse_length_percentage(&styled_node.computed.padding[3], vw, vh, font_size) { style.padding.left = dim; }
+
+    if let Some(dim) = parse_length_percentage(&styled_node.computed.border_width[0], vw, vh, font_size) { style.border.top = dim; }
+    if let Some(dim) = parse_length_percentage(&styled_node.computed.border_width[1], vw, vh, font_size) { style.border.right = dim; }
+    if let Some(dim) = parse_length_percentage(&styled_node.computed.border_width[2], vw, vh, font_size) { style.border.bottom = dim; }
+    if let Some(dim) = parse_length_percentage(&styled_node.computed.border_width[3], vw, vh, font_size) { style.border.left = dim; }
 
     if matches!(
         document.nodes.get(styled_node.node_id),

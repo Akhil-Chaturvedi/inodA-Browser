@@ -600,11 +600,76 @@ fn build_styled_node(
         .map(|id| build_styled_node(document, id, stylesheet, &inherited_styles))
         .collect();
 
+    let mut computed = crate::dom::ComputedStyle::default();
+
+    let get_prop = |key: &str| -> Option<&crate::dom::StyleValue> {
+        new_declarations
+            .iter()
+            .find(|(k, _)| &**k == key)
+            .map(|(_, v)| v)
+            .or_else(|| {
+                inherited_styles
+                    .as_ref()
+                    .and_then(|i| i.iter().find(|(k, _)| &**k == key).map(|(_, v)| v))
+            })
+    };
+
+    if let Some(crate::dom::StyleValue::Keyword(v)) = get_prop("display") {
+        computed.display = v.clone();
+    }
+    if let Some(crate::dom::StyleValue::Keyword(v)) = get_prop("flex-direction") {
+        computed.flex_direction = v.clone();
+    }
+    if let Some(v) = get_prop("width") {
+        computed.width = v.clone();
+    }
+    if let Some(v) = get_prop("height") {
+        computed.height = v.clone();
+    }
+
+    if let Some(v) = get_prop("margin-top") { computed.margin[0] = v.clone(); }
+    if let Some(v) = get_prop("margin-right") { computed.margin[1] = v.clone(); }
+    if let Some(v) = get_prop("margin-bottom") { computed.margin[2] = v.clone(); }
+    if let Some(v) = get_prop("margin-left") { computed.margin[3] = v.clone(); }
+
+    if let Some(v) = get_prop("padding-top") { computed.padding[0] = v.clone(); }
+    if let Some(v) = get_prop("padding-right") { computed.padding[1] = v.clone(); }
+    if let Some(v) = get_prop("padding-bottom") { computed.padding[2] = v.clone(); }
+    if let Some(v) = get_prop("padding-left") { computed.padding[3] = v.clone(); }
+
+    if let Some(v) = get_prop("border-top-width") { computed.border_width[0] = v.clone(); }
+    if let Some(v) = get_prop("border-right-width") { computed.border_width[1] = v.clone(); }
+    if let Some(v) = get_prop("border-bottom-width") { computed.border_width[2] = v.clone(); }
+    if let Some(v) = get_prop("border-left-width") { computed.border_width[3] = v.clone(); }
+
+    if let Some(crate::dom::StyleValue::Color(r, g, b)) = get_prop("background-color") {
+        computed.bg_color = Some((*r, *g, *b));
+    }
+    if let Some(crate::dom::StyleValue::Color(r, g, b)) = get_prop("border-color") {
+        computed.border_color = Some((*r, *g, *b));
+    }
+    
+    if let Some(v) = get_prop("font-size") {
+        match v {
+            crate::dom::StyleValue::LengthPx(px) => { computed.font_size = *px; }
+            crate::dom::StyleValue::Number(num) => { computed.font_size = *num; }
+            _ => {}
+        }
+    }
+    if computed.font_size == 0.0 {
+        computed.font_size = 16.0;
+    }
+
+    if let Some(crate::dom::StyleValue::Color(r, g, b)) = get_prop("color") {
+        computed.color = (*r, *g, *b);
+    }
+
     crate::dom::StyledNode {
         node_id,
         local: new_declarations,
         inherited: inherited_styles,
         children,
+        computed,
     }
 
 

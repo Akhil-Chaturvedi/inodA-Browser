@@ -26,7 +26,7 @@ render::draw_layout_tree()  -- walks Layout + StyledNode in parallel,
                                stroke_rect (border), draw_glyphs (text content)
 ```
 
-JavaScript execution happens outside this pipeline. The host application creates a `JsEngine`, passing in the `Document`. JS code can read and mutate the DOM via `Rc<RefCell<Document>>`. QuickJS is single-threaded; access is serialized. Returned node handles preserve `===` identity via a `WeakRef`-based `__nodeCache` on the JS side, with a `FinalizationRegistry` that deletes stale map keys when QuickJS GC runs. There is currently no mechanism to trigger re-style or re-layout from JS mutations. Timer callbacks registered via `setTimeout` fire only when the host calls `JsEngine::pump()`.
+JavaScript execution happens outside this pipeline. The host application creates a `JsEngine`, passing in the `Document`. JS code can read and mutate the DOM via `Rc<RefCell<Document>>`. QuickJS is single-threaded; access is serialized. Returned node handles preserve `===` identity via a `WeakRef`-based `__nodeCache` on the JS side. Each cache entry uses a string key `"index:generation"` computed from the node's `__nodeKey` array `[u32 index, u64 generation]`. A `FinalizationRegistry` receives this integer array when QuickJS GC runs, calls the native `_garbageCollectNodeRaw` Rust function which reconstructs the `NodeId` from the two integers directly without string parsing, then removes the node from the arena if it is not attached to the DOM tree. There is currently no mechanism to trigger re-style or re-layout from JS mutations. Timer callbacks registered via `setTimeout` fire only when the host calls `JsEngine::pump()`.
 
 ## Data structures
 
@@ -77,11 +77,28 @@ StyledNode {
     node_id: NodeId,
     local: Vec<(DefaultAtom, StyleValue)>,                     // properties declared on this node
     inherited: Option<Rc<Vec<(DefaultAtom, StyleValue)>>>,      // inheritable properties from parent
-    children: Vec<StyledNode>
+    children: Vec<StyledNode>,
+    computed: ComputedStyle                                     // pre-resolved native property cache
+}
+
+ComputedStyle {
+    display: DefaultAtom,
+    flex_direction: DefaultAtom,
+    width: StyleValue,
+    height: StyleValue,
+    margin: [StyleValue; 4],     // top, right, bottom, left
+    padding: [StyleValue; 4],
+    border_width: [StyleValue; 4],
+    bg_color: Option<(u8, u8, u8)>,
+    border_color: Option<(u8, u8, u8)>,
+    font_size: f32,
+    color: (u8, u8, u8)
 }
 ```
 
 This is a tree (not arena). Each node owns its children. It exists only during layout computation and rendering, then gets dropped. The `local` vector holds properties that matched this specific element. The `inherited` vector holds only inheritable properties (`color`, `font-size`, `font-family`, etc.) from the parent. Non-inheritable properties like `width` or `margin` are filtered out before being passed to children. When a child has no matched declarations and no new inheritable values, the parent's `Rc` is cloned without copying the underlying vector.
+
+`ComputedStyle` is populated at the end of `build_styled_node` from `local` and `inherited`. Layout and rendering read directly from `computed` rather than iterating over style tuples. This eliminates tuple-scanning in the hot layout and render paths.
 
 ### StyleSheet (css/mod.rs)
 

@@ -26,34 +26,22 @@ pub fn parse_html(html: &str) -> Document {
                 
                 if let Some(ref raw) = inside_raw_tag {
                     if &**raw == "style" {
-                        current_style_text.push_str("<");
-                        current_style_text.push_str(tag_name_str);
-                        for (k, v) in tag.attributes.iter() {
-                            let k_str = std::str::from_utf8(k).unwrap_or("");
-                            let v_str = std::str::from_utf8(v).unwrap_or("");
-                            current_style_text.push_str(" ");
-                            current_style_text.push_str(k_str);
-                            current_style_text.push_str("=\"");
-                            current_style_text.push_str(v_str);
-                            current_style_text.push_str("\"");
-                        }
-                        if tag.self_closing { current_style_text.push_str("/>"); } else { current_style_text.push_str(">"); }
-                    } else {
-                        if let Some(last_child) = doc.last_child_of(current_parent) {
-                            if let Some(Node::Text(existing)) = doc.nodes.get_mut(last_child) {
-                                existing.text.push_str("<");
-                                existing.text.push_str(tag_name_str);
-                                for (k, v) in tag.attributes.iter() {
-                                    let k_str = std::str::from_utf8(k).unwrap_or("");
-                                    let v_str = std::str::from_utf8(v).unwrap_or("");
-                                    existing.text.push_str(" ");
-                                    existing.text.push_str(k_str);
-                                    existing.text.push_str("=\"");
-                                    existing.text.push_str(v_str);
-                                    existing.text.push_str("\"");
-                                }
-                                if tag.self_closing { existing.text.push_str("/>"); } else { existing.text.push_str(">"); }
+                        // Skip StartTags inside `<style>` (html5gum shouldn't emit them in Rawtext mode,
+                        // but if it does, ignore them to prevent recursive DOM construction).
+                    } else if let Some(last_child) = doc.last_child_of(current_parent) {
+                        if let Some(Node::Text(existing)) = doc.nodes.get_mut(last_child) {
+                            existing.text.push_str("<");
+                            existing.text.push_str(tag_name_str);
+                            for (k, v) in tag.attributes.iter() {
+                                let k_str = std::str::from_utf8(k).unwrap_or("");
+                                let v_str = std::str::from_utf8(v).unwrap_or("");
+                                existing.text.push_str(" ");
+                                existing.text.push_str(k_str);
+                                existing.text.push_str("=\"");
+                                existing.text.push_str(v_str);
+                                existing.text.push_str("\"");
                             }
+                            if tag.self_closing { existing.text.push_str("/>"); } else { existing.text.push_str(">"); }
                         }
                     }
                     continue;
@@ -148,12 +136,15 @@ pub fn parse_html(html: &str) -> Document {
                 let tag_name = DefaultAtom::from(tag_name_str);
 
                 if let Some(ref raw) = inside_raw_tag {
-                    if raw != &tag_name {
-                        if &**raw == "style" {
-                            current_style_text.push_str("</");
-                            current_style_text.push_str(tag_name_str);
-                            current_style_text.push_str(">");
-                        } else {
+                    if &**raw == tag_name_str {
+                        inside_raw_tag = None;
+                        if &*tag_name == "style" && !current_style_text.is_empty() {
+                            doc.style_texts.push(std::mem::take(&mut current_style_text));
+                        }
+                    } else {
+                        // Skip EndTags inside `<style>` (html5gum shouldn't emit them in Rawtext mode,
+                        // but if it does, ignore them).
+                        if &**raw != "style" {
                             if let Some(last_child) = doc.last_child_of(current_parent) {
                                 if let Some(Node::Text(existing)) = doc.nodes.get_mut(last_child) {
                                     existing.text.push_str("</");
@@ -162,13 +153,8 @@ pub fn parse_html(html: &str) -> Document {
                                 }
                             }
                         }
-                        continue;
-                    } else {
-                        inside_raw_tag = None;
-                        if &*tag_name == "style" && !current_style_text.is_empty() {
-                            doc.style_texts.push(std::mem::take(&mut current_style_text));
-                        }
                     }
+                    continue;
                 }
 
                 let mut p = Some(current_parent);

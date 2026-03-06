@@ -9,6 +9,10 @@
 //!
 //! Parent pointers are stored directly on nodes to keep parent traversal
 //! cache-friendly and avoid hashmap overhead in embedded environments.
+//!
+//! `ComputedStyle` is a flat struct attached to `StyledNode`, populated once
+//! during style resolution. Layout and rendering read directly from it rather
+//! than scanning the style tuple vectors on every frame.
 
 use generational_arena::{Arena, Index};
 
@@ -76,6 +80,40 @@ pub enum StyleValue {
     None,
 }
 
+/// Pre-calculated native CSS properties to eliminate O(N) tuple lookups during Layout and Rendering loops.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComputedStyle {
+    pub display: string_cache::DefaultAtom,
+    pub flex_direction: string_cache::DefaultAtom,
+    pub width: StyleValue,
+    pub height: StyleValue,
+    pub margin: [StyleValue; 4],
+    pub padding: [StyleValue; 4],
+    pub border_width: [StyleValue; 4],
+    pub bg_color: Option<(u8, u8, u8)>,
+    pub border_color: Option<(u8, u8, u8)>,
+    pub font_size: f32,
+    pub color: (u8, u8, u8),
+}
+
+impl Default for ComputedStyle {
+    fn default() -> Self {
+        ComputedStyle {
+            display: string_cache::DefaultAtom::from("block"),
+            flex_direction: string_cache::DefaultAtom::from("row"),
+            width: StyleValue::Auto,
+            height: StyleValue::Auto,
+            margin: [StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0)],
+            padding: [StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0)],
+            border_width: [StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0)],
+            bg_color: None,
+            border_color: None,
+            font_size: 16.0,
+            color: (0, 0, 0),
+        }
+    }
+}
+
 /// A node mapped with its active computed CSS style properties.
 #[derive(Debug)]
 pub struct StyledNode {
@@ -83,6 +121,7 @@ pub struct StyledNode {
     pub local: Vec<(string_cache::DefaultAtom, StyleValue)>,
     pub inherited: Option<std::rc::Rc<Vec<(string_cache::DefaultAtom, StyleValue)>>>,
     pub children: Vec<StyledNode>,
+    pub computed: ComputedStyle,
 }
 
 impl Default for Document {

@@ -10,9 +10,9 @@
 //! Parent pointers are stored directly on nodes to keep parent traversal
 //! cache-friendly and avoid hashmap overhead in embedded environments.
 //!
-//! `ComputedStyle` is a flat struct attached to `StyledNode`, populated once
+//! `ComputedStyle` is stored directly inside `ElementData` and `TextData`, populated once
 //! during style resolution. Layout and rendering read directly from it rather
-//! than scanning the style tuple vectors on every frame.
+//! than scanning dynamic trees.
 
 use generational_arena::{Arena, Index};
 
@@ -21,12 +21,14 @@ use generational_arena::{Arena, Index};
 pub struct Document {
     pub nodes: Arena<Node>,
     pub root_id: NodeId,
-    /// Raw CSS text extracted from `<style>` elements during parsing.
-    pub style_texts: Vec<String>,
+    /// Persistent CSS parsed actively when `<style>` tags change.
+    pub stylesheet: crate::css::StyleSheet,
     /// O(1) lookup map for `getElementById`.
     pub id_map: std::collections::HashMap<String, NodeId>,
     /// Iterative deletion queue used by `remove_node` to avoid recursive stack overflow.
     pub dead_nodes: Vec<NodeId>,
+    /// Layout invalidation flag. True if DOM was mutated since the last render.
+    pub dirty: bool,
 }
 
 /// A handle into the arena. Generational indices prevent ABA problems.
@@ -39,9 +41,143 @@ pub enum Node {
     Root(RootData),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LocalName {
+    Standard(string_cache::DefaultAtom),
+    Custom(String),
+}
+
+impl LocalName {
+    pub fn new(tag: &str) -> Self {
+        if matches!(
+            tag,
+            "a" | "abbr" | "address" | "area" | "article" | "aside" | "audio" | "b" | "base" 
+            | "bdi" | "bdo" | "blockquote" | "body" | "br" | "button" | "canvas" | "caption" 
+            | "cite" | "code" | "col" | "colgroup" | "data" | "datalist" | "dd" | "del" | "details" 
+            | "dfn" | "dialog" | "div" | "dl" | "dt" | "em" | "embed" | "fieldset" | "figcaption" 
+            | "figure" | "footer" | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "head" 
+            | "header" | "hr" | "html" | "i" | "iframe" | "img" | "input" | "ins" | "kbd" 
+            | "label" | "legend" | "li" | "link" | "main" | "map" | "mark" | "meta" | "meter" 
+            | "nav" | "noscript" | "object" | "ol" | "optgroup" | "option" | "output" | "p" 
+            | "param" | "picture" | "pre" | "progress" | "q" | "rp" | "rt" | "ruby" | "s" 
+            | "samp" | "script" | "section" | "select" | "small" | "source" | "span" | "strong" 
+            | "style" | "sub" | "summary" | "sup" | "table" | "tbody" | "td" | "template" 
+            | "textarea" | "tfoot" | "th" | "thead" | "time" | "title" | "tr" | "track" | "u" 
+            | "ul" | "var" | "video" | "wbr"
+        ) {
+            LocalName::Standard(string_cache::DefaultAtom::from(tag))
+        } else {
+            LocalName::Custom(tag.to_string())
+        }
+    }
+}
+
+impl std::ops::Deref for LocalName {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            LocalName::Standard(atom) => &**atom,
+            LocalName::Custom(s) => s.as_str(),
+        }
+    }
+}
+
+impl std::fmt::Display for LocalName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LocalName::Standard(atom) => write!(f, "{}", atom),
+            LocalName::Custom(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+/// Strongly-typed CSS property names for O(1) matching during the cascade.
+/// Avoids dereferencing `DefaultAtom` to `&str` for every property comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PropertyName {
+    Display,
+    FlexDirection,
+    Width,
+    Height,
+    MarginTop,
+    MarginRight,
+    MarginBottom,
+    MarginLeft,
+    PaddingTop,
+    PaddingRight,
+    PaddingBottom,
+    PaddingLeft,
+    BorderTopWidth,
+    BorderRightWidth,
+    BorderBottomWidth,
+    BorderLeftWidth,
+    BackgroundColor,
+    BorderColor,
+    Color,
+    FontSize,
+    FontFamily,
+    FontWeight,
+    LineHeight,
+    TextAlign,
+    Visibility,
+    Other(u64), // hash of unrecognized property name
+}
+
+impl PropertyName {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "display" => PropertyName::Display,
+            "flex-direction" => PropertyName::FlexDirection,
+            "width" => PropertyName::Width,
+            "height" => PropertyName::Height,
+            "margin-top" => PropertyName::MarginTop,
+            "margin-right" => PropertyName::MarginRight,
+            "margin-bottom" => PropertyName::MarginBottom,
+            "margin-left" => PropertyName::MarginLeft,
+            "padding-top" => PropertyName::PaddingTop,
+            "padding-right" => PropertyName::PaddingRight,
+            "padding-bottom" => PropertyName::PaddingBottom,
+            "padding-left" => PropertyName::PaddingLeft,
+            "border-top-width" => PropertyName::BorderTopWidth,
+            "border-right-width" => PropertyName::BorderRightWidth,
+            "border-bottom-width" => PropertyName::BorderBottomWidth,
+            "border-left-width" => PropertyName::BorderLeftWidth,
+            "background-color" => PropertyName::BackgroundColor,
+            "border-color" => PropertyName::BorderColor,
+            "color" => PropertyName::Color,
+            "font-size" => PropertyName::FontSize,
+            "font-family" => PropertyName::FontFamily,
+            "font-weight" => PropertyName::FontWeight,
+            "line-height" => PropertyName::LineHeight,
+            "text-align" => PropertyName::TextAlign,
+            "visibility" => PropertyName::Visibility,
+            other => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                other.hash(&mut hasher);
+                PropertyName::Other(hasher.finish())
+            }
+        }
+    }
+
+    /// Returns true if this property is CSS-inheritable.
+    pub fn is_inheritable(&self) -> bool {
+        matches!(
+            self,
+            PropertyName::Color
+                | PropertyName::FontFamily
+                | PropertyName::FontSize
+                | PropertyName::FontWeight
+                | PropertyName::LineHeight
+                | PropertyName::TextAlign
+                | PropertyName::Visibility
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ElementData {
-    pub tag_name: string_cache::DefaultAtom,
+    pub tag_name: LocalName,
     pub attributes: Vec<(string_cache::DefaultAtom, String)>,
     pub classes: Vec<string_cache::DefaultAtom>,
     pub parent: Option<NodeId>,
@@ -49,6 +185,7 @@ pub struct ElementData {
     pub last_child: Option<NodeId>,
     pub prev_sibling: Option<NodeId>,
     pub next_sibling: Option<NodeId>,
+    pub computed: ComputedStyle,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +194,7 @@ pub struct TextData {
     pub parent: Option<NodeId>,
     pub prev_sibling: Option<NodeId>,
     pub next_sibling: Option<NodeId>,
+    pub computed: ComputedStyle,
 }
 
 #[derive(Debug, Clone)]
@@ -114,15 +252,7 @@ impl Default for ComputedStyle {
     }
 }
 
-/// A node mapped with its active computed CSS style properties.
-#[derive(Debug)]
-pub struct StyledNode {
-    pub node_id: NodeId,
-    pub local: Vec<(string_cache::DefaultAtom, StyleValue)>,
-    pub inherited: Option<std::rc::Rc<Vec<(string_cache::DefaultAtom, StyleValue)>>>,
-    pub children: Vec<StyledNode>,
-    pub computed: ComputedStyle,
-}
+
 
 impl Default for Document {
     fn default() -> Self {
@@ -134,9 +264,10 @@ impl Default for Document {
         Document {
             nodes: arena,
             root_id,
-            style_texts: Vec::new(),
+            stylesheet: crate::css::StyleSheet::default(),
             id_map: std::collections::HashMap::new(),
             dead_nodes: Vec::new(),
+            dirty: true,
         }
     }
 }
@@ -147,6 +278,7 @@ impl Document {
     }
 
     pub fn add_node(&mut self, node: Node) -> NodeId {
+        self.dirty = true;
         let id = self.nodes.insert(node);
         if let Some(Node::Element(data)) = self.nodes.get(id) {
             if let Some((_, id_val)) = data.attributes.iter().find(|(k, _)| &**k == "id") {
@@ -157,6 +289,7 @@ impl Document {
     }
 
     pub fn remove_node(&mut self, id: NodeId) -> Option<Node> {
+        self.dirty = true;
         // 1. Unlink from parent and siblings
         if let Some(parent_id) = self.parent_of(id) {
             self.remove_child(parent_id, id);
@@ -190,6 +323,7 @@ impl Document {
     }
 
     pub fn append_child(&mut self, parent_id: NodeId, child_id: NodeId) {
+        self.dirty = true;
         if let Some(old_parent) = self.parent_of(child_id) {
             self.remove_child(old_parent, child_id);
         }
@@ -220,6 +354,7 @@ impl Document {
     }
 
     pub fn remove_child(&mut self, parent_id: NodeId, child_id: NodeId) {
+        self.dirty = true;
         let prev = self.prev_sibling_of(child_id);
         let next = self.next_sibling_of(child_id);
 

@@ -105,10 +105,11 @@ use std::cmp::Ordering;
 
 /// A pending timer entry storing a persistent JS callback.
 struct PendingTimer {
-    #[allow(dead_code)]
     id: u32,
     fire_at: Instant,
     callback: Persistent<rquickjs::Function<'static>>,
+    is_interval: bool,
+    delay_ms: u64,
 }
 
 impl PartialEq for PendingTimer {
@@ -142,6 +143,8 @@ pub struct JsEngine {
     next_timer_id: Rc<Cell<u32>>,
     /// Min-Heap of pending timers waiting to fire.
     pending_timers: Rc<RefCell<std::collections::BinaryHeap<PendingTimer>>>,
+    /// Track cancelled timers natively preventing runaway intervals.
+    cancelled_timers: Rc<RefCell<std::collections::HashSet<u32>>>,
 }
 
 impl JsEngine {
@@ -155,6 +158,7 @@ impl JsEngine {
             document: Rc::new(RefCell::new(document)),
             next_timer_id: Rc::new(Cell::new(1)),
             pending_timers: Rc::new(RefCell::new(std::collections::BinaryHeap::new())),
+            cancelled_timers: Rc::new(RefCell::new(std::collections::HashSet::new())),
         };
 
         engine.init_web_api();
@@ -166,6 +170,7 @@ impl JsEngine {
         let doc_ref = self.document.clone();
         let timer_id_counter = self.next_timer_id.clone();
         let pending_timers = self.pending_timers.clone();
+        let cancelled_timers = self.cancelled_timers.clone();
 
         self.context.with(|ctx| {
             let globals = ctx.globals();
@@ -201,6 +206,7 @@ impl JsEngine {
                       attr: String,
                       value: String| {
                     let mut doc = doc_ref.borrow_mut();
+                    doc.dirty = true;
                     let node_id = this.borrow().to_node_id();
                     
                     if attr == "id" {
@@ -367,20 +373,10 @@ impl JsEngine {
                 move |tag_name: String| -> NodeHandleWithTag {
                     let mut doc = doc_ref.borrow_mut();
                     let safe_tag = tag_name.to_lowercase();
-                    
-                    let is_html5_tag = matches!(
-                        safe_tag.as_str(),
-                        "a" | "abbr" | "address" | "area" | "article" | "aside" | "audio" | "b" | "base" | "bdi" | "bdo" | "blockquote" | "body" | "br" | "button" | "canvas" | "caption" | "cite" | "code" | "col" | "colgroup" | "data" | "datalist" | "dd" | "del" | "details" | "dfn" | "dialog" | "div" | "dl" | "dt" | "em" | "embed" | "fieldset" | "figcaption" | "figure" | "footer" | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "head" | "header" | "hr" | "html" | "i" | "iframe" | "img" | "input" | "ins" | "kbd" | "label" | "legend" | "li" | "link" | "main" | "map" | "mark" | "meta" | "meter" | "nav" | "noscript" | "object" | "ol" | "optgroup" | "option" | "output" | "p" | "param" | "picture" | "pre" | "progress" | "q" | "rp" | "rt" | "ruby" | "s" | "samp" | "script" | "section" | "select" | "small" | "source" | "span" | "strong" | "style" | "sub" | "summary" | "sup" | "table" | "tbody" | "td" | "template" | "textarea" | "tfoot" | "th" | "thead" | "time" | "title" | "tr" | "track" | "u" | "ul" | "var" | "video" | "wbr"
-                    );
-
-                    let atom = if is_html5_tag {
-                        string_cache::DefaultAtom::from(safe_tag.as_str())
-                    } else {
-                        string_cache::DefaultAtom::from("div") // Fallback for invalid tags to prevent OOM
-                    };
+                    let local_name = crate::dom::LocalName::new(&safe_tag);
 
                     let node = crate::dom::Node::Element(crate::dom::ElementData {
-                        tag_name: atom.clone(),
+                        tag_name: local_name.clone(),
                         attributes: Vec::new(),
                         classes: Vec::new(),
                         parent: None,
@@ -388,13 +384,14 @@ impl JsEngine {
                         last_child: None,
                         prev_sibling: None,
                         next_sibling: None,
+                        computed: crate::dom::ComputedStyle::default(),
                     });
                     let index = doc.add_node(node);
                     drop(doc);
 
                     NodeHandleWithTag {
                         handle: NodeHandle::from_node_id(index),
-                        tag_name: atom.to_string(),
+                        tag_name: local_name.to_string(),
                         node_idx: index.into_raw_parts().0 as u32,
                         node_gen: index.into_raw_parts().1,
                     }
@@ -445,7 +442,7 @@ impl JsEngine {
                     r#"
                 document.__nodeCache = new Map();
                 document.__nodeRegistry = new FinalizationRegistry(key => {
-                    let mapKey = key[0] + ":" + key[1];
+                    let mapKey = BigInt(key[0]) | (BigInt(key[1]) << 32n);
                     document.__nodeCache.delete(mapKey);
                     document._garbageCollectNodeRaw(key);
                 });
@@ -453,7 +450,7 @@ impl JsEngine {
                 document._wrapNode = function(rawNode) {
                     if (!rawNode) return null;
                     let keyPair = rawNode.__nodeKey; // [idx, gen]
-                    let mapKey = keyPair[0] + ":" + keyPair[1];
+                    let mapKey = BigInt(keyPair[0]) | (BigInt(keyPair[1]) << 32n);
                     let cachedRef = document.__nodeCache.get(mapKey);
                     if (cachedRef) {
                         let cachedObj = cachedRef.deref();
@@ -481,25 +478,61 @@ impl JsEngine {
             let set_timeout_func = rquickjs::Function::new(ctx.clone(), {
                 let timer_id_counter = timer_id_counter.clone();
                 let pending_timers = pending_timers.clone();
-                move |cb: Persistent<rquickjs::Function<'static>>, delay: i32| -> i32 {
+                move |cb: Persistent<rquickjs::Function<'static>>, delay: i32| -> u32 {
                     let timer_id = timer_id_counter.get();
                     timer_id_counter.set(timer_id + 1);
 
-                    let fire_at =
-                        Instant::now() + std::time::Duration::from_millis(delay.max(0) as u64);
-                    let mut timers = pending_timers.borrow_mut();
-                    timers.push(PendingTimer {
+                    let delay_ms = delay.max(0) as u64;
+                    let fire_at = Instant::now() + std::time::Duration::from_millis(delay_ms);
+                    
+                    pending_timers.borrow_mut().push(PendingTimer {
                         id: timer_id,
                         fire_at,
                         callback: cb,
+                        is_interval: false,
+                        delay_ms,
                     });
 
-                    timer_id as i32
+                    timer_id
+                }
+            })
+            .unwrap();
+
+            let set_interval_func = rquickjs::Function::new(ctx.clone(), {
+                let timer_id_counter = timer_id_counter.clone();
+                let pending_timers = pending_timers.clone();
+                move |cb: Persistent<rquickjs::Function<'static>>, delay: i32| -> u32 {
+                    let timer_id = timer_id_counter.get();
+                    timer_id_counter.set(timer_id + 1);
+
+                    let delay_ms = delay.max(0) as u64;
+                    let fire_at = Instant::now() + std::time::Duration::from_millis(delay_ms);
+                    
+                    pending_timers.borrow_mut().push(PendingTimer {
+                        id: timer_id,
+                        fire_at,
+                        callback: cb,
+                        is_interval: true,
+                        delay_ms,
+                    });
+
+                    timer_id
+                }
+            })
+            .unwrap();
+
+            let clear_timer_func = rquickjs::Function::new(ctx.clone(), {
+                let cancelled_timers = cancelled_timers.clone();
+                move |id: u32| {
+                    cancelled_timers.borrow_mut().insert(id);
                 }
             })
             .unwrap();
 
             globals.set("setTimeout", set_timeout_func).unwrap();
+            globals.set("setInterval", set_interval_func).unwrap();
+            globals.set("clearTimeout", clear_timer_func.clone()).unwrap();
+            globals.set("clearInterval", clear_timer_func).unwrap();
         });
     }
 
@@ -511,10 +544,25 @@ impl JsEngine {
         let mut expired = Vec::new();
         {
             let mut timers = self.pending_timers.borrow_mut();
+            let mut cancelled = self.cancelled_timers.borrow_mut();
             while let Some(top) = timers.peek() {
                 if top.fire_at <= now {
                     let timer = timers.pop().unwrap();
-                    expired.push(timer.callback);
+                    if cancelled.remove(&timer.id) {
+                        continue;
+                    }
+                    
+                    expired.push(timer.callback.clone());
+                    
+                    if timer.is_interval {
+                        timers.push(PendingTimer {
+                            id: timer.id,
+                            fire_at: now + std::time::Duration::from_millis(timer.delay_ms),
+                            callback: timer.callback,
+                            is_interval: true,
+                            delay_ms: timer.delay_ms,
+                        });
+                    }
                 } else {
                     break;
                 }

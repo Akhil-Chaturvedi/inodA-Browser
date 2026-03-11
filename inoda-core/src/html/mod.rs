@@ -15,14 +15,14 @@ use crate::dom::{Document, ElementData, Node, TextData};
 pub fn parse_html(html: &str) -> Document {
     let mut doc = Document::default();
     let mut current_parent = doc.root_id;
-    let mut inside_raw_tag: Option<DefaultAtom> = None;
+    let mut inside_raw_tag: Option<crate::dom::LocalName> = None;
     let mut current_style_text = String::new();
 
     for token in Tokenizer::new(html).infallible() {
         match token {
             Token::StartTag(tag) => {
                 let tag_name_str = std::str::from_utf8(&tag.name).unwrap_or("");
-                let tag_name = DefaultAtom::from(tag_name_str);
+                let tag_name = crate::dom::LocalName::new(tag_name_str);
                 
                 if let Some(ref raw) = inside_raw_tag {
                     if &**raw == "style" {
@@ -113,6 +113,7 @@ pub fn parse_html(html: &str) -> Document {
                     last_child: None,
                     prev_sibling: None,
                     next_sibling: None,
+                    computed: crate::dom::ComputedStyle::default(),
                 });
 
                 let node_id = doc.add_node(node);
@@ -133,13 +134,14 @@ pub fn parse_html(html: &str) -> Document {
             }
             Token::EndTag(tag) => {
                 let tag_name_str = std::str::from_utf8(&tag.name).unwrap_or("");
-                let tag_name = DefaultAtom::from(tag_name_str);
-
+                let tag_name = crate::dom::LocalName::new(tag_name_str);
+                
                 if let Some(ref raw) = inside_raw_tag {
-                    if &**raw == tag_name_str {
+                    if &**raw == &*tag_name {
                         inside_raw_tag = None;
                         if &*tag_name == "style" && !current_style_text.is_empty() {
-                            doc.style_texts.push(std::mem::take(&mut current_style_text));
+                            crate::css::append_stylesheet(&current_style_text, &mut doc.stylesheet);
+                            current_style_text.clear();
                         }
                     } else {
                         // Skip EndTags inside `<style>` (html5gum shouldn't emit them in Rawtext mode,
@@ -196,6 +198,7 @@ pub fn parse_html(html: &str) -> Document {
                         parent: None,
                         prev_sibling: None,
                         next_sibling: None,
+                        computed: crate::dom::ComputedStyle::default(),
                     }));
                     doc.append_child(current_parent, id);
                 }

@@ -15,7 +15,7 @@ inodA-Browser/
 The engine library. It handles:
 
 - HTML parsing (streaming tokenizer via html5gum, single-pass into a generational arena DOM)
-- CSS parsing and style computation (specificity, inheritance, shorthand expansion)
+- CSS parsing and style computation (specificity, inheritance, shorthand expansion, cascade)
 - Flexbox/Grid layout (via the Taffy crate)
 - 2D rendering (via an abstract backend trait implemented by the host)
 - JavaScript execution (embedded QuickJS with a subset of the Web API)
@@ -26,13 +26,15 @@ See [inoda-core/ARCHITECTURE.md](inoda-core/ARCHITECTURE.md) for data flow, data
 
 ## Current state
 
-The engine tokenizes HTML via `html5gum` into an intrusive linked-list arena-based DOM. Nodes store parent, child, and sibling pointers directly for O(1) traversal and O(1) insertion/removal. CSS selectors are pre-parsed into an AST and distributed into hash-map buckets by tag, class, and ID for sublinear lookup. Combinators (child `>`, descendant ` `) are evaluated by walking parent pointers. Property values are parsed into typed enums (`StyleValue`) during the cascade, so the layout and render loops operate on numbers and enum variants rather than strings.
+HTML is tokenized via `html5gum` into an intrusive linked-list arena DOM (`generational_arena`). Each node stores parent, child, and sibling pointers directly for O(1) traversal and mutation. Tag names for standard HTML elements are interned as `DefaultAtom`; custom element names use a heap-allocated `String` variant (`LocalName`) to avoid exhausting the global intern pool.
 
-After each style resolution pass, a `ComputedStyle` struct is populated on every `StyledNode` from the local and inherited style vectors. Layout and rendering read directly from `computed` fields (e.g., `computed.margin`, `computed.bg_color`, `computed.font_size`) without scanning tuples on every frame.
+CSS selectors are pre-parsed into ASTs and distributed into hash-map buckets keyed by tag, class, and ID for sublinear lookup. Property names in parsed `Declaration` objects use a typed `PropertyName` enum covering all supported properties, making cascade property matching an integer comparison rather than a string deref. Combinators (`>`, space) are evaluated by walking arena parent pointers. Property values are parsed into typed `StyleValue` enums during cascade.
 
-Text measurement uses `cosmic-text` for HarfBuzz-based shaping. Text buffers are pre-populated before Taffy's layout solver runs. The buffer cache persists across frames; entries for nodes that have been removed from the DOM are evicted at the start of each layout call.
+`ComputedStyle` is stored directly in each arena node's `ElementData` and `TextData`, populated once by `css::compute_styles()`. Layout and rendering read from these fields directly, frame-to-frame, without building any intermediate style tree. `document.stylesheet` is persistent and merged in-place as `<style>` tags are encountered during parsing. Font-size values expressed as `em` or `rem` are resolved during the style cascade using the parent element's resolved pixel size.
 
-The JS engine is single-threaded, exposing DOM handles as `NodeHandle` class instances backed by arena indices. Each handle carries a `__nodeKey` property, a two-element JavaScript array `[u32 index, u64 generation]`. The `__nodeCache` Map is keyed by the string `"index:generation"` built from that array. A `FinalizationRegistry` receives the integer array when a wrapper is GC'd and calls the native Rust `_garbageCollectNodeRaw`, which reconstructs the `NodeId` from the two integers without string parsing.
+Text measurement uses `cosmic-text` for HarfBuzz-based shaping. Text buffers are pre-created before Taffy's layout solver runs and cached across frames. Entries for nodes removed from the DOM are evicted at the start of each layout call.
+
+The JS engine is single-threaded via `Rc<RefCell<Document>>`. Each DOM node exposed to JS carries a `__nodeKey` array `[u32 index, u64 generation]`. The `__nodeCache` Map is keyed by a `BigInt` formed from these two integers to avoid string allocation. A `FinalizationRegistry` removes stale cache entries when JS wrappers are garbage-collected, and cleans up arena entries for nodes that are no longer attached to the DOM tree. JS DOM mutations set `document.dirty = true`; the host application is responsible for detecting this flag and re-running the style, layout, and render pipeline. `setTimeout`, `setInterval`, `clearTimeout`, and `clearInterval` are all exposed; timers fire only when the host calls `JsEngine::pump()`.
 
 There is no networking, asset loading, image support, or iframe handling. The host application must provide a window, event loop, and graphics backend.
 

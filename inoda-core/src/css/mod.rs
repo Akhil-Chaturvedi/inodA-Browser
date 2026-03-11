@@ -5,8 +5,9 @@
 //! and in-node parent pointers for complex combinators (`>`, ` `).
 //!
 //! Property values are parsed into typed `StyleValue` enums at cascade time.
-//! Property names are interned as `string_cache::DefaultAtom`. Supports
-//! compound selectors, comma-separated lists, CSS inheritance for text
+//! Property names are typed as `PropertyName` enums, which makes property
+//! matching during cascade a direct integer comparison rather than a string deref.
+//! Supports compound selectors, comma-separated lists, CSS inheritance for text
 //! properties, and shorthand expansion for `margin`, `padding`, and
 //! `background`. Inline `style` attributes are parsed via `cssparser`'s
 //! `DeclarationParser` trait.
@@ -124,7 +125,7 @@ pub struct StyleRule {
 
 #[derive(Debug, Clone)]
 pub struct Declaration {
-    pub name: string_cache::DefaultAtom,
+    pub name: crate::dom::PropertyName,
     pub value: crate::dom::StyleValue,
 }
 
@@ -341,7 +342,7 @@ fn parse_compound_selector(s: &str) -> CompoundSelector {
 /// Match a pre-parsed compound selector against an element's tag name and attributes.
 fn match_compound_selector(
     compound: &CompoundSelector,
-    tag_name: &string_cache::DefaultAtom,
+    tag_name: &crate::dom::LocalName,
     attributes: &[(string_cache::DefaultAtom, String)],
     classes: &[string_cache::DefaultAtom],
 ) -> bool {
@@ -447,47 +448,39 @@ pub fn parse_stylesheet(css: &str) -> StyleSheet {
 }
 
 pub fn compute_styles(
-    document: &crate::dom::Document,
+    document: &mut crate::dom::Document,
     base_stylesheet: &StyleSheet,
-) -> crate::dom::StyledNode {
-    let mut combined_sheet = base_stylesheet.clone();
-
-    for style_text in &document.style_texts {
-        let mut input = ParserInput::new(style_text);
-        let mut parser = Parser::new(&mut input);
-        parse_rules_list(&mut parser, &mut combined_sheet);
-    }
+) {
+    let doc_sheet = std::mem::take(&mut document.stylesheet);
     
-    combined_sheet.sort_rules();
-
-    build_styled_node(
+    compute_node_styles_recursive(
         document,
         document.root_id,
-        &combined_sheet,
+        &[base_stylesheet, &doc_sheet],
         &None,
-    )
+    );
+    
+    document.stylesheet = doc_sheet;
+}
+
+pub fn append_stylesheet(css: &str, stylesheet: &mut StyleSheet) {
+    let mut input = cssparser::ParserInput::new(css);
+    let mut parser = cssparser::Parser::new(&mut input);
+    parse_rules_list(&mut parser, stylesheet);
+    stylesheet.sort_rules();
 }
 
 #[inline]
-fn is_inheritable(property: &string_cache::DefaultAtom) -> bool {
-    matches!(
-        &**property,
-        "color"
-            | "font-family"
-            | "font-size"
-            | "font-weight"
-            | "line-height"
-            | "text-align"
-            | "visibility"
-    )
+fn is_inheritable(property: &crate::dom::PropertyName) -> bool {
+    property.is_inheritable()
 }
 
-fn build_styled_node(
-    document: &crate::dom::Document,
+fn compute_node_styles_recursive(
+    document: &mut crate::dom::Document,
     node_id: crate::dom::NodeId,
-    stylesheet: &StyleSheet,
-    parent_styles: &Option<std::rc::Rc<Vec<(string_cache::DefaultAtom, crate::dom::StyleValue)>>>,
-) -> crate::dom::StyledNode {
+    stylesheets: &[&StyleSheet],
+    parent_styles: &Option<std::rc::Rc<Vec<(crate::dom::PropertyName, crate::dom::StyleValue)>>>,
+) {
     let mut new_declarations = Vec::new();
     let mut children_ids = Vec::new();
 
@@ -502,21 +495,32 @@ fn build_styled_node(
 
                 let mut lists: Vec<&[IndexedRule]> = Vec::new();
 
-                if let Some(id) = &id_attr {
-                    if let Some(rules) = stylesheet.by_id.get(id) {
-                        lists.push(rules.as_slice());
+                for stylesheet in stylesheets {
+                    if let Some(id) = &id_attr {
+                        if let Some(rules) = stylesheet.by_id.get(id) {
+                            lists.push(rules.as_slice());
+                        }
                     }
-                }
-                for class in &data.classes {
-                    if let Some(rules) = stylesheet.by_class.get(class) {
-                        lists.push(rules.as_slice());
+                    for class in &data.classes {
+                        if let Some(rules) = stylesheet.by_class.get(class) {
+                            lists.push(rules.as_slice());
+                        }
                     }
-                }
-                if let Some(rules) = stylesheet.by_tag.get(&data.tag_name) {
-                    lists.push(rules.as_slice());
-                }
-                if !stylesheet.universal.is_empty() {
-                    lists.push(stylesheet.universal.as_slice());
+                    match &data.tag_name {
+                        crate::dom::LocalName::Standard(atom) => {
+                            if let Some(rules) = stylesheet.by_tag.get(atom) {
+                                lists.push(rules.as_slice());
+                            }
+                        }
+                        crate::dom::LocalName::Custom(s) => {
+                            if let Some((_, rules)) = stylesheet.by_tag.iter().find(|(k, _)| &***k == s.as_str()) {
+                                lists.push(rules.as_slice());
+                            }
+                        }
+                    }
+                    if !stylesheet.universal.is_empty() {
+                        lists.push(stylesheet.universal.as_slice());
+                    }
                 }
 
                 // Linear merge of pre-sorted specificity buckets instead of dynamic sorting.
@@ -594,65 +598,71 @@ fn build_styled_node(
         }
         if appended_styles.is_empty() { None } else { Some(std::rc::Rc::new(appended_styles)) }
     };
-            
-    let children = children_ids
-        .into_iter()
-        .map(|id| build_styled_node(document, id, stylesheet, &inherited_styles))
-        .collect();
-
     let mut computed = crate::dom::ComputedStyle::default();
 
-    let get_prop = |key: &str| -> Option<&crate::dom::StyleValue> {
+    // Resolve parent font-size for em unit resolution in the cascade.
+    let parent_font_size = parent_styles
+        .as_ref()
+        .and_then(|ps| ps.iter().find(|(k, _)| *k == crate::dom::PropertyName::FontSize))
+        .and_then(|(_, v)| match v {
+            crate::dom::StyleValue::LengthPx(px) => Some(*px),
+            crate::dom::StyleValue::Number(n) => Some(*n),
+            _ => None,
+        })
+        .unwrap_or(16.0);
+
+    let get_prop = |key: crate::dom::PropertyName| -> Option<&crate::dom::StyleValue> {
         new_declarations
             .iter()
-            .find(|(k, _)| &**k == key)
+            .find(|(k, _)| *k == key)
             .map(|(_, v)| v)
             .or_else(|| {
                 inherited_styles
                     .as_ref()
-                    .and_then(|i| i.iter().find(|(k, _)| &**k == key).map(|(_, v)| v))
+                    .and_then(|i| i.iter().find(|(k, _)| *k == key).map(|(_, v)| v))
             })
     };
 
-    if let Some(crate::dom::StyleValue::Keyword(v)) = get_prop("display") {
+    use crate::dom::PropertyName as P;
+
+    if let Some(crate::dom::StyleValue::Keyword(v)) = get_prop(P::Display) {
         computed.display = v.clone();
     }
-    if let Some(crate::dom::StyleValue::Keyword(v)) = get_prop("flex-direction") {
+    if let Some(crate::dom::StyleValue::Keyword(v)) = get_prop(P::FlexDirection) {
         computed.flex_direction = v.clone();
     }
-    if let Some(v) = get_prop("width") {
-        computed.width = v.clone();
-    }
-    if let Some(v) = get_prop("height") {
-        computed.height = v.clone();
-    }
+    if let Some(v) = get_prop(P::Width) { computed.width = v.clone(); }
+    if let Some(v) = get_prop(P::Height) { computed.height = v.clone(); }
 
-    if let Some(v) = get_prop("margin-top") { computed.margin[0] = v.clone(); }
-    if let Some(v) = get_prop("margin-right") { computed.margin[1] = v.clone(); }
-    if let Some(v) = get_prop("margin-bottom") { computed.margin[2] = v.clone(); }
-    if let Some(v) = get_prop("margin-left") { computed.margin[3] = v.clone(); }
+    if let Some(v) = get_prop(P::MarginTop) { computed.margin[0] = v.clone(); }
+    if let Some(v) = get_prop(P::MarginRight) { computed.margin[1] = v.clone(); }
+    if let Some(v) = get_prop(P::MarginBottom) { computed.margin[2] = v.clone(); }
+    if let Some(v) = get_prop(P::MarginLeft) { computed.margin[3] = v.clone(); }
 
-    if let Some(v) = get_prop("padding-top") { computed.padding[0] = v.clone(); }
-    if let Some(v) = get_prop("padding-right") { computed.padding[1] = v.clone(); }
-    if let Some(v) = get_prop("padding-bottom") { computed.padding[2] = v.clone(); }
-    if let Some(v) = get_prop("padding-left") { computed.padding[3] = v.clone(); }
+    if let Some(v) = get_prop(P::PaddingTop) { computed.padding[0] = v.clone(); }
+    if let Some(v) = get_prop(P::PaddingRight) { computed.padding[1] = v.clone(); }
+    if let Some(v) = get_prop(P::PaddingBottom) { computed.padding[2] = v.clone(); }
+    if let Some(v) = get_prop(P::PaddingLeft) { computed.padding[3] = v.clone(); }
 
-    if let Some(v) = get_prop("border-top-width") { computed.border_width[0] = v.clone(); }
-    if let Some(v) = get_prop("border-right-width") { computed.border_width[1] = v.clone(); }
-    if let Some(v) = get_prop("border-bottom-width") { computed.border_width[2] = v.clone(); }
-    if let Some(v) = get_prop("border-left-width") { computed.border_width[3] = v.clone(); }
+    if let Some(v) = get_prop(P::BorderTopWidth) { computed.border_width[0] = v.clone(); }
+    if let Some(v) = get_prop(P::BorderRightWidth) { computed.border_width[1] = v.clone(); }
+    if let Some(v) = get_prop(P::BorderBottomWidth) { computed.border_width[2] = v.clone(); }
+    if let Some(v) = get_prop(P::BorderLeftWidth) { computed.border_width[3] = v.clone(); }
 
-    if let Some(crate::dom::StyleValue::Color(r, g, b)) = get_prop("background-color") {
+    if let Some(crate::dom::StyleValue::Color(r, g, b)) = get_prop(P::BackgroundColor) {
         computed.bg_color = Some((*r, *g, *b));
     }
-    if let Some(crate::dom::StyleValue::Color(r, g, b)) = get_prop("border-color") {
+    if let Some(crate::dom::StyleValue::Color(r, g, b)) = get_prop(P::BorderColor) {
         computed.border_color = Some((*r, *g, *b));
     }
-    
-    if let Some(v) = get_prop("font-size") {
+
+    // Resolve font-size: em/rem are resolved here relative to parent; others pass through.
+    if let Some(v) = get_prop(P::FontSize) {
         match v {
             crate::dom::StyleValue::LengthPx(px) => { computed.font_size = *px; }
             crate::dom::StyleValue::Number(num) => { computed.font_size = *num; }
+            crate::dom::StyleValue::Em(num) => { computed.font_size = num * parent_font_size; }
+            crate::dom::StyleValue::Rem(num) => { computed.font_size = num * 16.0; }
             _ => {}
         }
     }
@@ -660,19 +670,21 @@ fn build_styled_node(
         computed.font_size = 16.0;
     }
 
-    if let Some(crate::dom::StyleValue::Color(r, g, b)) = get_prop("color") {
+    if let Some(crate::dom::StyleValue::Color(r, g, b)) = get_prop(P::Color) {
         computed.color = (*r, *g, *b);
     }
 
-    crate::dom::StyledNode {
-        node_id,
-        local: new_declarations,
-        inherited: inherited_styles,
-        children,
-        computed,
+    if let Some(node) = document.nodes.get_mut(node_id) {
+        match node {
+            crate::dom::Node::Element(data) => data.computed = computed,
+            crate::dom::Node::Text(data) => data.computed = computed,
+            crate::dom::Node::Root(_) => {}
+        }
     }
 
-
+    for child_id in children_ids {
+        compute_node_styles_recursive(document, child_id, stylesheets, &inherited_styles);
+    }
 }
 
 fn parse_rules_list<'i, 't>(parser: &mut Parser<'i, 't>, stylesheet: &mut StyleSheet) {
@@ -767,73 +779,73 @@ fn parse_rule<'i, 't>(
                     match parts.len() {
                         1 => {
                             declarations.push(Declaration {
-                                name: string_cache::DefaultAtom::from(top),
+                                name: crate::dom::PropertyName::from_str(top),
                                 value: parse_style_value(parts[0]),
                             });
                             declarations.push(Declaration {
-                                name: string_cache::DefaultAtom::from(right),
+                                name: crate::dom::PropertyName::from_str(right),
                                 value: parse_style_value(parts[0]),
                             });
                             declarations.push(Declaration {
-                                name: string_cache::DefaultAtom::from(bottom),
+                                name: crate::dom::PropertyName::from_str(bottom),
                                 value: parse_style_value(parts[0]),
                             });
                             declarations.push(Declaration {
-                                name: string_cache::DefaultAtom::from(left),
+                                name: crate::dom::PropertyName::from_str(left),
                                 value: parse_style_value(parts[0]),
                             });
                         }
                         2 => {
                             declarations.push(Declaration {
-                                name: string_cache::DefaultAtom::from(top),
+                                name: crate::dom::PropertyName::from_str(top),
                                 value: parse_style_value(parts[0]),
                             });
                             declarations.push(Declaration {
-                                name: string_cache::DefaultAtom::from(bottom),
+                                name: crate::dom::PropertyName::from_str(bottom),
                                 value: parse_style_value(parts[0]),
                             });
                             declarations.push(Declaration {
-                                name: string_cache::DefaultAtom::from(left),
+                                name: crate::dom::PropertyName::from_str(left),
                                 value: parse_style_value(parts[1]),
                             });
                             declarations.push(Declaration {
-                                name: string_cache::DefaultAtom::from(right),
+                                name: crate::dom::PropertyName::from_str(right),
                                 value: parse_style_value(parts[1]),
                             });
                         }
                         4 => {
                             declarations.push(Declaration {
-                                name: string_cache::DefaultAtom::from(top),
+                                name: crate::dom::PropertyName::from_str(top),
                                 value: parse_style_value(parts[0]),
                             });
                             declarations.push(Declaration {
-                                name: string_cache::DefaultAtom::from(right),
+                                name: crate::dom::PropertyName::from_str(right),
                                 value: parse_style_value(parts[1]),
                             });
                             declarations.push(Declaration {
-                                name: string_cache::DefaultAtom::from(bottom),
+                                name: crate::dom::PropertyName::from_str(bottom),
                                 value: parse_style_value(parts[2]),
                             });
                             declarations.push(Declaration {
-                                name: string_cache::DefaultAtom::from(left),
+                                name: crate::dom::PropertyName::from_str(left),
                                 value: parse_style_value(parts[3]),
                             });
                         }
                         _ => {
                             declarations.push(Declaration {
-                                name: string_cache::DefaultAtom::from(name_str),
+                                name: crate::dom::PropertyName::from_str(&name_str),
                                 value: parse_style_value(&value),
                             });
                         }
                     }
                 } else if name_str == "background" {
                     declarations.push(Declaration {
-                        name: string_cache::DefaultAtom::from("background-color"),
+                        name: crate::dom::PropertyName::from_str("background-color"),
                         value: parse_style_value(&value),
                     });
                 } else {
                     declarations.push(Declaration {
-                        name: string_cache::DefaultAtom::from(name_str),
+                        name: crate::dom::PropertyName::from_str(&name_str),
                         value: parse_style_value(&value),
                     });
                 }
@@ -895,7 +907,7 @@ impl<'i> DeclarationParser<'i> for InlineStyleParser {
             }
         }
         Ok(Declaration {
-            name: string_cache::DefaultAtom::from(name.as_ref()),
+            name: crate::dom::PropertyName::from_str(name.as_ref()),
             value: parse_style_value(&value),
         })
     }

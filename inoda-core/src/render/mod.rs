@@ -1,16 +1,14 @@
 //! Rendering module.
 //!
-//! Walks the Taffy layout tree alongside the `StyledNode` tree and issues
-//! draw commands to an abstract renderer backend. Text is rendered via
-//! pre-shaped `cosmic_text::LayoutGlyph` arrays rather than raw strings.
+//! Walks the Taffy layout tree alongside the arena DOM and issues draw commands
+//! to an abstract renderer backend. Text is rendered via pre-shaped
+//! `cosmic_text::LayoutGlyph` iterators rather than raw strings.
 //! Draw properties (`bg_color`, `border_color`, `font_size`, `color`) are
-//! read directly from `styled_node.computed` without tuple iteration.
-//! `inoda-core` does not depend on OpenGL APIs; platform binaries can
-//! implement the `RendererBackend` trait using tiny-skia, LVGL, or any
-//! other raster target.
+//! read directly from `ComputedStyle` embedded in each arena node.
+//! `inoda-core` does not depend on any graphics APIs; platform binaries
+//! implement the `RendererBackend` trait using their own raster target.
 
-use crate::dom::StyledNode;
-use taffy::TaffyTree;
+
 use cosmic_text::Buffer;
 use std::collections::HashMap;
 
@@ -31,22 +29,28 @@ pub trait RendererBackend {
 pub fn draw_layout_tree<R: RendererBackend>(
     renderer: &mut R,
     document: &crate::dom::Document,
-    layout_tree: &TaffyTree,
-    styled_node: &StyledNode,
+    layout_tree: &taffy::TaffyTree,
+    node_id: crate::dom::NodeId,
     layout_node_id: taffy::NodeId,
     offset_x: f32,
     offset_y: f32,
     buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
 ) {
+    let computed = match document.nodes.get(node_id) {
+        Some(crate::dom::Node::Element(data)) => &data.computed,
+        Some(crate::dom::Node::Text(data)) => &data.computed,
+        _ => return, 
+    };
+
     if let Ok(layout) = layout_tree.layout(layout_node_id) {
         let abs_x = offset_x + layout.location.x;
         let abs_y = offset_y + layout.location.y;
 
-        if let Some((r, g, b)) = styled_node.computed.bg_color {
+        if let Some((r, g, b)) = computed.bg_color {
             renderer.fill_rect(abs_x, abs_y, layout.size.width, layout.size.height, Color { r, g, b });
         }
 
-        if let Some((r, g, b)) = styled_node.computed.border_color {
+        if let Some((r, g, b)) = computed.border_color {
             renderer.stroke_rect(
                 abs_x,
                 abs_y,
@@ -57,32 +61,31 @@ pub fn draw_layout_tree<R: RendererBackend>(
             );
         }
 
-        if let crate::dom::Node::Text(_) = document.nodes.get(styled_node.node_id).unwrap() {
-            let font_size = styled_node.computed.font_size;
-            let (r, g, b) = styled_node.computed.color;
-            let text_color = Color { r, g, b };
-            let line_height = (font_size * 1.2).max(1.0);
-
-            if let Some(buffer) = buffer_cache.get(&styled_node.node_id) {
-                for (line_index, run) in buffer.layout_runs().enumerate() {
-                    let baseline_y = abs_y + (line_index as f32 * line_height) + font_size;
-                    renderer.draw_glyphs(abs_x, baseline_y, run.glyphs, font_size, text_color);
-                }
-            }
-        }
-        if let Ok(children) = layout_tree.children(layout_node_id) {
-            for (i, child_layout_id) in children.into_iter().enumerate() {
-                if let Some(child_style) = styled_node.children.get(i) {
+        if let crate::dom::Node::Text(_) = document.nodes.get(node_id).unwrap() {
+            let buffer = buffer_cache.get_mut(&node_id).unwrap();
+            
+            renderer.draw_glyphs(
+                abs_x,
+                abs_y,
+                buffer.layout_runs().flat_map(|run| run.glyphs.iter().cloned()).collect::<Vec<_>>().as_slice(),
+                computed.font_size,
+                Color { r: computed.color.0, g: computed.color.1, b: computed.color.2 },
+            );
+        } else if let Ok(children) = layout_tree.children(layout_node_id) {
+            let mut dom_child_id = document.first_child_of(node_id);
+            for taffy_child in children {
+                if let Some(c) = dom_child_id {
                     draw_layout_tree(
                         renderer,
                         document,
                         layout_tree,
-                        child_style,
-                        child_layout_id,
+                        c,
+                        taffy_child,
                         abs_x,
                         abs_y,
                         buffer_cache,
                     );
+                    dom_child_id = document.next_sibling_of(c);
                 }
             }
         }

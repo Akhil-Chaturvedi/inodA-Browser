@@ -1,12 +1,12 @@
 # inoda-core
 
-A minimal browser engine library written in Rust. It parses HTML into a DOM tree, applies CSS styles with specificity and inheritance, computes Flexbox/Grid layout via Taffy, renders through an abstract backend trait, and exposes a subset of the Web API to an embedded QuickJS JavaScript runtime.
+A minimal browser engine library written in Rust. It parses HTML into an arena-based DOM, applies CSS styles with specificity and inheritance, computes Flexbox/Grid layout via Taffy, renders through an abstract backend trait, and runs a subset of the Web API in an embedded QuickJS JavaScript runtime.
 
 This is a library crate. It does not include a window, event loop, or GPU context -- those belong to the host application binary that depends on `inoda-core`.
 
 ## Status
 
-Early development. The engine covers enough of the web platform to parse simple pages and lay them out, but large gaps remain (see [Limitations](#limitations)).
+Early development. The engine can parse simple pages, apply stylesheets, lay out content with Flexbox/Grid, and run basic JavaScript that reads and mutates the DOM. Significant gaps remain (see [Limitations](#limitations)).
 
 ## Dependencies
 
@@ -18,103 +18,119 @@ Early development. The engine covers enough of the web platform to parse simple 
 | `taffy`              | 0.9     | Flexbox and CSS Grid layout algorithm          |
 | `rquickjs`           | 0.11    | QuickJS JavaScript engine bindings             |
 | `generational-arena` | 0.2     | Generational index arena for the DOM           |
-| `string_cache`       | 0.9     | Atom string interning for tag names and keys   |
-
-No other runtime dependencies.
+| `string_cache`       | 0.9     | Atom string interning for HTML tag names       |
 
 ## Module overview
 
 ```
 src/
   lib.rs        -- crate root, re-exports modules, integration tests
-  dom/mod.rs    -- generational arena DOM: Document, Node, ElementData, StyledNode
+  dom/mod.rs    -- generational arena DOM: Document, Node, ElementData, ComputedStyle
   html/mod.rs   -- html5gum token loop, streams HTML into the arena
-  css/mod.rs    -- CSS parser, specificity, inheritance, shorthand expansion, inline style parsing
-  layout/mod.rs -- StyledNode -> Taffy tree builder, text buffer pre-population, dimension parsing
-  render/mod.rs -- Taffy layout -> renderer backend draw calls (backgrounds, borders, text)
-  js/mod.rs     -- QuickJS runtime with document.*, console.*, cooperative setTimeout
+  css/mod.rs    -- CSS parser, specificity, cascade, inheritance, shorthand expansion
+  layout/mod.rs -- arena DOM -> TaffyTree builder, text buffer pre-population, dimension parsing
+  render/mod.rs -- Taffy layout + arena DOM -> renderer backend draw calls
+  js/mod.rs     -- QuickJS runtime with document.*, console.*, cooperative timers
 ```
 
 ### dom
 
 `generational_arena::Arena<Node>` indexed by `generational_arena::Index` (aliased as `NodeId`). Nodes are `Element(ElementData)`, `Text(TextData)`, or `Root(RootData)`. The tree is wired as an intrusive linked list: each node stores `first_child`, `last_child`, `next_sibling`, `prev_sibling`, and `parent` pointers directly, giving O(1) traversal and mutation without allocating child vectors.
 
-Tag names and attribute keys are interned as `string_cache::DefaultAtom`. Element classes are stored in a `Vec<DefaultAtom>` (not a `HashSet`) to reduce per-element memory overhead on constrained devices. Node deletion is iterative (queue-based) rather than recursive to avoid stack overflow on deeply nested trees with small thread stacks.
+Tag names are stored as `LocalName`, which is either `Standard(DefaultAtom)` for known HTML elements (interned, pointer-equality comparison) or `Custom(String)` for custom element names. This prevents unbounded growth of the global intern pool from arbitrary names passed through `document.createElement`.
 
-Documents maintain an `id_map: HashMap<String, NodeId>` for O(1) `getElementById` lookups.
+Attribute keys are interned as `DefaultAtom`. Element classes are stored in a `Vec<DefaultAtom>` rather than a `HashSet` to reduce per-element memory overhead.
+
+`ComputedStyle` is stored directly on `ElementData` and `TextData`, populated once during `css::compute_styles()`. Layout and rendering read from `computed` fields without scanning style tuples.
+
+`Document` fields:
+- `nodes: Arena<Node>` -- the arena
+- `stylesheet: StyleSheet` -- persistent, merged in-place as `<style>` tags are parsed
+- `id_map: HashMap<String, NodeId>` -- O(1) `getElementById` lookup
+- `dead_nodes: Vec<NodeId>` -- iterative deletion queue used by `remove_node`
+- `dirty: bool` -- set `true` by JS DOM mutations; the host must re-run compute/layout/render when true
+
+Node deletion is iterative (queue-based) to avoid stack overflow on deeply nested trees.
 
 ### html
 
-Streams `html5gum` tokens into the arena in a single pass. Each token is converted using `std::str::from_utf8` directly on the byte slices, avoiding intermediate `String` allocations. Implicit tag auto-closing walks up the ancestor chain from `current_parent` until it either finds the tag that should be closed (e.g., a `<div>` walks up past `<span>` and `<b>` to find and close an open `<p>`) or hits a block-level boundary (`div`, `body`, `td`, `th`, `table`) and stops. Content inside `<script>` and `<style>` tags is treated as raw text -- inner tokens are not parsed as HTML tags or appended to the DOM tree. CSS text from `<style>` elements is collected into `Document::style_texts`. Whitespace-only text nodes are preserved for inline spacing.
+Streams `html5gum` tokens into the arena in a single pass. Byte slices are validated with `std::str::from_utf8` directly, avoiding intermediate `String` allocations.
+
+Implicit tag auto-closing walks up the ancestor chain from `current_parent`. For example, a `<div>` token will first close an open `<p>`, but the walk stops at block-level boundary tags (`div`, `body`, `td`, `th`, `table`) to prevent over-closing. `EndTag` tokens walk `current_parent` back to the matching ancestor.
+
+Content inside `<script>` and `<style>` is accumulated as raw text via an `inside_raw_tag` state variable. The matching closing tag exits this state. Text from `<style>` elements is parsed immediately into `document.stylesheet` via `css::append_stylesheet()`.
 
 ### css
 
 - Parses CSS text into a `StyleSheet` containing pre-parsed `ComplexSelector` ASTs.
-- Property values are parsed into typed `StyleValue` enums (`LengthPx`, `Percent`, `ViewportWidth`, `ViewportHeight`, `Em`, `Rem`, `Color`, `Keyword`, `Number`, `Auto`, `None`) during the cascade, so downstream consumers do not parse strings at runtime.
-- Computes specificity as `(id_count, class_count, tag_count)` at parse time.
-- Rules are distributed into `HashMap<DefaultAtom, Vec<IndexedRule>>` buckets keyed by tag, class, and ID. Each rule records its source index for stable ordering. During style resolution, matching buckets are merged in a single O(N) pass using a k-way pointer walk over the pre-sorted slices, breaking specificity ties by source order, without allocating a temporary merged vector.
-- Supports tag, class, ID, compound, and complex combinators (`>`, ` `).
-- Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent to child. Only inheritable properties are passed to children; non-inheritable properties like `width` or `margin` are filtered out before recursing. Inherited style vectors are shared via `Rc` when no new declarations apply.
-- Expands `margin`, `padding` shorthands (1/2/4-value syntax) and maps `background` to `background-color`.
-- Inline `style=""` attributes are parsed via `cssparser`'s `DeclarationParser` trait.
+- Property values are parsed into typed `StyleValue` enums (`LengthPx`, `Percent`, `ViewportWidth`, `ViewportHeight`, `Em`, `Rem`, `Color`, `Keyword`, `Number`, `Auto`, `None`) during the cascade. Layout and rendering operate on these enum variants, not strings.
+- Property names in `Declaration` use `PropertyName`, a strongly-typed enum (`Display`, `Width`, `MarginTop`, `FontSize`, etc.) with an `Other(u64)` fallback. This makes property matching during cascade an integer comparison rather than a string deref.
+- Specificity is computed as `(id_count, class_count, tag_count)` at parse time and stored on each `ComplexSelector`.
+- Rules are stored in `HashMap<DefaultAtom, Vec<IndexedRule>>` buckets keyed by tag, class, and ID. Each rule carries a `rule_index` for stable source-order tie-breaking. Matching buckets are merged in a single k-way pointer walk over pre-sorted slices.
+- `compute_styles()` walks the arena DOM recursively, evaluates combinators (`>`, space) by walking arena parent pointers, populates `ComputedStyle` on each node via direct `PropertyName` enum matching.
+- Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent. Only inheritable properties are passed to children; non-inheritable properties like `width` or `margin` are filtered before recursing. Shared vectors use `Rc` to avoid copying.
+- `font-size` expressed as `Em` multiplies against the parent's resolved `font_size`. `Rem` always uses 16px as root baseline. Both are resolved during the cascade; the result stored in `computed.font_size` is always absolute pixels.
+- Expands `margin`, `padding` shorthands (1/2/4-value) and maps `background` to `background-color`.
+- Inline `style=""` attributes are parsed via `cssparser`'s `DeclarationParser` trait and applied after stylesheet rules.
+- `document.stylesheet` is persistent and updated incrementally. It is not reconstructed or re-sorted on every frame.
 
 ### layout
 
-Walks the `StyledNode` tree and builds a parallel `TaffyTree<TextMeasureContext>`. A pre-pass traverses the styled DOM and creates `cosmic-text::Buffer` objects for every text node, performing HarfBuzz shaping once. The buffer cache is caller-owned and persists across frames; entries for nodes that have been removed from the DOM are evicted at the start of each `compute_layout` call. The Taffy measure closure calls `buffer.set_size()` to adjust the width constraint, then calls `buffer.shape_until_scroll()` to re-wrap text. After layout completes, `finalize_text_measurements` reshapes each buffer at its final resolved width. Layout properties are read from `styled_node.computed` rather than scanning the style tuple vectors.
+Walks the arena DOM and builds a parallel `TaffyTree<TextMeasureContext>`. A pre-pass creates `cosmic-text::Buffer` objects for all text nodes, performing HarfBuzz shaping once before the solver runs. The buffer cache is caller-owned and persists across frames; entries for removed nodes are evicted via `retain()` at the start of `compute_layout`.
+
+The Taffy measure closure calls `buffer.set_size()` to adjust the width constraint, then `buffer.shape_until_scroll()` to re-wrap text. After layout completes, `finalize_text_measurements` reshapes each buffer at its final resolved width.
+
+Layout properties are read from `computed` fields on each arena node.
 
 Supported CSS properties mapped to Taffy:
-- `display`: flex, grid, block, none (inline/inline-block are recognized but not yet laid out differently)
+- `display`: flex, grid, block, none
 - `flex-direction`: row, column
 - `width`, `height` with units: `px`, `%`, `vw`, `vh`, `em`, `rem`, `auto`
-- `margin-top`, `margin-right`, `margin-bottom`, `margin-left` (including `auto`)
-- `padding-top`, `padding-right`, `padding-bottom`, `padding-left`
-- `border-width`, `border-top-width`, `border-right-width`, `border-bottom-width`, `border-left-width`
+- `margin-*`, `padding-*`, `border-*-width` (including `auto` for margins)
 
 Non-flex elements default to `flex-direction: column` to approximate block stacking.
 
-Properties not yet wired: `align-items`, `justify-content`, `gap`, `flex-wrap`, `flex-grow`, `flex-shrink`, `min-*`, `max-*`, `position`, `overflow`.
+Properties not wired: `align-items`, `justify-content`, `gap`, `flex-wrap`, `flex-grow`, `flex-shrink`, `min-*`, `max-*`, `position`, `overflow`.
 
 ### render
 
-Recursively walks the Taffy layout tree alongside the `StyledNode` tree and issues backend draw calls:
+Recursively walks the Taffy layout tree alongside the arena DOM and issues backend draw calls:
 - Background rectangles (`background-color`)
-- Border strokes (`border-color`, always 1px, no per-side control)
-- Text via `RendererBackend::draw_glyphs()` using pre-shaped `cosmic_text::LayoutGlyph` arrays
+- Border strokes (`border-color`)
+- Text via `RendererBackend::draw_glyphs()` with pre-shaped `cosmic_text::LayoutGlyph` iterators
 
-Draw properties (`bg_color`, `border_color`, `font_size`, `color`) are read directly from `styled_node.computed`. There is no intermediate `TextLayoutCache` or `TextDrawLine` struct.
+Draw properties are read directly from `ComputedStyle` fields on each arena node. There is no intermediate draw cache or separate text layout struct.
 
-The `RendererBackend` trait requires implementing `fill_rect`, `stroke_rect`, and `draw_glyphs`.
+The `RendererBackend` trait requires `fill_rect`, `stroke_rect`, and `draw_glyphs`.
 
-Color parsing handles the named colors `red`, `green`, `blue`, `black`, `white` and 6-digit hex (`#rrggbb`). No `rgb()`, `rgba()`, `hsl()`, shorthand hex, or alpha support.
-
-Font loading is backend-specific and must be provided by the host renderer implementation.
+Color parsing handles the named colors `red`, `green`, `blue`, `black`, `white` and 6-digit hex (`#rrggbb`). No `rgb()`, `rgba()`, `hsl()`, shorthand hex, or alpha.
 
 ### js
 
-Embeds QuickJS via `rquickjs`. The `JsEngine` holds the `Document` behind `Rc<RefCell<Document>>`. QuickJS is single-threaded; all DOM access is serialized through the `RefCell`.
+Embeds QuickJS via `rquickjs`. `JsEngine` holds `Document` behind `Rc<RefCell<Document>>`. QuickJS is single-threaded; all DOM access is serialized through the `RefCell`.
 
 Exposed globals:
 - `console.log(msg)`, `console.warn(msg)`, `console.error(msg)` -- print to stdout
-- `document.getElementById(id)` -- returns a `NodeHandle` object. Repeated calls for the same node return the same JS object (identity preserved via a `WeakRef`-based `__nodeCache`).
-- `document.querySelector(selector)` -- tag, class, and ID selectors. Returns a cached `NodeHandle` or null.
-- `document.createElement(tagName)` -- creates a detached element node in the arena, returns a cached `NodeHandle`.
-- `document.appendChild(parent, child)` -- appends a child node
-- `document.addEventListener(event, callback)` -- logs registration (scaffold; does not dispatch events)
-- `setTimeout(callback, delay)` -- registers a cooperative timer; host must call `pump()`
+- `document.getElementById(id)` -- returns a cached `NodeHandle` or null
+- `document.querySelector(selector)` -- tag, class, and ID selectors only; returns a cached `NodeHandle` or null
+- `document.createElement(tagName)` -- creates a detached element in the arena, returns a cached `NodeHandle`
+- `document.appendChild(parent, child)` -- appends child node, sets `document.dirty = true`
+- `document.addEventListener(event, callback)` -- records registration; does not dispatch events
+- `setTimeout(callback, delay)` -- registers a one-shot cooperative timer; returns a timer ID
+- `setInterval(callback, delay)` -- registers a repeating cooperative timer; returns a timer ID
+- `clearTimeout(id)`, `clearInterval(id)` -- cancels a pending timer by ID
 
 `NodeHandle` class methods:
 - `handle.tagName` -- returns the tag name string
 - `handle.getAttribute(key)` -- returns value or null
-- `handle.setAttribute(key, value)` -- updates or inserts attribute
-- `handle.removeChild(child)` -- detaches child from parent
+- `handle.setAttribute(key, value)` -- updates or inserts attribute, sets `document.dirty = true`
+- `handle.removeChild(child)` -- detaches child from parent, sets `document.dirty = true`
 
-The `__nodeCache` uses a `Map` of `WeakRef` objects keyed by `"index:generation"` strings. Each node exposed to JS carries a `__nodeKey` property which is a two-element JavaScript array `[u32 index, u64 generation]`. The cache key string is constructed from this array on the JS side. A `FinalizationRegistry` is given the integer array at registration time; when QuickJS garbage-collects the wrapper, the registry calls the native Rust `_garbageCollectNodeRaw` function passing the integer array directly (no string parsing). `_garbageCollectNodeRaw` reconstructs the `NodeId` from the two integers, then removes the node from the arena only if it is not currently attached to the DOM tree.
+The `__nodeCache` Map is keyed by a `BigInt` value: `BigInt(index) | (BigInt(generation) << 32n)`. This avoids string allocation for cache key construction. A `FinalizationRegistry` receives the raw `[index, generation]` integer array when QuickJS GC collects a wrapper; it computes the BigInt key for cache cleanup and calls `_garbageCollectNodeRaw` with the integer array. `_garbageCollectNodeRaw` reconstructs the `NodeId` from the two integers directly. Nodes are removed from the arena only if they are not currently attached to the DOM tree.
 
-`NodeHandle` does not implement `Drop`. Nodes created via JavaScript remain in the Rust arena until explicitly removed via `removeChild()`. This avoids ABA memory corruption that would occur if QuickJS garbage collection triggered arena deletions for nodes that are still attached to the DOM.
+`NodeHandle` does not implement `Drop`. Nodes created via JavaScript persist in the arena until explicitly removed via `removeChild()`. This prevents QuickJS GC from invalidating arena slots for nodes that are still attached to the tree.
 
-`setAttribute('id', newId)` removes the old ID from `Document::id_map` before inserting the new one. `remove_node` verifies that the `id_map` entry points to the node being removed before deleting it, preventing stale entries from corrupting lookups.
-
-Timer callbacks are stored as `rquickjs::Persistent<Function>` to survive context boundaries. Pending timers are held in a `BinaryHeap` sorted by fire time. The host application should call `pump()` on its event loop tick; `pump()` pops expired timers from the heap without allocating temporary vectors.
+Timer callbacks are stored as `rquickjs::Persistent<Function>`. Pending timers are in a `BinaryHeap` sorted by `fire_at`. Cancelled timer IDs are tracked in a `HashSet<u32>`; `pump()` skips popped timers whose IDs appear in the set. When an interval timer fires, a new `PendingTimer` is pushed with the next scheduled time. The host application must call `pump()` on its event loop tick.
 
 ## Building
 
@@ -138,14 +154,15 @@ This list is not exhaustive. The engine is a working skeleton, not a production 
 - No `<img>`, `<video>`, `<canvas>`, `<iframe>`, or form elements.
 - Inline formatting context is incomplete (no baseline alignment or float interaction).
 - Font loading and fallback are backend-specific and must be provided by the host.
-- `display: inline` and `inline-block` are parsed but laid out identically to block.
-- Layout properties `position`, `overflow`, `z-index`, `float`, `align-items`, `justify-content` are not wired to Taffy.
+- `display: inline` and `inline-block` are parsed but treated identically to block.
+- Layout properties `position`, `overflow`, `z-index`, `float`, `align-items`, `justify-content`, `gap`, `flex-grow`, `flex-shrink`, `min-*`, `max-*` are not wired to Taffy.
 - Color parsing is limited to 5 named colors and 6-digit hex.
 - No `@media`, `@import`, `@keyframes`, CSS variables, or `calc()`.
-- Selector matching supports combinators (`>`, ` `) but not `+`, `~`, attribute selectors, or pseudo-classes with arguments.
-- `addEventListener` logs the event name but never dispatches events.
-- `setTimeout` fires callbacks only when the host calls `pump()`. There is no background thread or async runtime.
-- Viewport units (`vw`, `vh`) are resolved to absolute pixels at tree construction time. Resizing the window requires rebuilding the layout tree.
+- Selector matching supports `>` (child) and space (descendant) combinators, but not `+`, `~`, attribute selectors, or `:pseudo-class()` with arguments.
+- `addEventListener` records the registration but never dispatches any events.
+- `setTimeout` and `setInterval` fire only when the host calls `pump()`. There is no background thread.
+- The host is responsible for detecting `document.dirty` and re-running the style/layout/render pipeline after JS mutations.
+- `rem` unit resolution uses a fixed 16px root baseline; there is no `<html>` element font-size negotiation.
 
 ## License
 

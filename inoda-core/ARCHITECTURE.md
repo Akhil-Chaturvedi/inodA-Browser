@@ -8,25 +8,27 @@ This document describes the data flow and module boundaries inside `inoda-core`.
 HTML string
   |
   v
-html::parse_html()          -- html5gum tokenizer -> token loop -> arena DOM (Document)
-  |                            also extracts <style> tag contents
+html::parse_html()          -- html5gum token loop -> arena DOM (Document)
+  |                            <style> tag text is parsed immediately into
+  |                            document.stylesheet via css::append_stylesheet()
   v
-css::parse_stylesheet()     -- cssparser tokenizer -> StyleSheet (HashMap<DefaultAtom, Vec<IndexedRule>>)
-css::compute_styles()       -- walks DOM, resolves specificity against hash-map buckets via
-  |                            right-to-left combinator backtracking,
-  |                            inherits properties via Rc::clone, expands shorthands -> StyledNode tree
+css::compute_styles()       -- walks the arena DOM recursively,
+  |                            resolves specificity against StyleSheet hash-map buckets,
+  |                            evaluates combinators by walking parent pointers,
+  |                            populates ComputedStyle in-place on each ElementData/TextData
   v
-layout::compute_layout()    -- pre-populates cosmic-text buffers for all text nodes,
-  |                            converts StyledNode tree to TaffyTree, resolves
-  |                            dimensions (px, %, vw, vh, em, rem, auto),
+layout::compute_layout()    -- pre-populates cosmic-text::Buffer for each text node,
+  |                            builds a TaffyTree from the arena DOM,
+  |                            resolves dimensions (px, %, vw, vh, em, rem, auto),
   |                            runs Taffy flexbox/grid solver -> positioned Layout tree
   v
-render::draw_layout_tree()  -- walks Layout + StyledNode in parallel,
-                               issues renderer backend draw calls: fill_rect (bg),
-                               stroke_rect (border), draw_glyphs (text content)
+render::draw_layout_tree()  -- walks Taffy layout tree alongside the arena DOM,
+                               reads ComputedStyle directly from each node,
+                               issues draw calls: fill_rect (bg), stroke_rect (border),
+                               draw_glyphs (text content)
 ```
 
-JavaScript execution happens outside this pipeline. The host application creates a `JsEngine`, passing in the `Document`. JS code can read and mutate the DOM via `Rc<RefCell<Document>>`. QuickJS is single-threaded; access is serialized. Returned node handles preserve `===` identity via a `WeakRef`-based `__nodeCache` on the JS side. Each cache entry uses a string key `"index:generation"` computed from the node's `__nodeKey` array `[u32 index, u64 generation]`. A `FinalizationRegistry` receives this integer array when QuickJS GC runs, calls the native `_garbageCollectNodeRaw` Rust function which reconstructs the `NodeId` from the two integers directly without string parsing, then removes the node from the arena if it is not attached to the DOM tree. There is currently no mechanism to trigger re-style or re-layout from JS mutations. Timer callbacks registered via `setTimeout` fire only when the host calls `JsEngine::pump()`.
+JavaScript execution is separate from this pipeline. The host creates a `JsEngine`, passing in the `Document` behind `Rc<RefCell<Document>>`. JS mutations set `document.dirty = true`. The host application is responsible for checking `dirty` and re-running `compute_styles`, `compute_layout`, and `draw_layout_tree` after JS mutations. Timer callbacks registered via `setTimeout` or `setInterval` fire only when the host calls `JsEngine::pump()`.
 
 ## Data structures
 
@@ -34,117 +36,148 @@ JavaScript execution happens outside this pipeline. The host application creates
 
 ```
 Document {
-    nodes: Arena<Node>,             // generational_arena::Arena, indexed by Index
-    root_id: generational_arena::Index,
-    style_texts: Vec<String>,       // raw CSS from <style> tags
+    nodes: Arena<Node>,              // generational_arena::Arena, indexed by NodeId
+    root_id: NodeId,
+    stylesheet: StyleSheet,          // persistent, updated when <style> tags are parsed
     id_map: HashMap<String, NodeId>, // O(1) getElementById lookup
-    dead_nodes: Vec<NodeId>         // iterative deletion queue for remove_node
+    dead_nodes: Vec<NodeId>,         // iterative deletion queue for remove_node
+    dirty: bool,                     // set true by JS DOM mutations, cleared by host after re-render
 }
 
 Node = Element(ElementData) | Text(TextData) | Root(RootData)
 NodeId = generational_arena::Index  // type alias
 
 ElementData {
-    tag_name: string_cache::DefaultAtom,   // interned
+    tag_name: LocalName,                             // Standard(DefaultAtom) for HTML tags, Custom(String) for custom elements
     attributes: Vec<(string_cache::DefaultAtom, String)>,
     classes: Vec<string_cache::DefaultAtom>,
-    parent: Option<NodeId>,
-    first_child: Option<NodeId>,
-    last_child: Option<NodeId>,
+    parent:       Option<NodeId>,
+    first_child:  Option<NodeId>,
+    last_child:   Option<NodeId>,
     prev_sibling: Option<NodeId>,
-    next_sibling: Option<NodeId>
+    next_sibling: Option<NodeId>,
+    computed: ComputedStyle,          // populated by css::compute_styles()
 }
 
 TextData {
     text: String,
-    parent: Option<NodeId>,
+    parent:       Option<NodeId>,
     prev_sibling: Option<NodeId>,
-    next_sibling: Option<NodeId>
+    next_sibling: Option<NodeId>,
+    computed: ComputedStyle,
 }
 
 RootData {
     first_child: Option<NodeId>,
-    last_child: Option<NodeId>
+    last_child:  Option<NodeId>,
 }
 ```
 
-Generational indices provide O(1) insertion and deletion without index invalidation or ABA problems. The DOM tree is wired as an intrusive linked list (`first_child`, `next_sibling`, etc.) which allows mutations without allocating child vectors. Node deletion uses an iterative queue rather than recursion to avoid stack overflow on deeply nested trees.
+Generational indices prevent ABA problems. The DOM tree is wired as an intrusive linked list; mutations do not allocate child vectors. Node deletion uses an iterative queue rather than recursion to avoid stack overflow on deep trees.
 
-### StyledNode (dom/mod.rs)
+`LocalName` separates standard HTML tags (interned as `DefaultAtom`) from custom element names (heap-allocated `String`). This prevents unbounded growth of the global `DefaultAtom` intern pool when arbitrary custom element names are created from JavaScript.
+
+### ComputedStyle (dom/mod.rs)
 
 ```
-StyledNode {
-    node_id: NodeId,
-    local: Vec<(DefaultAtom, StyleValue)>,                     // properties declared on this node
-    inherited: Option<Rc<Vec<(DefaultAtom, StyleValue)>>>,      // inheritable properties from parent
-    children: Vec<StyledNode>,
-    computed: ComputedStyle                                     // pre-resolved native property cache
-}
-
 ComputedStyle {
-    display: DefaultAtom,
-    flex_direction: DefaultAtom,
-    width: StyleValue,
-    height: StyleValue,
-    margin: [StyleValue; 4],     // top, right, bottom, left
-    padding: [StyleValue; 4],
-    border_width: [StyleValue; 4],
-    bg_color: Option<(u8, u8, u8)>,
-    border_color: Option<(u8, u8, u8)>,
-    font_size: f32,
-    color: (u8, u8, u8)
+    display:       DefaultAtom,        // "block", "flex", "grid", "none"
+    flex_direction: DefaultAtom,       // "row", "column"
+    width:         StyleValue,
+    height:        StyleValue,
+    margin:        [StyleValue; 4],    // top, right, bottom, left
+    padding:       [StyleValue; 4],
+    border_width:  [StyleValue; 4],
+    bg_color:      Option<(u8, u8, u8)>,
+    border_color:  Option<(u8, u8, u8)>,
+    font_size:     f32,                // absolute pixels, resolved during cascade
+    color:         (u8, u8, u8),
 }
 ```
 
-This is a tree (not arena). Each node owns its children. It exists only during layout computation and rendering, then gets dropped. The `local` vector holds properties that matched this specific element. The `inherited` vector holds only inheritable properties (`color`, `font-size`, `font-family`, etc.) from the parent. Non-inheritable properties like `width` or `margin` are filtered out before being passed to children. When a child has no matched declarations and no new inheritable values, the parent's `Rc` is cloned without copying the underlying vector.
+`ComputedStyle` is stored directly inside `ElementData` and `TextData`. It is populated once during `css::compute_styles()` and read by both `layout::compute_layout()` and `render::draw_layout_tree()`. There is no intermediate styled-node tree that gets built and dropped per frame.
 
-`ComputedStyle` is populated at the end of `build_styled_node` from `local` and `inherited`. Layout and rendering read directly from `computed` rather than iterating over style tuples. This eliminates tuple-scanning in the hot layout and render paths.
+`StyleValue` is:
+
+```
+StyleValue = LengthPx(f32) | Percent(f32) | ViewportWidth(f32) | ViewportHeight(f32)
+           | Em(f32) | Rem(f32) | Number(f32) | Keyword(DefaultAtom)
+           | Color(u8, u8, u8) | Auto | None
+```
+
+`Em` and `Rem` are stored as-is in most properties and resolved to absolute pixels in `layout/mod.rs` using the element's `font_size`. For `font-size` itself, `Em` is resolved during the cascade by multiplying against the parent element's `font_size`; `Rem` always uses 16px as the root baseline.
 
 ### StyleSheet (css/mod.rs)
 
 ```
 StyleSheet {
-    by_id: HashMap<DefaultAtom, Vec<IndexedRule>>,
+    by_id:    HashMap<DefaultAtom, Vec<IndexedRule>>,
     by_class: HashMap<DefaultAtom, Vec<IndexedRule>>,
-    by_tag: HashMap<DefaultAtom, Vec<IndexedRule>>,
-    universal: Vec<IndexedRule>
+    by_tag:   HashMap<DefaultAtom, Vec<IndexedRule>>,
+    universal: Vec<IndexedRule>,
+    next_rule_index: usize,
 }
-IndexedRule { selector: ComplexSelector, declarations: Rc<Vec<Declaration>>, rule_index: usize }
+
+IndexedRule   { selector: ComplexSelector, declarations: Rc<Vec<Declaration>>, rule_index: usize }
 ComplexSelector { last: CompoundSelector, ancestors: Vec<(Combinator, CompoundSelector)>, specificity: (u32, u32, u32) }
-Combinator = Descendant | Child
-Declaration { name: DefaultAtom, value: StyleValue }
+Combinator    = Descendant | Child
+Declaration   { name: PropertyName, value: StyleValue }
 ```
 
-Selectors are pre-parsed into a `ComplexSelector` AST at stylesheet creation time. Specificity is calculated once during parsing. Each rule also records a `rule_index` (its position in the original stylesheet) for stable tie-breaking. Rules are distributed into hash-map buckets based on their right-most selector component. During style resolution, matching buckets are merged via a k-way pointer walk over the pre-sorted slices, breaking specificity ties by `rule_index` to preserve document source order. Combinators (`>` for child, space for descendant) are evaluated by walking parent pointers up the arena. Inline `style` attributes are parsed via `cssparser`'s `DeclarationParser` trait.
+`PropertyName` is a strongly-typed enum covering all CSS properties the engine recognizes (`Display`, `Width`, `MarginTop`, `Color`, `FontSize`, etc.) with an `Other(u64)` variant for unrecognized names. It replaces `DefaultAtom` as the key in `Declaration`, eliminating string-deref comparisons from the cascade hot path. Property matching during `compute_styles` is a direct enum equality check.
+
+Selectors are pre-parsed into ASTs at stylesheet creation time. Specificity is computed once. Rules are distributed into hash-map buckets based on their right-most simple selector. During style resolution, matching buckets are merged via a k-way pointer walk over pre-sorted slices.
+
+`StyleSheet` is stored persistently on `Document`. When HTML parsing encounters a `<style>` tag, `css::append_stylesheet()` merges the new rules into `document.stylesheet` in-place. This replaces the previous approach of collecting raw CSS text strings for batch parsing.
 
 ### PendingTimer (js/mod.rs)
 
 ```
 PendingTimer {
-    id: u32,
-    fire_at: Instant,
-    callback: Persistent<Function<'static>>     // rquickjs::Persistent
+    id:          u32,
+    fire_at:     Instant,
+    callback:    Persistent<Function<'static>>,  // rquickjs::Persistent
+    is_interval: bool,
+    delay_ms:    u64,
 }
 ```
 
-Timer callbacks are stored as `rquickjs::Persistent<Function>` which holds a JS function reference outside the QuickJS context lifetime. Pending timers are held in a `std::collections::BinaryHeap` ordered by `fire_at` (min-heap via reversed `Ord`). `JsEngine::pump()` pops expired entries from the heap without allocating temporary vectors.
+Timers are stored in a `std::collections::BinaryHeap` ordered by `fire_at` (min-heap via reversed `Ord`). Cancelled timer IDs are tracked in a `HashSet<u32>`; `pump()` skips any popped timer whose ID is in the set. When an interval timer fires, `pump()` reschedules it by pushing a new `PendingTimer` with `fire_at = now + delay_ms`. The `BinaryHeap` does not support in-place cancellation -- the cancel set approach avoids rebuilding the heap on `clearTimeout`.
 
-## Specificity
+## Cascade and inheritance
 
-Selectors are scored as `(id_count, class_count, tag_count)`. Matched rules are merged in specificity order. Equal-specificity rules from different buckets are tie-broken by `rule_index` to preserve document source order. Inline `style` attributes always win because they are applied after all stylesheet rules.
+`css::compute_styles()` walks the arena DOM recursively. For each element node it:
+
+1. Looks up matching rules from `document.stylesheet` buckets (by ID, class, tag, universal).
+2. Merges matched rules using a k-way specificity-ordered pointer walk.
+3. Applies inline `style` attribute declarations last (highest priority).
+4. Builds a new `Vec<(PropertyName, StyleValue)>` of matched declarations.
+5. Inherits inheritable properties (`color`, `font-size`, `font-family`, `font-weight`, `line-height`, `text-align`, `visibility`) from the parent via `Rc::clone` when no new inheritable values apply.
+6. Populates `ComputedStyle` on the node via direct enum matching on `PropertyName`.
+7. Recurses into children, passing the updated inheritable-style vector.
+
+Combinator evaluation (`>` child, space descendant) walks arena parent pointers rather than maintaining a separate ancestor stack.
+
+## JavaScript bridge
+
+`JsEngine` holds the `Document` inside `Rc<RefCell<Document>>`. DOM-mutating JS functions call `doc.dirty = true` after making changes.
+
+Each DOM node exposed to JS carries a `__nodeKey` property: a two-element array `[u32 index, u64 generation]`. The `__nodeCache` Map is keyed by a `BigInt` value computed as `BigInt(index) | (BigInt(generation) << 32n)`. This avoids string allocation for cache keys. A `FinalizationRegistry` receives the integer array when QuickJS garbage-collects a wrapper; it recomputes the BigInt key for cache removal and calls `_garbageCollectNodeRaw` with the raw integer array. `_garbageCollectNodeRaw` reconstructs the `NodeId` directly from the two integers and removes the arena entry only if the node is not attached to the DOM tree.
+
+`NodeHandle` does not implement `Drop`. Nodes created by JavaScript persist in the arena until explicitly removed via `removeChild()`. This prevents QuickJS garbage collection from triggering arena mutations on nodes that are still part of the tree.
 
 ## Text measurement
 
-Text nodes are inserted into Taffy as leaf nodes with a `TextMeasureContext`. A pre-pass traverses the styled DOM and creates a `cosmic-text::Buffer` for each text node, performing HarfBuzz shaping once. The buffer cache is caller-owned and persists across frames; it is not cleared internally. During `compute_layout_with_measure`, the measure closure retrieves the already-shaped buffer, calls `buffer.set_size()` to adjust the width constraint, then calls `buffer.shape_until_scroll()` to re-wrap the text. It then counts layout lines to determine the height.
+A pre-pass in `prepare_text_buffers` creates a `cosmic-text::Buffer` for each text node, performing HarfBuzz shaping once before the layout solver runs. The buffer cache is caller-owned and persists across frames; entries for removed nodes are evicted by `buffer_cache.retain()` at the start of each `compute_layout` call.
 
-After layout completes, `finalize_text_measurements` walks the Taffy tree one last time and reshapes each text buffer at its final resolved width. The renderer reads glyphs directly from the `buffer_cache` via `buffer.layout_runs()` -- there is no intermediate `TextLayoutCache` or `TextLineLayout` struct.
-
-## Thread safety
-
-`JsEngine` holds the `Document` inside `Rc<RefCell<Document>>`. QuickJS and `rquickjs` are designed for single-threaded usage. All JS-exposed functions borrow the `RefCell` to access the DOM. This avoids mutex overhead while maintaining memory safety through Rust's runtime borrow checking. `NodeHandle` does not implement `Drop`; nodes created by JavaScript persist in the arena until explicitly removed via `removeChild()`. This prevents ABA corruption from QuickJS garbage collection triggering arena deletions on still-attached nodes.
+During `compute_layout_with_measure`, the measure closure calls `buffer.set_size()` and `buffer.shape_until_scroll()` to re-wrap text at the available width. After the layout solver finishes, `finalize_text_measurements` reshapes each buffer at its final resolved width. The renderer reads `LayoutGlyph` iterators directly from `buffer.layout_runs()`.
 
 ## HTML parsing
 
-The HTML module iterates over `html5gum` tokens in a loop. Each `StartTag` token creates an `ElementData` node in the arena and appends it as a child of the current parent. Before appending, the parser walks up the ancestor chain from `current_parent` to check whether the new tag should implicitly close an ancestor. For example, when a `<div>` is encountered inside `<p><span><b>`, the walk finds the `<p>` ancestor and pops `current_parent` back to the `<p>`'s parent. The walk stops at block-level boundaries (`div`, `body`, `td`, `th`, `table`) to prevent over-closing. `EndTag` tokens pop the current parent back to its own parent. `String` tokens create `TextData` nodes. Byte slices are validated with `std::str::from_utf8` directly, without allocating through `from_utf8_lossy`.
+The HTML module iterates `html5gum` tokens in a loop. `StartTag` tokens create `ElementData` nodes and append them under `current_parent`. Before appending, the parser checks whether the new tag should implicitly close an open ancestor (e.g., `<div>` closing an open `<p>`). The walk stops at block-level boundary tags (`div`, `body`, `td`, `th`, `table`). `EndTag` tokens walk `current_parent` back up to the matching ancestor. Byte slices are validated as UTF-8 directly without allocating through `String::from_utf8_lossy`.
 
-Content inside `<script>` and `<style>` tags is tracked via an `inside_raw_tag` state variable. While inside a raw tag, `StartTag` and `EndTag` tokens for other elements are accumulated as literal text rather than parsed as DOM nodes. Only the matching closing tag (e.g., `</script>`) exits the raw state. CSS text from `<style>` elements is collected into `Document::style_texts`.
+Content inside `<script>` and `<style>` is accumulated as raw text. The matching closing tag exits the raw state. `<style>` content is parsed immediately into `document.stylesheet` via `css::append_stylesheet()`.
+
+## Thread safety
+
+`JsEngine` uses `Rc<RefCell<Document>>`. QuickJS and `rquickjs` are single-threaded by design. `JsEngine` is not `Send`. All DOM access from JS callbacks is serialized through the `RefCell`. There are no mutexes or atomic operations in the engine core.

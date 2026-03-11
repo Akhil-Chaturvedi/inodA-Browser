@@ -1,16 +1,16 @@
 //! Layout computation module.
 //!
-//! Converts a `StyledNode` tree into a `TaffyTree` and runs the Flexbox/Grid
-//! layout algorithm. Before running the solver, orphaned `cosmic-text::Buffer`
-//! entries (for nodes removed from the DOM since the last frame) are evicted
-//! from the caller-owned buffer cache. A pre-pass then creates `Buffer` objects
-//! for all current text nodes, performing HarfBuzz shaping once per node.
+//! Walks the arena DOM and builds a parallel `TaffyTree<TextMeasureContext>`. Before
+//! running the solver, orphaned `cosmic-text::Buffer` entries (for nodes removed
+//! from the DOM since the last frame) are evicted from the caller-owned buffer cache.
+//! A pre-pass then creates `Buffer` objects for all current text nodes, performing
+//! HarfBuzz shaping once per node.
 //!
 //! The Taffy measure closure calls `buffer.set_size()` to adjust the width
-//! constraint; if it returns a non-unit change signal `buffer.shape_until_scroll()`
-//! is called to re-wrap text. Layout properties (`width`, `height`, `margin`,
-//! `padding`, `border-width`, `display`, `flex-direction`) are read directly
-//! from `styled_node.computed` rather than scanning style tuple vectors.
+//! constraint, then `buffer.shape_until_scroll()` to re-wrap text. Layout
+//! properties (`width`, `height`, `margin`, `padding`, `border-width`, `display`,
+//! `flex-direction`) are read directly from `node.computed` (a `ComputedStyle`
+//! embedded in each arena `ElementData` or `TextData`).
 //!
 //! Supported dimension units: px, %, vw, vh, em, rem, auto.
 //! Supported display modes: flex, grid, block, none.
@@ -18,7 +18,7 @@
 
 use std::{cell::RefCell, collections::HashMap};
 
-use crate::dom::StyledNode;
+
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, Wrap};
 use taffy::{
     TaffyTree,
@@ -34,7 +34,7 @@ pub struct TextMeasureContext {
 
 pub fn compute_layout(
     document: &crate::dom::Document,
-    styled_node: &StyledNode,
+
     viewport_width: f32,
     viewport_height: f32,
     font_system: &mut FontSystem,
@@ -45,12 +45,12 @@ pub fn compute_layout(
     // Evict cached text buffers for nodes that have been removed from the DOM
     buffer_cache.retain(|node_id, _| document.nodes.contains(*node_id));
 
-    prepare_text_buffers(document, styled_node, font_system, buffer_cache);
+    prepare_text_buffers(document, document.root_id, font_system, buffer_cache);
 
     let root_taffy_node = build_taffy_node(
         &mut tree,
         document,
-        styled_node, 
+        document.root_id, 
         viewport_width,
         viewport_height,
     );
@@ -126,24 +126,26 @@ pub fn compute_layout(
 
 fn prepare_text_buffers(
     document: &crate::dom::Document,
-    styled_node: &StyledNode,
+    node_id: crate::dom::NodeId,
     font_system: &mut FontSystem,
     buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
 ) {
-    if let Some(crate::dom::Node::Text(txt)) = document.nodes.get(styled_node.node_id) {
-        let font_size = styled_node.computed.font_size;
+    if let Some(crate::dom::Node::Text(data)) = document.nodes.get(node_id) {
+        let font_size = data.computed.font_size;
 
         let line_height = (font_size * 1.2).max(1.0);
-        let _buffer = buffer_cache.entry(styled_node.node_id).or_insert_with(|| {
+        buffer_cache.entry(node_id).or_insert_with(|| {
             let mut b = Buffer::new(font_system, Metrics::new(font_size, line_height));
             b.set_wrap(font_system, Wrap::WordOrGlyph);
-            b.set_text(font_system, &txt.text, Attrs::new(), Shaping::Advanced);
+            b.set_text(font_system, &data.text, Attrs::new(), Shaping::Advanced);
             b
         });
     }
 
-    for child in &styled_node.children {
-        prepare_text_buffers(document, child, font_system, buffer_cache);
+    let mut child_id = document.first_child_of(node_id);
+    while let Some(c) = child_id {
+        prepare_text_buffers(document, c, font_system, buffer_cache);
+        child_id = document.next_sibling_of(c);
     }
 }
 
@@ -177,15 +179,21 @@ fn finalize_text_measurements(
 fn build_taffy_node(
     tree: &mut TaffyTree<TextMeasureContext>,
     document: &crate::dom::Document,
-    styled_node: &StyledNode,
+    node_id: crate::dom::NodeId,
     vw: f32,
     vh: f32,
 ) -> NodeId {
     let mut style = Style::DEFAULT;
 
-    let font_size = styled_node.computed.font_size;
+    let computed = match document.nodes.get(node_id) {
+        Some(crate::dom::Node::Element(data)) => &data.computed,
+        Some(crate::dom::Node::Text(data)) => &data.computed,
+        _ => return tree.new_leaf(style).unwrap(), // Root node
+    };
 
-    match &*styled_node.computed.display {
+    let font_size = computed.font_size;
+
+    match &*computed.display {
         "flex" => style.display = Display::Flex,
         "grid" => style.display = Display::Grid,
         "none" => style.display = Display::None,
@@ -193,60 +201,61 @@ fn build_taffy_node(
         _ => {}
     }
 
-    match &*styled_node.computed.flex_direction {
+    match &*computed.flex_direction {
         "row" => style.flex_direction = FlexDirection::Row,
         "column" => style.flex_direction = FlexDirection::Column,
         _ => {}
     }
 
-    let is_flex = &*styled_node.computed.display == "flex";
-    let has_flex_dir = &*styled_node.computed.flex_direction == "row" || &*styled_node.computed.flex_direction == "column";
+    let is_flex = &*computed.display == "flex";
+    let has_flex_dir = &*computed.flex_direction == "row" || &*computed.flex_direction == "column";
 
     if !is_flex && !has_flex_dir {
         style.flex_direction = FlexDirection::Column;
     }
 
-    if let Some(dim) = parse_dimension(&styled_node.computed.width, vw, vh, font_size) {
+    if let Some(dim) = parse_dimension(&computed.width, vw, vh, font_size) {
         style.size.width = dim;
     }
     
-    if let Some(dim) = parse_dimension(&styled_node.computed.height, vw, vh, font_size) {
+    if let Some(dim) = parse_dimension(&computed.height, vw, vh, font_size) {
         style.size.height = dim;
     }
 
-    if let Some(dim) = parse_length_percentage_auto(&styled_node.computed.margin[0], vw, vh, font_size) { style.margin.top = dim; }
-    if let Some(dim) = parse_length_percentage_auto(&styled_node.computed.margin[1], vw, vh, font_size) { style.margin.right = dim; }
-    if let Some(dim) = parse_length_percentage_auto(&styled_node.computed.margin[2], vw, vh, font_size) { style.margin.bottom = dim; }
-    if let Some(dim) = parse_length_percentage_auto(&styled_node.computed.margin[3], vw, vh, font_size) { style.margin.left = dim; }
+    if let Some(dim) = parse_length_percentage_auto(&computed.margin[0], vw, vh, font_size) { style.margin.top = dim; }
+    if let Some(dim) = parse_length_percentage_auto(&computed.margin[1], vw, vh, font_size) { style.margin.right = dim; }
+    if let Some(dim) = parse_length_percentage_auto(&computed.margin[2], vw, vh, font_size) { style.margin.bottom = dim; }
+    if let Some(dim) = parse_length_percentage_auto(&computed.margin[3], vw, vh, font_size) { style.margin.left = dim; }
 
-    if let Some(dim) = parse_length_percentage(&styled_node.computed.padding[0], vw, vh, font_size) { style.padding.top = dim; }
-    if let Some(dim) = parse_length_percentage(&styled_node.computed.padding[1], vw, vh, font_size) { style.padding.right = dim; }
-    if let Some(dim) = parse_length_percentage(&styled_node.computed.padding[2], vw, vh, font_size) { style.padding.bottom = dim; }
-    if let Some(dim) = parse_length_percentage(&styled_node.computed.padding[3], vw, vh, font_size) { style.padding.left = dim; }
+    if let Some(dim) = parse_length_percentage(&computed.padding[0], vw, vh, font_size) { style.padding.top = dim; }
+    if let Some(dim) = parse_length_percentage(&computed.padding[1], vw, vh, font_size) { style.padding.right = dim; }
+    if let Some(dim) = parse_length_percentage(&computed.padding[2], vw, vh, font_size) { style.padding.bottom = dim; }
+    if let Some(dim) = parse_length_percentage(&computed.padding[3], vw, vh, font_size) { style.padding.left = dim; }
 
-    if let Some(dim) = parse_length_percentage(&styled_node.computed.border_width[0], vw, vh, font_size) { style.border.top = dim; }
-    if let Some(dim) = parse_length_percentage(&styled_node.computed.border_width[1], vw, vh, font_size) { style.border.right = dim; }
-    if let Some(dim) = parse_length_percentage(&styled_node.computed.border_width[2], vw, vh, font_size) { style.border.bottom = dim; }
-    if let Some(dim) = parse_length_percentage(&styled_node.computed.border_width[3], vw, vh, font_size) { style.border.left = dim; }
+    if let Some(dim) = parse_length_percentage(&computed.border_width[0], vw, vh, font_size) { style.border.top = dim; }
+    if let Some(dim) = parse_length_percentage(&computed.border_width[1], vw, vh, font_size) { style.border.right = dim; }
+    if let Some(dim) = parse_length_percentage(&computed.border_width[2], vw, vh, font_size) { style.border.bottom = dim; }
+    if let Some(dim) = parse_length_percentage(&computed.border_width[3], vw, vh, font_size) { style.border.left = dim; }
 
     if matches!(
-        document.nodes.get(styled_node.node_id),
+        document.nodes.get(node_id),
         Some(crate::dom::Node::Text(_))
     ) {
         tree.new_leaf_with_context(
             style,
             TextMeasureContext {
-                node_id: styled_node.node_id,
+                node_id,
                 font_size,
             },
         )
         .unwrap()
     } else {
-        let taffy_children = styled_node
-            .children
-            .iter()
-            .map(|child| build_taffy_node(tree, document, child, vw, vh))
-            .collect::<Vec<_>>();
+        let mut taffy_children = Vec::new();
+        let mut child_id = document.first_child_of(node_id);
+        while let Some(c) = child_id {
+            taffy_children.push(build_taffy_node(tree, document, c, vw, vh));
+            child_id = document.next_sibling_of(c);
+        }
 
         tree.new_with_children(style, &taffy_children).unwrap()
     }

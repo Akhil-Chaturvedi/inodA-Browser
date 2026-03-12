@@ -4,9 +4,9 @@
 //! `Document` in a single pass. Implicit tag auto-closing walks up the
 //! ancestor chain to find the matching tag before block-level boundaries.
 //!
-//! Content inside `<script>` and `<style>` tags is treated as raw text and
-//! not parsed as HTML. CSS text from `<style>` elements is collected into
-//! `Document::style_texts`.
+//! Content inside `<script>` and `<style>` tags is treated as raw text.
+//! CSS text from `<style>` elements is parsed immediately into
+//! `document.stylesheet` via `css::append_stylesheet()`.
 
 use html5gum::{Token, Tokenizer};
 use string_cache::DefaultAtom;
@@ -92,9 +92,9 @@ pub fn parse_html(html: &str) -> Document {
 
                         if &*k_atom == "class" {
                             for c in v_str.split_whitespace() {
-                                let class_atom = DefaultAtom::from(c);
-                                if !classes.contains(&class_atom) {
-                                    classes.push(class_atom);
+                                let class_string = c.to_string();
+                                if !classes.contains(&class_string) {
+                                    classes.push(class_string);
                                 }
                             }
                         } else if &*k_atom == "id" {

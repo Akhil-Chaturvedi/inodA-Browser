@@ -145,6 +145,8 @@ pub struct JsEngine {
     pending_timers: Rc<RefCell<std::collections::BinaryHeap<PendingTimer>>>,
     /// Track cancelled timers natively preventing runaway intervals.
     cancelled_timers: Rc<RefCell<std::collections::HashSet<u32>>>,
+    /// Track iterations for deterministic QuickJS garbage collection.
+    pump_ticks: Rc<Cell<u32>>,
 }
 
 impl JsEngine {
@@ -159,6 +161,7 @@ impl JsEngine {
             next_timer_id: Rc::new(Cell::new(1)),
             pending_timers: Rc::new(RefCell::new(std::collections::BinaryHeap::new())),
             cancelled_timers: Rc::new(RefCell::new(std::collections::HashSet::new())),
+            pump_ticks: Rc::new(Cell::new(0)),
         };
 
         engine.init_web_api();
@@ -244,9 +247,9 @@ impl JsEngine {
                         if &*local_attr == "class" {
                             data.classes.clear();
                             for c in value.split_whitespace() {
-                                let class_atom = string_cache::DefaultAtom::from(c);
-                                if !data.classes.contains(&class_atom) {
-                                    data.classes.push(class_atom);
+                                let class_string = c.to_string();
+                                if !data.classes.contains(&class_string) {
+                                    data.classes.push(class_string);
                                 }
                             }
                         }
@@ -542,6 +545,7 @@ impl JsEngine {
     pub fn pump(&self) -> u32 {
         let now = Instant::now();
         let mut expired = Vec::new();
+        let mut rescheduled = Vec::new();
         {
             let mut timers = self.pending_timers.borrow_mut();
             let mut cancelled = self.cancelled_timers.borrow_mut();
@@ -555,7 +559,7 @@ impl JsEngine {
                     expired.push(timer.callback.clone());
                     
                     if timer.is_interval {
-                        timers.push(PendingTimer {
+                        rescheduled.push(PendingTimer {
                             id: timer.id,
                             fire_at: now + std::time::Duration::from_millis(timer.delay_ms),
                             callback: timer.callback,
@@ -567,6 +571,10 @@ impl JsEngine {
                     break;
                 }
             }
+            
+            for t in rescheduled {
+                timers.push(t);
+            }
         }
 
         let count = expired.len() as u32;
@@ -577,6 +585,16 @@ impl JsEngine {
                 }
             });
         }
+        
+        // Deterministic GC limit mapping
+        let ticks = self.pump_ticks.get();
+        if ticks > 60 {
+            self.runtime.run_gc(); // Sweep abandoned closures + DOM Nodes deterministically
+            self.pump_ticks.set(0);
+        } else {
+            self.pump_ticks.set(ticks + 1);
+        }
+        
         count
     }
 

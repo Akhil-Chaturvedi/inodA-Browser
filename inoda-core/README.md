@@ -39,7 +39,9 @@ src/
 
 Tag names are stored as `LocalName`, which is either `Standard(DefaultAtom)` for known HTML elements (interned, pointer-equality comparison) or `Custom(String)` for custom element names. This prevents unbounded growth of the global intern pool from arbitrary names passed through `document.createElement`.
 
-Attribute keys are interned as `DefaultAtom`. Element classes are stored in a `Vec<DefaultAtom>` rather than a `HashSet` to reduce per-element memory overhead.
+Tag names are stored as `LocalName`, which is either `Standard(DefaultAtom)` for known HTML elements (interned, pointer-equality comparison) or `Custom(String)` for custom element names. This prevents unbounded growth of the global intern pool from arbitrary names passed through `document.createElement`.
+
+Attribute keys for known HTML attributes are interned as `DefaultAtom`. Element classes are stored in a `Vec<String>` rather than `Vec<DefaultAtom>`. CSS class names are uncontrolled user input -- frameworks like Tailwind or CSS-in-JS generate thousands of randomized class names per session. Interning them as `DefaultAtom` would grow the global pool permanently and never release memory. ID values are also stored as `String` for the same reason.
 
 `ComputedStyle` is stored directly on `ElementData` and `TextData`, populated once during `css::compute_styles()`. Layout and rendering read from `computed` fields without scanning style tuples.
 
@@ -66,7 +68,7 @@ Content inside `<script>` and `<style>` is accumulated as raw text via an `insid
 - Property values are parsed into typed `StyleValue` enums (`LengthPx`, `Percent`, `ViewportWidth`, `ViewportHeight`, `Em`, `Rem`, `Color`, `Keyword`, `Number`, `Auto`, `None`) during the cascade. Layout and rendering operate on these enum variants, not strings.
 - Property names in `Declaration` use `PropertyName`, a strongly-typed enum (`Display`, `Width`, `MarginTop`, `FontSize`, etc.) with an `Other(u64)` fallback. This makes property matching during cascade an integer comparison rather than a string deref.
 - Specificity is computed as `(id_count, class_count, tag_count)` at parse time and stored on each `ComplexSelector`.
-- Rules are stored in `HashMap<DefaultAtom, Vec<IndexedRule>>` buckets keyed by tag, class, and ID. Each rule carries a `rule_index` for stable source-order tie-breaking. Matching buckets are merged in a single k-way pointer walk over pre-sorted slices.
+- Rules are stored in `HashMap<String, Vec<IndexedRule>>` buckets keyed by class and ID (plain `String`), and `HashMap<DefaultAtom, Vec<IndexedRule>>` keyed by tag (bounded set of known tag names; interning is safe here). Class and ID keys are not interned because they are uncontrolled user input.
 - `compute_styles()` walks the arena DOM recursively, evaluates combinators (`>`, space) by walking arena parent pointers, populates `ComputedStyle` on each node via direct `PropertyName` enum matching.
 - Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent. Only inheritable properties are passed to children; non-inheritable properties like `width` or `margin` are filtered before recursing. Shared vectors use `Rc` to avoid copying.
 - `font-size` expressed as `Em` multiplies against the parent's resolved `font_size`. `Rem` always uses 16px as root baseline. Both are resolved during the cascade; the result stored in `computed.font_size` is always absolute pixels.
@@ -97,7 +99,7 @@ Properties not wired: `align-items`, `justify-content`, `gap`, `flex-wrap`, `fle
 Recursively walks the Taffy layout tree alongside the arena DOM and issues backend draw calls:
 - Background rectangles (`background-color`)
 - Border strokes (`border-color`)
-- Text via `RendererBackend::draw_glyphs()` with pre-shaped `cosmic_text::LayoutGlyph` iterators
+- Text: calls `draw_glyphs` once per `LayoutRun` from `buffer.layout_runs()`, passing `run.glyphs` (a `&[LayoutGlyph]` slice borrowed directly from the pre-shaped buffer) and `abs_y + run.line_y` as the vertical position. No intermediate `Vec` is allocated in the render loop.
 
 Draw properties are read directly from `ComputedStyle` fields on each arena node. There is no intermediate draw cache or separate text layout struct.
 
@@ -130,7 +132,11 @@ The `__nodeCache` Map is keyed by a `BigInt` value: `BigInt(index) | (BigInt(gen
 
 `NodeHandle` does not implement `Drop`. Nodes created via JavaScript persist in the arena until explicitly removed via `removeChild()`. This prevents QuickJS GC from invalidating arena slots for nodes that are still attached to the tree.
 
-Timer callbacks are stored as `rquickjs::Persistent<Function>`. Pending timers are in a `BinaryHeap` sorted by `fire_at`. Cancelled timer IDs are tracked in a `HashSet<u32>`; `pump()` skips popped timers whose IDs appear in the set. When an interval timer fires, a new `PendingTimer` is pushed with the next scheduled time. The host application must call `pump()` on its event loop tick.
+`NodeHandle` does not implement `Drop`. Nodes created via JavaScript persist in the arena until explicitly removed via `removeChild()`. This prevents QuickJS GC from invalidating arena slots for nodes that are still attached to the tree.
+
+Timer callbacks are stored as `rquickjs::Persistent<Function>`. Pending timers are in a `BinaryHeap` sorted by `fire_at`. Cancelled timer IDs are tracked in a `HashSet<u32>`; `pump()` skips popped timers whose IDs appear in the set. When an interval timer fires, a new `PendingTimer` is pushed with the next scheduled time. Rescheduled interval timers are collected into a separate local `Vec` before being pushed back to the heap; this prevents `setInterval(cb, 0)` from re-appearing at the top of the heap within the same `pump()` call and locking the loop.
+
+`JsEngine` maintains a `pump_ticks` counter. Every 60 calls to `pump()`, `runtime.run_gc()` is called synchronously. QuickJS defers `FinalizationRegistry` callbacks by default; without this periodic sweep, detached arena nodes accumulate until the host runs out of memory. The host application must call `pump()` on its event loop tick.
 
 ## Building
 

@@ -179,7 +179,7 @@ impl PropertyName {
 pub struct ElementData {
     pub tag_name: LocalName,
     pub attributes: Vec<(string_cache::DefaultAtom, String)>,
-    pub classes: Vec<string_cache::DefaultAtom>,
+    pub classes: Vec<String>,
     pub parent: Option<NodeId>,
     pub first_child: Option<NodeId>,
     pub last_child: Option<NodeId>,

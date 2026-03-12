@@ -63,14 +63,17 @@ pub fn draw_layout_tree<R: RendererBackend>(
 
         if let crate::dom::Node::Text(_) = document.nodes.get(node_id).unwrap() {
             let buffer = buffer_cache.get_mut(&node_id).unwrap();
+            let color = Color { r: computed.color.0, g: computed.color.1, b: computed.color.2 };
             
-            renderer.draw_glyphs(
-                abs_x,
-                abs_y,
-                buffer.layout_runs().flat_map(|run| run.glyphs.iter().cloned()).collect::<Vec<_>>().as_slice(),
-                computed.font_size,
-                Color { r: computed.color.0, g: computed.color.1, b: computed.color.2 },
-            );
+            for run in buffer.layout_runs() {
+                renderer.draw_glyphs(
+                    abs_x,
+                    abs_y + run.line_y,
+                    run.glyphs,
+                    computed.font_size,
+                    color,
+                );
+            }
         } else if let Ok(children) = layout_tree.children(layout_node_id) {
             let mut dom_child_id = document.first_child_of(node_id);
             for taffy_child in children {

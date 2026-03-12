@@ -63,8 +63,8 @@ pub struct IndexedRule {
 
 #[derive(Debug, Default, Clone)]
 pub struct StyleSheet {
-    pub by_id: std::collections::HashMap<string_cache::DefaultAtom, Vec<IndexedRule>>,
-    pub by_class: std::collections::HashMap<string_cache::DefaultAtom, Vec<IndexedRule>>,
+    pub by_id: std::collections::HashMap<String, Vec<IndexedRule>>,
+    pub by_class: std::collections::HashMap<String, Vec<IndexedRule>>,
     pub by_tag: std::collections::HashMap<string_cache::DefaultAtom, Vec<IndexedRule>>,
     pub universal: Vec<IndexedRule>,
     pub next_rule_index: usize,
@@ -95,9 +95,9 @@ impl StyleSheet {
             }
 
             if let Some(id) = id_key {
-                self.by_id.entry(string_cache::DefaultAtom::from(id.as_str())).or_default().push(indexed);
+                self.by_id.entry(id.clone()).or_default().push(indexed);
             } else if let Some(class) = class_key {
-                self.by_class.entry(string_cache::DefaultAtom::from(class.as_str())).or_default().push(indexed);
+                self.by_class.entry(class.clone()).or_default().push(indexed);
             } else if let Some(tag) = tag_key {
                 self.by_tag.entry(string_cache::DefaultAtom::from(tag.as_str())).or_default().push(indexed);
             } else {
@@ -344,7 +344,7 @@ fn match_compound_selector(
     compound: &CompoundSelector,
     tag_name: &crate::dom::LocalName,
     attributes: &[(string_cache::DefaultAtom, String)],
-    classes: &[string_cache::DefaultAtom],
+    classes: &[String],
 ) -> bool {
     if compound.parts.is_empty() {
         return false;
@@ -363,8 +363,8 @@ fn match_compound_selector(
                 }
             }
             SimpleSelector::Class(c) => {
-                let atom = string_cache::DefaultAtom::from(c.as_str());
-                if !classes.contains(&atom) {
+                let class_string = c.to_string();
+                if !classes.contains(&class_string) {
                     return false;
                 }
             }
@@ -491,13 +491,13 @@ fn compute_node_styles_recursive(
                     .attributes
                     .iter()
                     .find(|(k, _)| &**k == "id")
-                    .map(|(_, v)| string_cache::DefaultAtom::from(v.as_str()));
+                    .map(|(_, v)| v.as_str());
 
                 let mut lists: Vec<&[IndexedRule]> = Vec::new();
 
                 for stylesheet in stylesheets {
                     if let Some(id) = &id_attr {
-                        if let Some(rules) = stylesheet.by_id.get(id) {
+                        if let Some(rules) = stylesheet.by_id.get(*id) {
                             lists.push(rules.as_slice());
                         }
                     }

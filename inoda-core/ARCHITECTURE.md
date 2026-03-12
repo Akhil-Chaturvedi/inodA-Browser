@@ -50,7 +50,7 @@ NodeId = generational_arena::Index  // type alias
 ElementData {
     tag_name: LocalName,                             // Standard(DefaultAtom) for HTML tags, Custom(String) for custom elements
     attributes: Vec<(string_cache::DefaultAtom, String)>,
-    classes: Vec<string_cache::DefaultAtom>,
+    classes: Vec<String>,                            // heap-allocated Strings; never interned to avoid global atom pool growth
     parent:       Option<NodeId>,
     first_child:  Option<NodeId>,
     last_child:   Option<NodeId>,
@@ -76,6 +76,8 @@ RootData {
 Generational indices prevent ABA problems. The DOM tree is wired as an intrusive linked list; mutations do not allocate child vectors. Node deletion uses an iterative queue rather than recursion to avoid stack overflow on deep trees.
 
 `LocalName` separates standard HTML tags (interned as `DefaultAtom`) from custom element names (heap-allocated `String`). This prevents unbounded growth of the global `DefaultAtom` intern pool when arbitrary custom element names are created from JavaScript.
+
+`ElementData::classes` stores each class token as a plain `String`. CSS class names are uncontrolled user input (modern frameworks generate randomized names like `css-1x8g9u`); interning them as `DefaultAtom` would cause the global intern pool to grow unboundedly and never shrink. ID values are also stored as `String` in `id_map` and are looked up by `&str`. Attribute keys for recognized HTML attributes (e.g. `id`, `class`, `style`) are still interned as `DefaultAtom` since the set of valid attribute names is bounded.
 
 ### ComputedStyle (dom/mod.rs)
 
@@ -111,8 +113,8 @@ StyleValue = LengthPx(f32) | Percent(f32) | ViewportWidth(f32) | ViewportHeight(
 
 ```
 StyleSheet {
-    by_id:    HashMap<DefaultAtom, Vec<IndexedRule>>,
-    by_class: HashMap<DefaultAtom, Vec<IndexedRule>>,
+    by_id:    HashMap<String, Vec<IndexedRule>>,
+    by_class: HashMap<String, Vec<IndexedRule>>,
     by_tag:   HashMap<DefaultAtom, Vec<IndexedRule>>,
     universal: Vec<IndexedRule>,
     next_rule_index: usize,
@@ -164,11 +166,13 @@ Combinator evaluation (`>` child, space descendant) walks arena parent pointers 
 
 Each DOM node exposed to JS carries a `__nodeKey` property: a two-element array `[u32 index, u64 generation]`. The `__nodeCache` Map is keyed by a `BigInt` value computed as `BigInt(index) | (BigInt(generation) << 32n)`. This avoids string allocation for cache keys. A `FinalizationRegistry` receives the integer array when QuickJS garbage-collects a wrapper; it recomputes the BigInt key for cache removal and calls `_garbageCollectNodeRaw` with the raw integer array. `_garbageCollectNodeRaw` reconstructs the `NodeId` directly from the two integers and removes the arena entry only if the node is not attached to the DOM tree.
 
+`JsEngine` also maintains a `pump_ticks` counter. Every 60 calls to `pump()`, `runtime.run_gc()` is called synchronously. This forces QuickJS to sweep `FinalizationRegistry` callbacks that it would otherwise defer indefinitely, preventing the arena from accumulating detached nodes until the host runs out of memory.
+
 `NodeHandle` does not implement `Drop`. Nodes created by JavaScript persist in the arena until explicitly removed via `removeChild()`. This prevents QuickJS garbage collection from triggering arena mutations on nodes that are still part of the tree.
 
 ## Text measurement
 
-A pre-pass in `prepare_text_buffers` creates a `cosmic-text::Buffer` for each text node, performing HarfBuzz shaping once before the layout solver runs. The buffer cache is caller-owned and persists across frames; entries for removed nodes are evicted by `buffer_cache.retain()` at the start of each `compute_layout` call.
+The text render loop calls `buffer.layout_runs()` and invokes `draw_glyphs` once per `LayoutRun`, passing `run.glyphs` (a `&[LayoutGlyph]` slice borrowed directly from the buffer) and `run.line_y` as the vertical offset. No intermediate `Vec` is allocated during the render pass.
 
 During `compute_layout_with_measure`, the measure closure calls `buffer.set_size()` and `buffer.shape_until_scroll()` to re-wrap text at the available width. After the layout solver finishes, `finalize_text_measurements` reshapes each buffer at its final resolved width. The renderer reads `LayoutGlyph` iterators directly from `buffer.layout_runs()`.
 

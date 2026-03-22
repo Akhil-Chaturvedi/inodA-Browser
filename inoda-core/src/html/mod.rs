@@ -120,6 +120,7 @@ pub fn parse_html(html: &str) -> Document {
                     next_sibling: None,
                     computed: crate::dom::ComputedStyle::default(),
                     taffy_node: None,
+                    js_handles: 0,
                 });
 
                 let node_id = doc.add_node(node);
@@ -219,6 +220,7 @@ pub fn parse_html(html: &str) -> Document {
                         next_sibling: None,
                         computed: crate::dom::ComputedStyle::default(),
                         taffy_node: None,
+                        js_handles: 0,
                     }));
                     doc.append_child(current_parent, id);
                 }

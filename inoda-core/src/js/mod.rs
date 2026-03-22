@@ -280,6 +280,69 @@ impl JsEngine {
             .unwrap();
             proto.set("removeChild", remove_child_func).unwrap();
 
+            let parent_node_func = rquickjs::Function::new(ctx.clone(), {
+                let doc_ref = doc_ref.clone();
+                move |This(this): This<rquickjs::Class<'_, NodeHandle>>| -> Option<NodeHandle> {
+                    let mut doc = doc_ref.borrow_mut();
+                    let node_id = this.borrow().to_node_id();
+                    if let Some(parent_id) = doc.parent_of(node_id) {
+                        if let Some(node) = doc.nodes.get_mut(parent_id) {
+                            let tag_name = match node {
+                                crate::dom::Node::Element(d) => { d.js_handles += 1; d.tag_name.to_string() },
+                                crate::dom::Node::Text(d) => { d.js_handles += 1; "text".to_string() },
+                                crate::dom::Node::Root(d) => { d.js_handles += 1; "root".to_string() },
+                            };
+                            return Some(NodeHandle::from_node_id(parent_id, tag_name));
+                        }
+                    }
+                    None
+                }
+            })
+            .unwrap();
+            proto.set("parentNode", parent_node_func).unwrap();
+
+            let first_child_func = rquickjs::Function::new(ctx.clone(), {
+                let doc_ref = doc_ref.clone();
+                move |This(this): This<rquickjs::Class<'_, NodeHandle>>| -> Option<NodeHandle> {
+                    let mut doc = doc_ref.borrow_mut();
+                    let node_id = this.borrow().to_node_id();
+                    if let Some(child_id) = doc.first_child_of(node_id) {
+                        if let Some(node) = doc.nodes.get_mut(child_id) {
+                            let tag_name = match node {
+                                crate::dom::Node::Element(d) => { d.js_handles += 1; d.tag_name.to_string() },
+                                crate::dom::Node::Text(d) => { d.js_handles += 1; "text".to_string() },
+                                crate::dom::Node::Root(d) => { d.js_handles += 1; "root".to_string() },
+                            };
+                            return Some(NodeHandle::from_node_id(child_id, tag_name));
+                        }
+                    }
+                    None
+                }
+            })
+            .unwrap();
+            proto.set("firstChild", first_child_func).unwrap();
+
+            let next_sibling_func = rquickjs::Function::new(ctx.clone(), {
+                let doc_ref = doc_ref.clone();
+                move |This(this): This<rquickjs::Class<'_, NodeHandle>>| -> Option<NodeHandle> {
+                    let mut doc = doc_ref.borrow_mut();
+                    let node_id = this.borrow().to_node_id();
+                    if let Some(sibling_id) = doc.next_sibling_of(node_id) {
+                        if let Some(node) = doc.nodes.get_mut(sibling_id) {
+                            let tag_name = match node {
+                                crate::dom::Node::Element(d) => { d.js_handles += 1; d.tag_name.to_string() },
+                                crate::dom::Node::Text(d) => { d.js_handles += 1; "text".to_string() },
+                                crate::dom::Node::Root(d) => { d.js_handles += 1; "root".to_string() },
+                            };
+                            return Some(NodeHandle::from_node_id(sibling_id, tag_name));
+                        }
+                    }
+                    None
+                }
+            })
+            .unwrap();
+            proto.set("nextSibling", next_sibling_func).unwrap();
+
             // --- console object ---
             let console_obj = rquickjs::Object::new(ctx.clone()).unwrap();
 
@@ -310,9 +373,10 @@ impl JsEngine {
             let get_by_id_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
                 move |id: String| -> Option<NodeHandle> {
-                    let doc = doc_ref.borrow();
+                    let mut doc = doc_ref.borrow_mut();
                     if let Some(&node_id) = doc.id_map.get(&id) {
-                        if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
+                        if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
+                            data.js_handles += 1;
                             return Some(NodeHandle::from_node_id(
                                 node_id,
                                 data.tag_name.to_string(),
@@ -332,7 +396,10 @@ impl JsEngine {
             let query_selector_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
                 move |selector: String| -> Option<NodeHandle> {
-                    let doc = doc_ref.borrow();
+                    let mut doc = doc_ref.borrow_mut();
+                    let mut found_id = None;
+                    let mut tag_name = String::new();
+                    
                     for (node_id, node) in doc.nodes.iter() {
                         if let crate::dom::Node::Element(data) = node {
                             let is_match = if selector.starts_with('.') {
@@ -348,12 +415,22 @@ impl JsEngine {
                             };
 
                             if is_match {
-                                return Some(NodeHandle::from_node_id(
-                                    node_id,
-                                    data.tag_name.to_string(),
-                                ));
+                                found_id = Some(node_id);
+                                tag_name = data.tag_name.to_string();
+                                break;
                             }
                         }
+                    }
+
+                    if let Some(node_id) = found_id {
+                        if let Some(node) = doc.nodes.get_mut(node_id) {
+                            match node {
+                                crate::dom::Node::Element(d) => d.js_handles += 1,
+                                crate::dom::Node::Text(d) => d.js_handles += 1,
+                                crate::dom::Node::Root(d) => d.js_handles += 1,
+                            }
+                        }
+                        return Some(NodeHandle::from_node_id(node_id, tag_name));
                     }
                     None
                 }
@@ -395,6 +472,7 @@ impl JsEngine {
                         next_sibling: None,
                         computed: crate::dom::ComputedStyle::default(),
                         taffy_node: None,
+                        js_handles: 1, // Start with 1 as we return it to JS
                     });
                     let index = doc.add_node(node);
                     drop(doc);
@@ -429,12 +507,7 @@ impl JsEngine {
                     {
                         let node_id = NodeId::from_raw_parts(idx as usize, gen_val);
                         let mut doc = doc_ref.borrow_mut();
-
-                        // If the JS wrapper is garbage collected AND the node is unattached,
-                        // safely wipe it from the Rust Arena freeing memory.
-                        if !doc.is_attached_to_root(node_id) && node_id != doc.root_id {
-                            doc.remove_node(node_id);
-                        }
+                        doc.try_cleanup_node(node_id);
                     }
                 }
             })

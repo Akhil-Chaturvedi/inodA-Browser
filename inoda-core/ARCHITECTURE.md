@@ -9,16 +9,18 @@ HTML string
   |
   v
 html::parse_html()          -- html5gum token loop -> arena DOM (Document)
-  |                            <style> tag text is parsed immediately into
-  |                            document.stylesheet via css::append_stylesheet()
+  |                            <style> tag mutations set document.styles_dirty = true
   v
-css::compute_styles()       -- walks the arena DOM recursively,
+css::compute_styles()       -- rebuilds document.stylesheet if styles_dirty,
+  |                            walks the arena DOM recursively,
   |                            resolves specificity against StyleSheet hash-map buckets,
   |                            evaluates combinators by walking parent pointers,
   |                            populates ComputedStyle in-place on each ElementData/TextData
   v
-layout::compute_layout()    -- pre-populates cosmic-text::Buffer for each text node,
+layout::compute_layout()    -- prepares text buffers in a pre-pass,
+  |                            calculates max/min intrinsic widths,
   |                            builds a TaffyTree from the arena DOM,
+  |                            uses O(1) metrics for measure estimations,
   |                            resolves dimensions (px, %, vw, vh, em, rem, auto),
   |                            runs Taffy flexbox/grid solver -> positioned Layout tree
   v
@@ -28,7 +30,9 @@ render::draw_layout_tree()  -- walks Taffy layout tree alongside the arena DOM,
                                draw_glyphs (text content)
 ```
 
-JavaScript execution is separate from this pipeline. The host creates a `JsEngine`, passing in the `Document` behind `Rc<RefCell<Document>>`. JS mutations set `document.dirty = true`. The host application is responsible for checking `dirty` and re-running `compute_styles`, `compute_layout`, and `draw_layout_tree` after JS mutations. Timer callbacks registered via `setTimeout` or `setInterval` fire only when the host calls `JsEngine::pump()`.
+JavaScript execution is separate from this pipeline. DOM nodes exposed to JS carry a `js_handles` reference count. QuickJS wrapper objects are tracked by a `FinalizationRegistry`; when GC'd, they decrement the `js_handles` count for the corresponding Rust arena node. Detached nodes are only wiped from the arena when no JS handles remain.
+
+JS mutations set `document.dirty = true`. The host application is responsible for checking `dirty` and re-running `compute_styles`, `compute_layout`, and `draw_layout_tree` after JS mutations. Timer callbacks registered via `setTimeout` or `setInterval` fire only when the host calls `JsEngine::pump()`. Every 60 ticks, `runtime.run_gc()` is called to process the `FinalizationRegistry` and release unreferenced nodes.
 
 ## Data structures
 
@@ -42,6 +46,7 @@ Document {
     id_map: HashMap<String, NodeId>, // O(1) getElementById lookup
     dead_nodes: Vec<NodeId>,         // iterative deletion queue for remove_node
     dirty: bool,                     // set true by JS DOM mutations, cleared by host after re-render
+    styles_dirty: bool,              // set true when <style> tags change, triggers rebuild
 }
 
 Node = Element(ElementData) | Text(TextData) | Root(RootData)
@@ -57,6 +62,7 @@ ElementData {
     prev_sibling: Option<NodeId>,
     next_sibling: Option<NodeId>,
     computed: ComputedStyle,          // populated by css::compute_styles()
+    js_handles: usize,                // reference count for JS engine
 }
 
 TextData {
@@ -65,11 +71,13 @@ TextData {
     prev_sibling: Option<NodeId>,
     next_sibling: Option<NodeId>,
     computed: ComputedStyle,
+    js_handles: usize,
 }
 
 RootData {
     first_child: Option<NodeId>,
     last_child:  Option<NodeId>,
+    js_handles:  usize,
 }
 ```
 

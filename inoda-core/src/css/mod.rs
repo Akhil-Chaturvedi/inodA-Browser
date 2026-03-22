@@ -476,6 +476,10 @@ pub fn parse_stylesheet(css: &str) -> StyleSheet {
 }
 
 pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &StyleSheet) {
+    if document.styles_dirty {
+        document.rebuild_styles();
+    }
+
     let doc_sheet = std::mem::take(&mut document.stylesheet);
 
     compute_node_styles_recursive(

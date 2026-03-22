@@ -168,6 +168,7 @@ mod tests {
             next_sibling: None,
             computed: dom::ComputedStyle::default(),
             taffy_node: None,
+            js_handles: 0,
         }));
 
         let child = doc.add_node(dom::Node::Element(dom::ElementData {
@@ -181,6 +182,7 @@ mod tests {
             next_sibling: None,
             computed: dom::ComputedStyle::default(),
             taffy_node: None,
+            js_handles: 0,
         }));
 
         let grandchild = doc.add_node(dom::Node::Text(dom::TextData {
@@ -190,6 +192,7 @@ mod tests {
             next_sibling: None,
             computed: dom::ComputedStyle::default(),
             taffy_node: None,
+            js_handles: 0,
         }));
 
         doc.append_child(doc.root_id, parent);

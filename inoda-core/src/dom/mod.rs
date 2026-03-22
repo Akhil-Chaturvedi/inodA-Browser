@@ -20,6 +20,8 @@ use generational_arena::{Arena, Index};
 pub struct TextMeasureContext {
     pub node_id: NodeId,
     pub font_size: f32,
+    pub max_intrinsic_width: f32,
+    pub min_intrinsic_width: f32,
 }
 
 /// A DOM document backed by a generational arena.
@@ -34,6 +36,8 @@ pub struct Document {
     pub dead_nodes: Vec<NodeId>,
     /// Layout invalidation flag. True if DOM was mutated since the last render.
     pub dirty: bool,
+    /// Stylesheet invalidation flag. True if `<style>` tags were added or removed.
+    pub styles_dirty: bool,
     pub taffy_tree: taffy::TaffyTree<TextMeasureContext>,
 }
 
@@ -288,6 +292,7 @@ pub struct ElementData {
     pub next_sibling: Option<NodeId>,
     pub computed: ComputedStyle,
     pub taffy_node: Option<taffy::NodeId>,
+    pub js_handles: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -298,6 +303,7 @@ pub struct TextData {
     pub next_sibling: Option<NodeId>,
     pub computed: ComputedStyle,
     pub taffy_node: Option<taffy::NodeId>,
+    pub js_handles: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -305,6 +311,7 @@ pub struct RootData {
     pub first_child: Option<NodeId>,
     pub last_child: Option<NodeId>,
     pub taffy_node: Option<taffy::NodeId>,
+    pub js_handles: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -378,6 +385,7 @@ impl Default for Document {
             first_child: None,
             last_child: None,
             taffy_node: None,
+            js_handles: 0,
         }));
         Document {
             nodes: arena,
@@ -386,6 +394,7 @@ impl Default for Document {
             id_map: std::collections::HashMap::new(),
             dead_nodes: Vec::new(),
             dirty: true,
+            styles_dirty: true,
             taffy_tree: taffy::TaffyTree::new(),
         }
     }
@@ -409,40 +418,165 @@ impl Document {
 
     pub fn remove_node(&mut self, id: NodeId) -> Option<Node> {
         self.dirty = true;
+        
+        let node_copy = self.nodes.get(id).cloned();
+
         // 1. Unlink from parent and siblings
         if let Some(parent_id) = self.parent_of(id) {
             self.remove_child(parent_id, id);
         }
 
-        self.dead_nodes.push(id);
-        let mut root_node = None;
+        // 2. If it's now detached and the whole tree has 0 handles, wipe it.
+        // This keeps the Arena clean for non-JS-referenced nodes.
+        if id != self.root_id && self.can_wipe_detached_tree(id) {
+            self.wipe_node_recursive(id);
+        }
 
-        while let Some(current_id) = self.dead_nodes.pop() {
-            let mut current_child = self.first_child_of(current_id);
-            while let Some(child_id) = current_child {
-                current_child = self.next_sibling_of(child_id);
-                self.dead_nodes.push(child_id);
+        node_copy
+    }
+
+    /// Recursively wipes a node and its descendants from the arena.
+    /// Internal use only, assumes node is already detached from the root-connected tree.
+    fn wipe_node_recursive(&mut self, id: NodeId) {
+        let mut to_wipe = vec![id];
+        while let Some(current_id) = to_wipe.pop() {
+            let mut child = self.first_child_of(current_id);
+            while let Some(c) = child {
+                to_wipe.push(c);
+                child = self.next_sibling_of(c);
             }
 
             if let Some(node) = self.nodes.remove(current_id) {
-                if let Node::Element(ref data) = node {
+                if let Node::Element(data) = &node {
                     if let Some((_, id_val)) = data.attributes.iter().find(|(k, _)| &**k == "id") {
                         if self.id_map.get(id_val) == Some(&current_id) {
                             self.id_map.remove(id_val);
                         }
                     }
                 }
-                if current_id == id {
-                    root_node = Some(node);
+            }
+        }
+    }
+
+    /// Checks if a detached tree can be safely deleted.
+    /// Returns true if no node in the tree (starting from `id`) has any active JS handles.
+    pub fn can_wipe_detached_tree(&self, id: NodeId) -> bool {
+        let mut stack = vec![id];
+        while let Some(current_id) = stack.pop() {
+            let node = match self.nodes.get(current_id) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            let handles = match node {
+                Node::Element(d) => d.js_handles,
+                Node::Text(d) => d.js_handles,
+                Node::Root(d) => d.js_handles,
+            };
+
+            if handles > 0 {
+                return false;
+            }
+
+            let mut child = self.first_child_of(current_id);
+            while let Some(c) = child {
+                stack.push(c);
+                child = self.next_sibling_of(c);
+            }
+        }
+        true
+    }
+
+    /// Invoked by the GC bridge when a JS NodeHandle is dropped.
+    pub fn try_cleanup_node(&mut self, id: NodeId) {
+        if let Some(node) = self.nodes.get_mut(id) {
+            let handles = match node {
+                Node::Element(d) => &mut d.js_handles,
+                Node::Text(d) => &mut d.js_handles,
+                Node::Root(d) => &mut d.js_handles,
+            };
+            if *handles > 0 {
+                *handles -= 1;
+            }
+        }
+
+        // If it's now detached and the whole tree has 0 handles, wipe it.
+        // We find the "detached root" first.
+        let mut detached_root = id;
+        while let Some(parent) = self.parent_of(detached_root) {
+            detached_root = parent;
+        }
+
+        if detached_root != self.root_id && self.can_wipe_detached_tree(detached_root) {
+            self.wipe_node_recursive(detached_root);
+        }
+    }
+
+    /// Rebuilds the internal stylesheet by collecting all currently attached `<style>` tags.
+    pub fn rebuild_styles(&mut self) {
+        if !self.styles_dirty {
+            return;
+        }
+
+        let mut all_css = String::new();
+        let mut stack = vec![self.root_id];
+
+        while let Some(id) = stack.pop() {
+            if let Some(node) = self.nodes.get(id) {
+                match node {
+                    Node::Element(data) => {
+                        if &*data.tag_name == "style" {
+                            // Collect inner text from children
+                            let mut child_id = data.first_child;
+                            while let Some(c) = child_id {
+                                if let Some(Node::Text(text_data)) = self.nodes.get(c) {
+                                    all_css.push_str(&text_data.text);
+                                }
+                                child_id = self.next_sibling_of(c);
+                            }
+                        }
+
+                        // Traverse children (reverse for stack)
+                        let mut children = Vec::new();
+                        let mut child_id = data.first_child;
+                        while let Some(c) = child_id {
+                            children.push(c);
+                            child_id = self.next_sibling_of(c);
+                        }
+                        for c in children.into_iter().rev() {
+                            stack.push(c);
+                        }
+                    }
+                    Node::Root(data) => {
+                        let mut children = Vec::new();
+                        let mut child_id = data.first_child;
+                        while let Some(c) = child_id {
+                            children.push(c);
+                            child_id = self.next_sibling_of(c);
+                        }
+                        for c in children.into_iter().rev() {
+                            stack.push(c);
+                        }
+                    }
+                    Node::Text(_) => {}
                 }
             }
         }
 
-        root_node
+        self.stylesheet = crate::css::parse_stylesheet(&all_css);
+        self.styles_dirty = false;
     }
 
     pub fn append_child(&mut self, parent_id: NodeId, child_id: NodeId) {
         self.dirty = true;
+        
+        // If we are appending a <style> tag, mark styles as dirty
+        if let Some(Node::Element(data)) = self.nodes.get(child_id) {
+            if &*data.tag_name == "style" {
+                self.styles_dirty = true;
+            }
+        }
+
         if let Some(old_parent) = self.parent_of(child_id) {
             self.remove_child(old_parent, child_id);
         }
@@ -478,6 +612,14 @@ impl Document {
 
     pub fn remove_child(&mut self, parent_id: NodeId, child_id: NodeId) {
         self.dirty = true;
+        
+        // If we are removing a <style> tag, mark styles as dirty
+        if let Some(Node::Element(data)) = self.nodes.get(child_id) {
+            if &*data.tag_name == "style" {
+                self.styles_dirty = true;
+            }
+        }
+
         let prev = self.prev_sibling_of(child_id);
         let next = self.next_sibling_of(child_id);
 

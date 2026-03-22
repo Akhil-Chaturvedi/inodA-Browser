@@ -51,6 +51,7 @@ Attribute keys for known HTML attributes are interned as `DefaultAtom`. Element 
 - `id_map: HashMap<String, NodeId>` -- O(1) `getElementById` lookup
 - `dead_nodes: Vec<NodeId>` -- iterative deletion queue used by `remove_node`
 - `dirty: bool` -- set `true` by JS DOM mutations; the host must re-run compute/layout/render when true
+- `styles_dirty: bool` -- tracks if `<style>` tags were added or removed, triggering a clean stylesheet rebuild.
 
 Node deletion is iterative (queue-based) to avoid stack overflow on deeply nested trees.
 
@@ -70,17 +71,17 @@ Content inside `<script>` and `<style>` is accumulated as raw text via an `insid
 - Specificity is computed as `(id_count, class_count, tag_count)` at parse time and stored on each `ComplexSelector`.
 - Rules are stored in `HashMap<String, Vec<IndexedRule>>` buckets keyed by class and ID (plain `String`), and `HashMap<DefaultAtom, Vec<IndexedRule>>` keyed by tag (bounded set of known tag names; interning is safe here). Class and ID keys are not interned because they are uncontrolled user input.
 - `compute_styles()` walks the arena DOM recursively, evaluates combinators (`>`, space) by walking arena parent pointers, populates `ComputedStyle` on each node via direct `PropertyName` enum matching.
-- Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent. Only inheritable properties are passed to children; non-inheritable properties like `width` or `margin` are filtered before recursing. Shared vectors use `Rc` to avoid copying.
+- Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent. Only inheritable properties are passed to children; non-inheritable properties like `width` or `margin` are filtered before recursing. Values are copied directly from the parent's resolved style to avoid redundant allocations.
 - `font-size` expressed as `Em` multiplies against the parent's resolved `font_size`. `Rem` always uses 16px as root baseline. Both are resolved during the cascade; the result stored in `computed.font_size` is always absolute pixels.
 - Expands `margin`, `padding` shorthands (1/2/4-value) and maps `background` to `background-color`.
 - Inline `style=""` attributes are parsed via `cssparser`'s `DeclarationParser` trait and applied after stylesheet rules.
-- `document.stylesheet` is persistent and updated incrementally. It is not reconstructed or re-sorted on every frame.
+- `document.stylesheet` is persistent but invalidates via `rebuild_styles()` when the DOM is mutated. Only rules from currently attached `<style>` tags are preserved, preventing memory leaks from removed nodes.
 
 ### layout
 
-Walks the arena DOM and builds a parallel `TaffyTree<TextMeasureContext>`. A pre-pass creates `cosmic-text::Buffer` objects for all text nodes, performing HarfBuzz shaping once before the solver runs. The buffer cache is caller-owned and persists across frames; entries for removed nodes are evicted via `retain()` at the start of `compute_layout`.
+Walks the arena DOM and builds a parallel `TaffyTree<TextMeasureContext>`. `prepare_text_buffers` performs HarfBuzz shaping in a pre-pass to calculate `max_intrinsic_width` and `min_intrinsic_width`. The buffer cache is caller-owned and persists across frames.
 
-The Taffy measure closure calls `buffer.set_size()` to adjust the width constraint, then `buffer.shape_until_scroll()` to re-wrap text. After layout completes, `finalize_text_measurements` reshapes each buffer at its final resolved width.
+The Taffy measure closure uses these pre-calculated metrics for $O(1)$ height estimations, avoiding expensive shaping during the layout solver loop. After Taffy converges, `finalize_text_measurements` performs the final shaping at the confirmed resolved width.
 
 Layout properties are read from `computed` fields on each arena node.
 

@@ -41,7 +41,7 @@ pub fn compute_layout(
     prepare_text_buffers(document, document.root_id, font_system, buffer_cache);
 
     let root_taffy_node =
-        build_taffy_node(document, document.root_id, viewport_width, viewport_height);
+        build_taffy_node(document, document.root_id, viewport_width, viewport_height, buffer_cache);
 
     let tree = &mut document.taffy_tree;
     let available_space = Size {
@@ -49,8 +49,7 @@ pub fn compute_layout(
         height: AvailableSpace::Definite(viewport_height),
     };
 
-    let font_system = RefCell::new(font_system);
-    let buffer_cache_cell = RefCell::new(&mut *buffer_cache);
+    let font_system_cell = RefCell::new(font_system);
 
     tree.compute_layout_with_measure(
         root_taffy_node,
@@ -69,33 +68,17 @@ pub fn compute_layout(
                 _ => viewport_width.max(1.0),
             };
 
-            let mut sys = font_system.borrow_mut();
-            let mut b_cache = buffer_cache_cell.borrow_mut();
+            // $O(1)$ Estimation: height = ceil(max_width / width_constraint) * line_height
+            // This avoids HarfBuzz shaping in the tight Flexbox loop.
+            let width = ctx.max_intrinsic_width.min(width_constraint);
+            let line_count = if width_constraint >= ctx.max_intrinsic_width {
+                1.0
+            } else {
+                (ctx.max_intrinsic_width / width_constraint.max(1.0)).ceil().max(1.0)
+            };
 
-            let buffer = b_cache.get_mut(&ctx.node_id).unwrap();
-
-            buffer.set_size(
-                &mut sys,
-                Some(width_constraint.max(1.0)),
-                Some(f32::INFINITY),
-            );
-
-            buffer.shape_until_scroll(&mut sys, false);
-
-            let mut lines_count = 0;
-            let mut max_width: f32 = 0.0;
-            for run in buffer.layout_runs() {
-                max_width = max_width.max(run.line_w);
-                lines_count += 1;
-            }
-
-            if lines_count == 0 {
-                lines_count = 1;
-            }
-
-            let width = max_width.min(width_constraint.max(1.0));
             let line_height = (ctx.font_size * 1.2).max(1.0);
-            let height = (lines_count as f32) * line_height;
+            let height = line_count * line_height;
 
             taffy::geometry::Size { width, height }
         },
@@ -106,7 +89,7 @@ pub fn compute_layout(
     finalize_text_measurements(
         &document.taffy_tree,
         root_taffy_node,
-        font_system.into_inner(),
+        font_system_cell.into_inner(),
         buffer_cache,
     );
 
@@ -127,6 +110,10 @@ fn prepare_text_buffers(
             let mut b = Buffer::new(font_system, Metrics::new(font_size, line_height));
             b.set_wrap(font_system, Wrap::WordOrGlyph);
             b.set_text(font_system, &data.text, Attrs::new(), Shaping::Advanced);
+            
+            // Shape ONCE in pre-pass to resolve intrinsic widths
+            b.set_size(font_system, Some(f32::INFINITY), Some(f32::INFINITY));
+            b.shape_until_scroll(font_system, false);
             b
         });
     }
@@ -170,6 +157,7 @@ fn build_taffy_node(
     node_id: crate::dom::NodeId,
     vw: f32,
     vh: f32,
+    buffer_cache: &HashMap<crate::dom::NodeId, Buffer>,
 ) -> taffy::NodeId {
     let mut style = Style::DEFAULT;
 
@@ -281,9 +269,27 @@ fn build_taffy_node(
         existing_t_node
     } else {
         let new_t_node = if is_text {
+            let mut max_intrinsic_width: f32 = 0.0;
+            let mut min_intrinsic_width: f32 = 0.0;
+            
+            if let Some(buffer) = buffer_cache.get(&node_id) {
+                for run in buffer.layout_runs() {
+                    max_intrinsic_width = max_intrinsic_width.max(run.line_w);
+                    // Approximation for min_intrinsic_width (longest word)
+                    // In a real browser we'd track this during shaping.
+                    // For now, we'll use a conservative 10% of max or some heuristic.
+                    min_intrinsic_width = min_intrinsic_width.max(run.line_w * 0.1f32);
+                }
+            }
+
             document
                 .taffy_tree
-                .new_leaf_with_context(style, crate::dom::TextMeasureContext { node_id, font_size })
+                .new_leaf_with_context(style, crate::dom::TextMeasureContext { 
+                    node_id, 
+                    font_size,
+                    max_intrinsic_width,
+                    min_intrinsic_width,
+                })
                 .unwrap()
         } else {
             document.taffy_tree.new_leaf(style).unwrap()
@@ -302,7 +308,7 @@ fn build_taffy_node(
         let mut taffy_children = Vec::new();
         let mut child_id = document.first_child_of(node_id);
         while let Some(c) = child_id {
-            taffy_children.push(build_taffy_node(document, c, vw, vh));
+            taffy_children.push(build_taffy_node(document, c, vw, vh, buffer_cache));
             child_id = document.next_sibling_of(c);
         }
         document

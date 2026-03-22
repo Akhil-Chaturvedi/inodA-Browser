@@ -46,14 +46,33 @@ use std::time::Instant;
 pub struct NodeHandle {
     pub index: u32,
     pub generation: u64,
+    pub tag_name: String,
+}
+
+#[rquickjs::methods]
+impl NodeHandle {
+    #[qjs(get)]
+    #[allow(non_snake_case)]
+    pub fn tagName(&self) -> String {
+        self.tag_name.clone()
+    }
+
+    #[qjs(get, rename = "__nodeKey")]
+    pub fn node_key<'js>(&self, ctx: rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Array<'js>> {
+        let arr = rquickjs::Array::new(ctx)?;
+        arr.set(0, self.index)?;
+        arr.set(1, self.generation)?;
+        Ok(arr)
+    }
 }
 
 impl NodeHandle {
-    pub fn from_node_id(id: NodeId) -> Self {
+    pub fn from_node_id(id: NodeId, tag_name: String) -> Self {
         let (index, generation) = id.into_raw_parts();
         NodeHandle {
             index: index as u32,
             generation,
+            tag_name,
         }
     }
 
@@ -76,26 +95,7 @@ unsafe impl<'js> rquickjs::JsLifetime<'js> for NodeHandle {
     type Changed<'to> = NodeHandle;
 }
 
-pub struct NodeHandleWithTag {
-    handle: NodeHandle,
-    tag_name: String,
-    node_idx: u32,
-    node_gen: u64,
-}
-
-impl<'js> rquickjs::IntoJs<'js> for NodeHandleWithTag {
-    fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
-        let cls = rquickjs::Class::instance(ctx.clone(), self.handle)?;
-        cls.set("tagName", self.tag_name)?;
-        
-        let arr = rquickjs::Array::new(ctx.clone())?;
-        arr.set(0, self.node_idx)?;
-        arr.set(1, self.node_gen)?;
-        cls.set("__nodeKey", arr)?;
-        
-        cls.into_js(ctx)
-    }
-}
+// NodeHandleWithTag is removed as NodeHandle now includes tagName and node_key getters.
 
 // ---------------------------------------------------------------------------
 // Timer queue
@@ -129,7 +129,10 @@ impl PartialOrd for PendingTimer {
 impl Ord for PendingTimer {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse order for min-heap behavior based on fire_at
-        other.fire_at.cmp(&self.fire_at).then_with(|| other.id.cmp(&self.id))
+        other
+            .fire_at
+            .cmp(&self.fire_at)
+            .then_with(|| other.id.cmp(&self.id))
     }
 }
 
@@ -211,22 +214,26 @@ impl JsEngine {
                     let mut doc = doc_ref.borrow_mut();
                     doc.dirty = true;
                     let node_id = this.borrow().to_node_id();
-                    
+
                     if attr == "id" {
                         // Securely remove the old ID from the ABA mapping
                         let mut old_id_to_remove = None;
                         if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
-                            if let Some((_, old_val)) = data.attributes.iter().find(|(k, _)| &**k == "id") {
+                            if let Some((_, old_val)) =
+                                data.attributes.iter().find(|(k, _)| &**k == "id")
+                            {
                                 old_id_to_remove = Some(old_val.clone());
                             }
                         }
                         if let Some(old_id) = old_id_to_remove {
                             doc.id_map.remove(&old_id);
                         }
-                        
+
                         if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
                             let local_attr = string_cache::DefaultAtom::from("id");
-                            if let Some(pos) = data.attributes.iter().position(|(k, _)| *k == local_attr) {
+                            if let Some(pos) =
+                                data.attributes.iter().position(|(k, _)| *k == local_attr)
+                            {
                                 data.attributes[pos].1 = value.clone();
                             } else {
                                 data.attributes.push((local_attr, value.clone()));
@@ -234,7 +241,8 @@ impl JsEngine {
                         }
 
                         doc.id_map.insert(value.clone(), node_id);
-                    } else if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
+                    } else if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id)
+                    {
                         let local_attr = string_cache::DefaultAtom::from(attr.as_str());
                         if let Some(pos) =
                             data.attributes.iter().position(|(k, _)| *k == local_attr)
@@ -243,7 +251,7 @@ impl JsEngine {
                         } else {
                             data.attributes.push((local_attr.clone(), value.clone()));
                         }
-                        
+
                         if &*local_attr == "class" {
                             data.classes.clear();
                             for c in value.split_whitespace() {
@@ -301,16 +309,14 @@ impl JsEngine {
             // Native lookup helpers; wrapped below with JS-side identity cache
             let get_by_id_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
-                move |id: String| -> Option<NodeHandleWithTag> {
+                move |id: String| -> Option<NodeHandle> {
                     let doc = doc_ref.borrow();
                     if let Some(&node_id) = doc.id_map.get(&id) {
                         if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
-                            return Some(NodeHandleWithTag {
-                                handle: NodeHandle::from_node_id(node_id),
-                                tag_name: data.tag_name.to_string(),
-                                node_idx: node_id.into_raw_parts().0 as u32,
-                                node_gen: node_id.into_raw_parts().1,
-                            });
+                            return Some(NodeHandle::from_node_id(
+                                node_id,
+                                data.tag_name.to_string(),
+                            ));
                         }
                     }
                     None
@@ -325,7 +331,7 @@ impl JsEngine {
             // querySelector: returns a NodeHandle JS object or null
             let query_selector_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
-                move |selector: String| -> Option<NodeHandleWithTag> {
+                move |selector: String| -> Option<NodeHandle> {
                     let doc = doc_ref.borrow();
                     for (node_id, node) in doc.nodes.iter() {
                         if let crate::dom::Node::Element(data) = node {
@@ -334,18 +340,18 @@ impl JsEngine {
                                 data.classes.iter().any(|c| &**c == class_name)
                             } else if selector.starts_with('#') {
                                 let id_name = &selector[1..];
-                                data.attributes.iter().any(|(k, v)| &**k == "id" && v == id_name)
+                                data.attributes
+                                    .iter()
+                                    .any(|(k, v)| &**k == "id" && v == id_name)
                             } else {
                                 &*data.tag_name == selector
                             };
 
                             if is_match {
-                                return Some(NodeHandleWithTag {
-                                    handle: NodeHandle::from_node_id(node_id),
-                                    tag_name: data.tag_name.to_string(),
-                                    node_idx: node_id.into_raw_parts().0 as u32,
-                                    node_gen: node_id.into_raw_parts().1,
-                                });
+                                return Some(NodeHandle::from_node_id(
+                                    node_id,
+                                    data.tag_name.to_string(),
+                                ));
                             }
                         }
                     }
@@ -373,7 +379,7 @@ impl JsEngine {
             // createElement: creates an unattached node, returns a NodeHandle JS object
             let create_element_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
-                move |tag_name: String| -> NodeHandleWithTag {
+                move |tag_name: String| -> NodeHandle {
                     let mut doc = doc_ref.borrow_mut();
                     let safe_tag = tag_name.to_lowercase();
                     let local_name = crate::dom::LocalName::new(&safe_tag);
@@ -388,16 +394,12 @@ impl JsEngine {
                         prev_sibling: None,
                         next_sibling: None,
                         computed: crate::dom::ComputedStyle::default(),
+                        taffy_node: None,
                     });
                     let index = doc.add_node(node);
                     drop(doc);
 
-                    NodeHandleWithTag {
-                        handle: NodeHandle::from_node_id(index),
-                        tag_name: local_name.to_string(),
-                        node_idx: index.into_raw_parts().0 as u32,
-                        node_gen: index.into_raw_parts().1,
-                    }
+                    NodeHandle::from_node_id(index, local_name.to_string())
                 }
             })
             .unwrap();
@@ -423,10 +425,11 @@ impl JsEngine {
             let gc_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
                 move |node_key: rquickjs::Array<'_>| {
-                    if let (Ok(idx), Ok(gen_val)) = (node_key.get::<u32>(0), node_key.get::<u64>(1)) {
+                    if let (Ok(idx), Ok(gen_val)) = (node_key.get::<u32>(0), node_key.get::<u64>(1))
+                    {
                         let node_id = NodeId::from_raw_parts(idx as usize, gen_val);
                         let mut doc = doc_ref.borrow_mut();
-                        
+
                         // If the JS wrapper is garbage collected AND the node is unattached,
                         // safely wipe it from the Rust Arena freeing memory.
                         if !doc.is_attached_to_root(node_id) && node_id != doc.root_id {
@@ -487,7 +490,7 @@ impl JsEngine {
 
                     let delay_ms = delay.max(0) as u64;
                     let fire_at = Instant::now() + std::time::Duration::from_millis(delay_ms);
-                    
+
                     pending_timers.borrow_mut().push(PendingTimer {
                         id: timer_id,
                         fire_at,
@@ -510,7 +513,7 @@ impl JsEngine {
 
                     let delay_ms = delay.max(0) as u64;
                     let fire_at = Instant::now() + std::time::Duration::from_millis(delay_ms);
-                    
+
                     pending_timers.borrow_mut().push(PendingTimer {
                         id: timer_id,
                         fire_at,
@@ -534,7 +537,9 @@ impl JsEngine {
 
             globals.set("setTimeout", set_timeout_func).unwrap();
             globals.set("setInterval", set_interval_func).unwrap();
-            globals.set("clearTimeout", clear_timer_func.clone()).unwrap();
+            globals
+                .set("clearTimeout", clear_timer_func.clone())
+                .unwrap();
             globals.set("clearInterval", clear_timer_func).unwrap();
         });
     }
@@ -555,9 +560,9 @@ impl JsEngine {
                     if cancelled.remove(&timer.id) {
                         continue;
                     }
-                    
+
                     expired.push(timer.callback.clone());
-                    
+
                     if timer.is_interval {
                         rescheduled.push(PendingTimer {
                             id: timer.id,
@@ -571,7 +576,7 @@ impl JsEngine {
                     break;
                 }
             }
-            
+
             for t in rescheduled {
                 timers.push(t);
             }
@@ -585,7 +590,7 @@ impl JsEngine {
                 }
             });
         }
-        
+
         // Deterministic GC limit mapping
         let ticks = self.pump_ticks.get();
         if ticks > 60 {
@@ -594,7 +599,7 @@ impl JsEngine {
         } else {
             self.pump_ticks.set(ticks + 1);
         }
-        
+
         count
     }
 

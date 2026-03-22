@@ -87,9 +87,17 @@ impl StyleSheet {
 
             for part in &selector.last.parts {
                 match part {
-                    SimpleSelector::Id(id) => { id_key = Some(id.clone()); }
-                    SimpleSelector::Class(c) => { if class_key.is_none() { class_key = Some(c.clone()); } }
-                    SimpleSelector::Tag(t) => { tag_key = Some(t.clone()); }
+                    SimpleSelector::Id(id) => {
+                        id_key = Some(id.clone());
+                    }
+                    SimpleSelector::Class(c) => {
+                        if class_key.is_none() {
+                            class_key = Some(c.clone());
+                        }
+                    }
+                    SimpleSelector::Tag(t) => {
+                        tag_key = Some(t.clone());
+                    }
                     _ => {}
                 }
             }
@@ -97,9 +105,15 @@ impl StyleSheet {
             if let Some(id) = id_key {
                 self.by_id.entry(id.clone()).or_default().push(indexed);
             } else if let Some(class) = class_key {
-                self.by_class.entry(class.clone()).or_default().push(indexed);
+                self.by_class
+                    .entry(class.clone())
+                    .or_default()
+                    .push(indexed);
             } else if let Some(tag) = tag_key {
-                self.by_tag.entry(string_cache::DefaultAtom::from(tag.as_str())).or_default().push(indexed);
+                self.by_tag
+                    .entry(string_cache::DefaultAtom::from(tag.as_str()))
+                    .or_default()
+                    .push(indexed);
             } else {
                 self.universal.push(indexed);
             }
@@ -108,11 +122,20 @@ impl StyleSheet {
 
     pub fn sort_rules(&mut self) {
         let sort_fn = |a: &IndexedRule, b: &IndexedRule| {
-            a.selector.specificity.cmp(&b.selector.specificity).then_with(|| a.rule_index.cmp(&b.rule_index))
+            a.selector
+                .specificity
+                .cmp(&b.selector.specificity)
+                .then_with(|| a.rule_index.cmp(&b.rule_index))
         };
-        for list in self.by_id.values_mut() { list.sort_by(sort_fn); }
-        for list in self.by_class.values_mut() { list.sort_by(sort_fn); }
-        for list in self.by_tag.values_mut() { list.sort_by(sort_fn); }
+        for list in self.by_id.values_mut() {
+            list.sort_by(sort_fn);
+        }
+        for list in self.by_class.values_mut() {
+            list.sort_by(sort_fn);
+        }
+        for list in self.by_tag.values_mut() {
+            list.sort_by(sort_fn);
+        }
         self.universal.sort_by(sort_fn);
     }
 }
@@ -406,7 +429,7 @@ fn match_ancestors_recursive(
                 }
             }
         }
-        
+
         if *comb == Combinator::Child {
             break;
         }
@@ -423,7 +446,12 @@ fn match_complex_selector(
     document: &crate::dom::Document,
 ) -> bool {
     if let Some(crate::dom::Node::Element(data)) = document.nodes.get(node_id) {
-        if !match_compound_selector(&complex.last, &data.tag_name, &data.attributes, &data.classes) {
+        if !match_compound_selector(
+            &complex.last,
+            &data.tag_name,
+            &data.attributes,
+            &data.classes,
+        ) {
             return false;
         }
     } else {
@@ -447,19 +475,16 @@ pub fn parse_stylesheet(css: &str) -> StyleSheet {
     stylesheet
 }
 
-pub fn compute_styles(
-    document: &mut crate::dom::Document,
-    base_stylesheet: &StyleSheet,
-) {
+pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &StyleSheet) {
     let doc_sheet = std::mem::take(&mut document.stylesheet);
-    
+
     compute_node_styles_recursive(
         document,
         document.root_id,
         &[base_stylesheet, &doc_sheet],
-        &None,
+        None,
     );
-    
+
     document.stylesheet = doc_sheet;
 }
 
@@ -470,16 +495,11 @@ pub fn append_stylesheet(css: &str, stylesheet: &mut StyleSheet) {
     stylesheet.sort_rules();
 }
 
-#[inline]
-fn is_inheritable(property: &crate::dom::PropertyName) -> bool {
-    property.is_inheritable()
-}
-
 fn compute_node_styles_recursive(
     document: &mut crate::dom::Document,
     node_id: crate::dom::NodeId,
     stylesheets: &[&StyleSheet],
-    parent_styles: &Option<std::rc::Rc<Vec<(crate::dom::PropertyName, crate::dom::StyleValue)>>>,
+    parent_computed: Option<&crate::dom::ComputedStyle>,
 ) {
     let mut new_declarations = Vec::new();
     let mut children_ids = Vec::new();
@@ -513,7 +533,9 @@ fn compute_node_styles_recursive(
                             }
                         }
                         crate::dom::LocalName::Custom(s) => {
-                            if let Some((_, rules)) = stylesheet.by_tag.iter().find(|(k, _)| &***k == s.as_str()) {
+                            if let Some((_, rules)) =
+                                stylesheet.by_tag.iter().find(|(k, _)| &***k == s.as_str())
+                            {
                                 lists.push(rules.as_slice());
                             }
                         }
@@ -529,7 +551,12 @@ fn compute_node_styles_recursive(
                     for i in 1..lists.len() {
                         let a = &lists[i][0];
                         let b = &lists[min_idx][0];
-                        if a.selector.specificity.cmp(&b.selector.specificity).then_with(|| a.rule_index.cmp(&b.rule_index)) == std::cmp::Ordering::Less {
+                        if a.selector
+                            .specificity
+                            .cmp(&b.selector.specificity)
+                            .then_with(|| a.rule_index.cmp(&b.rule_index))
+                            == std::cmp::Ordering::Less
+                        {
                             min_idx = i;
                         }
                     }
@@ -537,7 +564,9 @@ fn compute_node_styles_recursive(
                     let rule = &lists[min_idx][0];
                     if match_complex_selector(&rule.selector, node_id, document) {
                         for decl in rule.declarations.iter() {
-                            if let Some(pos) = new_declarations.iter().position(|(k, _)| k == &decl.name) {
+                            if let Some(pos) =
+                                new_declarations.iter().position(|(k, _)| k == &decl.name)
+                            {
                                 new_declarations[pos].1 = decl.value.clone();
                             } else {
                                 new_declarations.push((decl.name.clone(), decl.value.clone()));
@@ -551,10 +580,13 @@ fn compute_node_styles_recursive(
                     }
                 }
 
-                if let Some((_, style_attr)) = data.attributes.iter().find(|(k, _)| &**k == "style") {
+                if let Some((_, style_attr)) = data.attributes.iter().find(|(k, _)| &**k == "style")
+                {
                     let inline_decls = parse_inline_declarations(style_attr);
                     for decl in &inline_decls {
-                        if let Some(pos) = new_declarations.iter().position(|(k, _)| k == &decl.name) {
+                        if let Some(pos) =
+                            new_declarations.iter().position(|(k, _)| k == &decl.name)
+                        {
                             new_declarations[pos].1 = decl.value.clone();
                         } else {
                             new_declarations.push((decl.name.clone(), decl.value.clone()));
@@ -579,48 +611,22 @@ fn compute_node_styles_recursive(
         }
     }
 
-    let inherited_styles = if new_declarations.is_empty() {
-        parent_styles.clone()
-    } else {
-        let mut appended_styles = if let Some(parent) = parent_styles {
-            parent.iter().cloned().collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        for (k, v) in &new_declarations {
-            if is_inheritable(k) {
-                if let Some(pos) = appended_styles.iter().position(|(ek, _)| ek == k) {
-                    appended_styles[pos].1 = v.clone();
-                } else {
-                    appended_styles.push((k.clone(), v.clone()));
-                }
-            }
-        }
-        if appended_styles.is_empty() { None } else { Some(std::rc::Rc::new(appended_styles)) }
-    };
     let mut computed = crate::dom::ComputedStyle::default();
 
+    // Default to inheriting from parent if possible
+    if let Some(pc) = parent_computed {
+        computed.font_size = pc.font_size;
+        computed.color = pc.color;
+    }
+
     // Resolve parent font-size for em unit resolution in the cascade.
-    let parent_font_size = parent_styles
-        .as_ref()
-        .and_then(|ps| ps.iter().find(|(k, _)| *k == crate::dom::PropertyName::FontSize))
-        .and_then(|(_, v)| match v {
-            crate::dom::StyleValue::LengthPx(px) => Some(*px),
-            crate::dom::StyleValue::Number(n) => Some(*n),
-            _ => None,
-        })
-        .unwrap_or(16.0);
+    let parent_font_size = parent_computed.map(|pc| pc.font_size).unwrap_or(16.0);
 
     let get_prop = |key: crate::dom::PropertyName| -> Option<&crate::dom::StyleValue> {
         new_declarations
             .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, v)| v)
-            .or_else(|| {
-                inherited_styles
-                    .as_ref()
-                    .and_then(|i| i.iter().find(|(k, _)| *k == key).map(|(_, v)| v))
-            })
     };
 
     use crate::dom::PropertyName as P;
@@ -631,23 +637,51 @@ fn compute_node_styles_recursive(
     if let Some(crate::dom::StyleValue::Keyword(v)) = get_prop(P::FlexDirection) {
         computed.flex_direction = v.clone();
     }
-    if let Some(v) = get_prop(P::Width) { computed.width = v.clone(); }
-    if let Some(v) = get_prop(P::Height) { computed.height = v.clone(); }
+    if let Some(v) = get_prop(P::Width) {
+        computed.width = v.clone();
+    }
+    if let Some(v) = get_prop(P::Height) {
+        computed.height = v.clone();
+    }
 
-    if let Some(v) = get_prop(P::MarginTop) { computed.margin[0] = v.clone(); }
-    if let Some(v) = get_prop(P::MarginRight) { computed.margin[1] = v.clone(); }
-    if let Some(v) = get_prop(P::MarginBottom) { computed.margin[2] = v.clone(); }
-    if let Some(v) = get_prop(P::MarginLeft) { computed.margin[3] = v.clone(); }
+    if let Some(v) = get_prop(P::MarginTop) {
+        computed.margin[0] = v.clone();
+    }
+    if let Some(v) = get_prop(P::MarginRight) {
+        computed.margin[1] = v.clone();
+    }
+    if let Some(v) = get_prop(P::MarginBottom) {
+        computed.margin[2] = v.clone();
+    }
+    if let Some(v) = get_prop(P::MarginLeft) {
+        computed.margin[3] = v.clone();
+    }
 
-    if let Some(v) = get_prop(P::PaddingTop) { computed.padding[0] = v.clone(); }
-    if let Some(v) = get_prop(P::PaddingRight) { computed.padding[1] = v.clone(); }
-    if let Some(v) = get_prop(P::PaddingBottom) { computed.padding[2] = v.clone(); }
-    if let Some(v) = get_prop(P::PaddingLeft) { computed.padding[3] = v.clone(); }
+    if let Some(v) = get_prop(P::PaddingTop) {
+        computed.padding[0] = v.clone();
+    }
+    if let Some(v) = get_prop(P::PaddingRight) {
+        computed.padding[1] = v.clone();
+    }
+    if let Some(v) = get_prop(P::PaddingBottom) {
+        computed.padding[2] = v.clone();
+    }
+    if let Some(v) = get_prop(P::PaddingLeft) {
+        computed.padding[3] = v.clone();
+    }
 
-    if let Some(v) = get_prop(P::BorderTopWidth) { computed.border_width[0] = v.clone(); }
-    if let Some(v) = get_prop(P::BorderRightWidth) { computed.border_width[1] = v.clone(); }
-    if let Some(v) = get_prop(P::BorderBottomWidth) { computed.border_width[2] = v.clone(); }
-    if let Some(v) = get_prop(P::BorderLeftWidth) { computed.border_width[3] = v.clone(); }
+    if let Some(v) = get_prop(P::BorderTopWidth) {
+        computed.border_width[0] = v.clone();
+    }
+    if let Some(v) = get_prop(P::BorderRightWidth) {
+        computed.border_width[1] = v.clone();
+    }
+    if let Some(v) = get_prop(P::BorderBottomWidth) {
+        computed.border_width[2] = v.clone();
+    }
+    if let Some(v) = get_prop(P::BorderLeftWidth) {
+        computed.border_width[3] = v.clone();
+    }
 
     if let Some(crate::dom::StyleValue::Color(r, g, b)) = get_prop(P::BackgroundColor) {
         computed.bg_color = Some((*r, *g, *b));
@@ -659,10 +693,18 @@ fn compute_node_styles_recursive(
     // Resolve font-size: em/rem are resolved here relative to parent; others pass through.
     if let Some(v) = get_prop(P::FontSize) {
         match v {
-            crate::dom::StyleValue::LengthPx(px) => { computed.font_size = *px; }
-            crate::dom::StyleValue::Number(num) => { computed.font_size = *num; }
-            crate::dom::StyleValue::Em(num) => { computed.font_size = num * parent_font_size; }
-            crate::dom::StyleValue::Rem(num) => { computed.font_size = num * 16.0; }
+            crate::dom::StyleValue::LengthPx(px) => {
+                computed.font_size = *px;
+            }
+            crate::dom::StyleValue::Number(num) => {
+                computed.font_size = *num;
+            }
+            crate::dom::StyleValue::Em(num) => {
+                computed.font_size = num * parent_font_size;
+            }
+            crate::dom::StyleValue::Rem(num) => {
+                computed.font_size = num * 16.0;
+            }
             _ => {}
         }
     }
@@ -676,14 +718,14 @@ fn compute_node_styles_recursive(
 
     if let Some(node) = document.nodes.get_mut(node_id) {
         match node {
-            crate::dom::Node::Element(data) => data.computed = computed,
-            crate::dom::Node::Text(data) => data.computed = computed,
+            crate::dom::Node::Element(data) => data.computed = computed.clone(),
+            crate::dom::Node::Text(data) => data.computed = computed.clone(),
             crate::dom::Node::Root(_) => {}
         }
     }
 
     for child_id in children_ids {
-        compute_node_styles_recursive(document, child_id, stylesheets, &inherited_styles);
+        compute_node_styles_recursive(document, child_id, stylesheets, Some(&computed));
     }
 }
 

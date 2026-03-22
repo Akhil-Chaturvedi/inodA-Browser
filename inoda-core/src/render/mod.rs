@@ -8,7 +8,6 @@
 //! `inoda-core` does not depend on any graphics APIs; platform binaries
 //! implement the `RendererBackend` trait using their own raster target.
 
-
 use cosmic_text::Buffer;
 use std::collections::HashMap;
 
@@ -22,8 +21,14 @@ pub struct Color {
 pub trait RendererBackend {
     fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color);
     fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32, line_width: f32, color: Color);
-    fn draw_glyphs(&mut self, x: f32, y: f32, glyphs: &[cosmic_text::LayoutGlyph], size: f32, color: Color);
-
+    fn draw_glyphs(
+        &mut self,
+        x: f32,
+        y: f32,
+        glyphs: &[cosmic_text::LayoutGlyph],
+        size: f32,
+        color: Color,
+    );
 }
 
 pub fn draw_layout_tree<R: RendererBackend>(
@@ -39,7 +44,7 @@ pub fn draw_layout_tree<R: RendererBackend>(
     let computed = match document.nodes.get(node_id) {
         Some(crate::dom::Node::Element(data)) => &data.computed,
         Some(crate::dom::Node::Text(data)) => &data.computed,
-        _ => return, 
+        _ => return,
     };
 
     if let Ok(layout) = layout_tree.layout(layout_node_id) {
@@ -47,7 +52,13 @@ pub fn draw_layout_tree<R: RendererBackend>(
         let abs_y = offset_y + layout.location.y;
 
         if let Some((r, g, b)) = computed.bg_color {
-            renderer.fill_rect(abs_x, abs_y, layout.size.width, layout.size.height, Color { r, g, b });
+            renderer.fill_rect(
+                abs_x,
+                abs_y,
+                layout.size.width,
+                layout.size.height,
+                Color { r, g, b },
+            );
         }
 
         if let Some((r, g, b)) = computed.border_color {
@@ -63,8 +74,12 @@ pub fn draw_layout_tree<R: RendererBackend>(
 
         if let crate::dom::Node::Text(_) = document.nodes.get(node_id).unwrap() {
             let buffer = buffer_cache.get_mut(&node_id).unwrap();
-            let color = Color { r: computed.color.0, g: computed.color.1, b: computed.color.2 };
-            
+            let color = Color {
+                r: computed.color.0,
+                g: computed.color.1,
+                b: computed.color.2,
+            };
+
             for run in buffer.layout_runs() {
                 renderer.draw_glyphs(
                     abs_x,

@@ -8,9 +8,9 @@
 //! CSS text from `<style>` elements is parsed immediately into
 //! `document.stylesheet` via `css::append_stylesheet()`.
 
+use crate::dom::{Document, ElementData, Node, TextData};
 use html5gum::{Token, Tokenizer};
 use string_cache::DefaultAtom;
-use crate::dom::{Document, ElementData, Node, TextData};
 
 pub fn parse_html(html: &str) -> Document {
     let mut doc = Document::default();
@@ -21,9 +21,9 @@ pub fn parse_html(html: &str) -> Document {
     for token in Tokenizer::new(html).infallible() {
         match token {
             Token::StartTag(tag) => {
-                let tag_name_str = std::str::from_utf8(&tag.name).unwrap_or("");
-                let tag_name = crate::dom::LocalName::new(tag_name_str);
-                
+                let tag_name_str = String::from_utf8_lossy(&tag.name);
+                let tag_name = crate::dom::LocalName::new(&tag_name_str);
+
                 if let Some(ref raw) = inside_raw_tag {
                     if &**raw == "style" {
                         // Skip StartTags inside `<style>` (html5gum shouldn't emit them in Rawtext mode,
@@ -31,7 +31,7 @@ pub fn parse_html(html: &str) -> Document {
                     } else if let Some(last_child) = doc.last_child_of(current_parent) {
                         if let Some(Node::Text(existing)) = doc.nodes.get_mut(last_child) {
                             existing.text.push_str("<");
-                            existing.text.push_str(tag_name_str);
+                            existing.text.push_str(&tag_name_str);
                             for (k, v) in tag.attributes.iter() {
                                 let k_str = std::str::from_utf8(k).unwrap_or("");
                                 let v_str = std::str::from_utf8(v).unwrap_or("");
@@ -41,53 +41,58 @@ pub fn parse_html(html: &str) -> Document {
                                 existing.text.push_str(v_str);
                                 existing.text.push_str("\"");
                             }
-                            if tag.self_closing { existing.text.push_str("/>"); } else { existing.text.push_str(">"); }
+                            if tag.self_closing {
+                                existing.text.push_str("/>");
+                            } else {
+                                existing.text.push_str(">");
+                            }
                         }
                     }
                     continue;
                 }
-                
+
                 if &*tag_name == "style" || &*tag_name == "script" {
                     inside_raw_tag = Some(tag_name.clone());
                 }
 
                 let mut check_node = current_parent;
                 let mut found_close_target = false;
-                
+
                 while let Some(Node::Element(data)) = doc.nodes.get(check_node) {
                     let p_tag = &*data.tag_name;
                     let should_close = match &*tag_name {
                         "li" => p_tag == "li",
                         "td" | "th" => p_tag == "td" || p_tag == "th",
                         "tr" => p_tag == "tr",
-                        "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "ul" | "ol" | "table" => p_tag == "p",
+                        "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "ul" | "ol"
+                        | "table" => p_tag == "p",
                         _ => false,
                     };
-                    
+
                     if should_close {
                         found_close_target = true;
                         break;
                     }
-                    
+
                     if matches!(p_tag, "div" | "body" | "td" | "th" | "table") {
                         break;
                     }
-                    
+
                     check_node = doc.parent_of(check_node).unwrap_or(doc.root_id);
                 }
-                
+
                 if found_close_target {
                     current_parent = doc.parent_of(check_node).unwrap_or(doc.root_id);
                 }
-
-
 
                 let mut attributes = Vec::new();
                 let mut classes = Vec::new();
                 let mut id_val = None;
 
                 for (key, value) in tag.attributes {
-                    if let (Ok(k_str), Ok(v_str)) = (std::str::from_utf8(&key), std::str::from_utf8(&value)) {
+                    if let (Ok(k_str), Ok(v_str)) =
+                        (std::str::from_utf8(&key), std::str::from_utf8(&value))
+                    {
                         let k_atom = DefaultAtom::from(k_str);
 
                         if &*k_atom == "class" {
@@ -114,6 +119,7 @@ pub fn parse_html(html: &str) -> Document {
                     prev_sibling: None,
                     next_sibling: None,
                     computed: crate::dom::ComputedStyle::default(),
+                    taffy_node: None,
                 });
 
                 let node_id = doc.add_node(node);
@@ -122,10 +128,23 @@ pub fn parse_html(html: &str) -> Document {
                 }
 
                 doc.append_child(current_parent, node_id);
-                
+
                 let is_void = matches!(
                     &*tag_name,
-                    "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta" | "param" | "source" | "track" | "wbr"
+                    "area"
+                        | "base"
+                        | "br"
+                        | "col"
+                        | "embed"
+                        | "hr"
+                        | "img"
+                        | "input"
+                        | "link"
+                        | "meta"
+                        | "param"
+                        | "source"
+                        | "track"
+                        | "wbr"
                 );
 
                 if !is_void && !tag.self_closing {
@@ -133,9 +152,9 @@ pub fn parse_html(html: &str) -> Document {
                 }
             }
             Token::EndTag(tag) => {
-                let tag_name_str = std::str::from_utf8(&tag.name).unwrap_or("");
-                let tag_name = crate::dom::LocalName::new(tag_name_str);
-                
+                let tag_name_str = String::from_utf8_lossy(&tag.name);
+                let tag_name = crate::dom::LocalName::new(&tag_name_str);
+
                 if let Some(ref raw) = inside_raw_tag {
                     if &**raw == &*tag_name {
                         inside_raw_tag = None;
@@ -150,7 +169,7 @@ pub fn parse_html(html: &str) -> Document {
                             if let Some(last_child) = doc.last_child_of(current_parent) {
                                 if let Some(Node::Text(existing)) = doc.nodes.get_mut(last_child) {
                                     existing.text.push_str("</");
-                                    existing.text.push_str(tag_name_str);
+                                    existing.text.push_str(&tag_name_str);
                                     existing.text.push_str(">");
                                 }
                             }
@@ -177,7 +196,7 @@ pub fn parse_html(html: &str) -> Document {
                 if text_str.is_empty() {
                     continue;
                 }
-                
+
                 if let Some(ref raw) = inside_raw_tag {
                     if &**raw == "style" {
                         current_style_text.push_str(text_str);
@@ -199,6 +218,7 @@ pub fn parse_html(html: &str) -> Document {
                         prev_sibling: None,
                         next_sibling: None,
                         computed: crate::dom::ComputedStyle::default(),
+                        taffy_node: None,
                     }));
                     doc.append_child(current_parent, id);
                 }

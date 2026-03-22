@@ -16,8 +16,13 @@
 
 use generational_arena::{Arena, Index};
 
+#[derive(Debug, Clone, Copy)]
+pub struct TextMeasureContext {
+    pub node_id: NodeId,
+    pub font_size: f32,
+}
+
 /// A DOM document backed by a generational arena.
-#[derive(Debug, Clone)]
 pub struct Document {
     pub nodes: Arena<Node>,
     pub root_id: NodeId,
@@ -29,6 +34,7 @@ pub struct Document {
     pub dead_nodes: Vec<NodeId>,
     /// Layout invalidation flag. True if DOM was mutated since the last render.
     pub dirty: bool,
+    pub taffy_tree: taffy::TaffyTree<TextMeasureContext>,
 }
 
 /// A handle into the arena. Generational indices prevent ABA problems.
@@ -51,19 +57,114 @@ impl LocalName {
     pub fn new(tag: &str) -> Self {
         if matches!(
             tag,
-            "a" | "abbr" | "address" | "area" | "article" | "aside" | "audio" | "b" | "base" 
-            | "bdi" | "bdo" | "blockquote" | "body" | "br" | "button" | "canvas" | "caption" 
-            | "cite" | "code" | "col" | "colgroup" | "data" | "datalist" | "dd" | "del" | "details" 
-            | "dfn" | "dialog" | "div" | "dl" | "dt" | "em" | "embed" | "fieldset" | "figcaption" 
-            | "figure" | "footer" | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "head" 
-            | "header" | "hr" | "html" | "i" | "iframe" | "img" | "input" | "ins" | "kbd" 
-            | "label" | "legend" | "li" | "link" | "main" | "map" | "mark" | "meta" | "meter" 
-            | "nav" | "noscript" | "object" | "ol" | "optgroup" | "option" | "output" | "p" 
-            | "param" | "picture" | "pre" | "progress" | "q" | "rp" | "rt" | "ruby" | "s" 
-            | "samp" | "script" | "section" | "select" | "small" | "source" | "span" | "strong" 
-            | "style" | "sub" | "summary" | "sup" | "table" | "tbody" | "td" | "template" 
-            | "textarea" | "tfoot" | "th" | "thead" | "time" | "title" | "tr" | "track" | "u" 
-            | "ul" | "var" | "video" | "wbr"
+            "a" | "abbr"
+                | "address"
+                | "area"
+                | "article"
+                | "aside"
+                | "audio"
+                | "b"
+                | "base"
+                | "bdi"
+                | "bdo"
+                | "blockquote"
+                | "body"
+                | "br"
+                | "button"
+                | "canvas"
+                | "caption"
+                | "cite"
+                | "code"
+                | "col"
+                | "colgroup"
+                | "data"
+                | "datalist"
+                | "dd"
+                | "del"
+                | "details"
+                | "dfn"
+                | "dialog"
+                | "div"
+                | "dl"
+                | "dt"
+                | "em"
+                | "embed"
+                | "fieldset"
+                | "figcaption"
+                | "figure"
+                | "footer"
+                | "form"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "head"
+                | "header"
+                | "hr"
+                | "html"
+                | "i"
+                | "iframe"
+                | "img"
+                | "input"
+                | "ins"
+                | "kbd"
+                | "label"
+                | "legend"
+                | "li"
+                | "link"
+                | "main"
+                | "map"
+                | "mark"
+                | "meta"
+                | "meter"
+                | "nav"
+                | "noscript"
+                | "object"
+                | "ol"
+                | "optgroup"
+                | "option"
+                | "output"
+                | "p"
+                | "param"
+                | "picture"
+                | "pre"
+                | "progress"
+                | "q"
+                | "rp"
+                | "rt"
+                | "ruby"
+                | "s"
+                | "samp"
+                | "script"
+                | "section"
+                | "select"
+                | "small"
+                | "source"
+                | "span"
+                | "strong"
+                | "style"
+                | "sub"
+                | "summary"
+                | "sup"
+                | "table"
+                | "tbody"
+                | "td"
+                | "template"
+                | "textarea"
+                | "tfoot"
+                | "th"
+                | "thead"
+                | "time"
+                | "title"
+                | "tr"
+                | "track"
+                | "u"
+                | "ul"
+                | "var"
+                | "video"
+                | "wbr"
         ) {
             LocalName::Standard(string_cache::DefaultAtom::from(tag))
         } else {
@@ -186,6 +287,7 @@ pub struct ElementData {
     pub prev_sibling: Option<NodeId>,
     pub next_sibling: Option<NodeId>,
     pub computed: ComputedStyle,
+    pub taffy_node: Option<taffy::NodeId>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,12 +297,14 @@ pub struct TextData {
     pub prev_sibling: Option<NodeId>,
     pub next_sibling: Option<NodeId>,
     pub computed: ComputedStyle,
+    pub taffy_node: Option<taffy::NodeId>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RootData {
     pub first_child: Option<NodeId>,
     pub last_child: Option<NodeId>,
+    pub taffy_node: Option<taffy::NodeId>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -241,9 +345,24 @@ impl Default for ComputedStyle {
             flex_direction: string_cache::DefaultAtom::from("row"),
             width: StyleValue::Auto,
             height: StyleValue::Auto,
-            margin: [StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0)],
-            padding: [StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0)],
-            border_width: [StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0), StyleValue::LengthPx(0.0)],
+            margin: [
+                StyleValue::LengthPx(0.0),
+                StyleValue::LengthPx(0.0),
+                StyleValue::LengthPx(0.0),
+                StyleValue::LengthPx(0.0),
+            ],
+            padding: [
+                StyleValue::LengthPx(0.0),
+                StyleValue::LengthPx(0.0),
+                StyleValue::LengthPx(0.0),
+                StyleValue::LengthPx(0.0),
+            ],
+            border_width: [
+                StyleValue::LengthPx(0.0),
+                StyleValue::LengthPx(0.0),
+                StyleValue::LengthPx(0.0),
+                StyleValue::LengthPx(0.0),
+            ],
             bg_color: None,
             border_color: None,
             font_size: 16.0,
@@ -252,14 +371,13 @@ impl Default for ComputedStyle {
     }
 }
 
-
-
 impl Default for Document {
     fn default() -> Self {
         let mut arena = Arena::new();
         let root_id = arena.insert(Node::Root(RootData {
             first_child: None,
             last_child: None,
+            taffy_node: None,
         }));
         Document {
             nodes: arena,
@@ -268,6 +386,7 @@ impl Default for Document {
             id_map: std::collections::HashMap::new(),
             dead_nodes: Vec::new(),
             dirty: true,
+            taffy_tree: taffy::TaffyTree::new(),
         }
     }
 }
@@ -331,13 +450,17 @@ impl Document {
         let old_last_child = match self.nodes.get_mut(parent_id) {
             Some(Node::Element(data)) => {
                 let last = data.last_child;
-                if data.first_child.is_none() { data.first_child = Some(child_id); }
+                if data.first_child.is_none() {
+                    data.first_child = Some(child_id);
+                }
                 data.last_child = Some(child_id);
                 last
             }
             Some(Node::Root(root)) => {
                 let last = root.last_child;
-                if root.first_child.is_none() { root.first_child = Some(child_id); }
+                if root.first_child.is_none() {
+                    root.first_child = Some(child_id);
+                }
                 root.last_child = Some(child_id);
                 last
             }
@@ -347,7 +470,7 @@ impl Document {
         if let Some(old_last) = old_last_child {
             self.set_next_sibling(old_last, Some(child_id));
         }
-        
+
         self.set_prev_sibling(child_id, old_last_child);
         self.set_next_sibling(child_id, None);
         self.set_parent(child_id, Some(parent_id));
@@ -361,25 +484,37 @@ impl Document {
         if let Some(parent) = self.nodes.get_mut(parent_id) {
             match parent {
                 Node::Element(data) => {
-                    if data.first_child == Some(child_id) { data.first_child = next; }
-                    if data.last_child == Some(child_id) { data.last_child = prev; }
+                    if data.first_child == Some(child_id) {
+                        data.first_child = next;
+                    }
+                    if data.last_child == Some(child_id) {
+                        data.last_child = prev;
+                    }
                 }
                 Node::Root(root) => {
-                    if root.first_child == Some(child_id) { root.first_child = next; }
-                    if root.last_child == Some(child_id) { root.last_child = prev; }
+                    if root.first_child == Some(child_id) {
+                        root.first_child = next;
+                    }
+                    if root.last_child == Some(child_id) {
+                        root.last_child = prev;
+                    }
                 }
                 Node::Text(_) => {}
             }
         }
 
-        if let Some(p) = prev { self.set_next_sibling(p, next); }
-        if let Some(n) = next { self.set_prev_sibling(n, prev); }
+        if let Some(p) = prev {
+            self.set_next_sibling(p, next);
+        }
+        if let Some(n) = next {
+            self.set_prev_sibling(n, prev);
+        }
 
         self.set_parent(child_id, None);
         self.set_prev_sibling(child_id, None);
         self.set_next_sibling(child_id, None);
     }
-    
+
     pub fn is_attached_to_root(&self, node_id: NodeId) -> bool {
         let mut current_id = node_id;
         while current_id != self.root_id {

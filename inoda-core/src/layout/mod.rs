@@ -18,7 +18,6 @@
 
 use std::{cell::RefCell, collections::HashMap};
 
-
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, Wrap};
 use taffy::{
     TaffyTree,
@@ -26,35 +25,25 @@ use taffy::{
     style::{Dimension, Style},
 };
 
-#[derive(Debug, Clone, Copy)]
-pub struct TextMeasureContext {
-    pub node_id: crate::dom::NodeId,
-    pub font_size: f32,
-}
+// TextMeasureContext moved to crate::dom
 
 pub fn compute_layout(
-    document: &crate::dom::Document,
+    document: &mut crate::dom::Document,
 
     viewport_width: f32,
     viewport_height: f32,
     font_system: &mut FontSystem,
     buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
-) -> (TaffyTree<TextMeasureContext>, NodeId, HashMap<crate::dom::NodeId, Buffer>) {
-    let mut tree: TaffyTree<TextMeasureContext> = TaffyTree::new();
-
+) -> (taffy::NodeId, HashMap<crate::dom::NodeId, Buffer>) {
     // Evict cached text buffers for nodes that have been removed from the DOM
     buffer_cache.retain(|node_id, _| document.nodes.contains(*node_id));
 
     prepare_text_buffers(document, document.root_id, font_system, buffer_cache);
 
-    let root_taffy_node = build_taffy_node(
-        &mut tree,
-        document,
-        document.root_id, 
-        viewport_width,
-        viewport_height,
-    );
+    let root_taffy_node =
+        build_taffy_node(document, document.root_id, viewport_width, viewport_height);
 
+    let tree = &mut document.taffy_tree;
     let available_space = Size {
         width: AvailableSpace::Definite(viewport_width),
         height: AvailableSpace::Definite(viewport_height),
@@ -69,7 +58,7 @@ pub fn compute_layout(
         |_known_dimensions,
          available_space,
          _node_id,
-         context: Option<&mut TextMeasureContext>,
+         context: Option<&mut crate::dom::TextMeasureContext>,
          _style| {
             let Some(ctx) = context else {
                 return taffy::geometry::Size::ZERO;
@@ -82,7 +71,7 @@ pub fn compute_layout(
 
             let mut sys = font_system.borrow_mut();
             let mut b_cache = buffer_cache_cell.borrow_mut();
-            
+
             let buffer = b_cache.get_mut(&ctx.node_id).unwrap();
 
             buffer.set_size(
@@ -90,7 +79,7 @@ pub fn compute_layout(
                 Some(width_constraint.max(1.0)),
                 Some(f32::INFINITY),
             );
-            
+
             buffer.shape_until_scroll(&mut sys, false);
 
             let mut lines_count = 0;
@@ -115,13 +104,13 @@ pub fn compute_layout(
 
     // We walk the tree one last time to enforce exact text heights for empty nodes
     finalize_text_measurements(
-        &tree,
+        &document.taffy_tree,
         root_taffy_node,
         font_system.into_inner(),
         buffer_cache,
     );
 
-    (tree, root_taffy_node, std::mem::take(buffer_cache))
+    (root_taffy_node, std::mem::take(buffer_cache))
 }
 
 fn prepare_text_buffers(
@@ -150,7 +139,7 @@ fn prepare_text_buffers(
 }
 
 fn finalize_text_measurements(
-    tree: &TaffyTree<TextMeasureContext>,
+    tree: &TaffyTree<crate::dom::TextMeasureContext>,
     taffy_node: NodeId,
     font_system: &mut FontSystem,
     buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
@@ -177,18 +166,35 @@ fn finalize_text_measurements(
 }
 
 fn build_taffy_node(
-    tree: &mut TaffyTree<TextMeasureContext>,
-    document: &crate::dom::Document,
+    document: &mut crate::dom::Document,
     node_id: crate::dom::NodeId,
     vw: f32,
     vh: f32,
-) -> NodeId {
+) -> taffy::NodeId {
     let mut style = Style::DEFAULT;
 
-    let computed = match document.nodes.get(node_id) {
-        Some(crate::dom::Node::Element(data)) => &data.computed,
-        Some(crate::dom::Node::Text(data)) => &data.computed,
-        _ => return tree.new_leaf(style).unwrap(), // Root node
+    let (computed, is_text) = match document.nodes.get(node_id) {
+        Some(crate::dom::Node::Element(data)) => (&data.computed, false),
+        Some(crate::dom::Node::Text(data)) => (&data.computed, true),
+        _ => {
+            // Root node or fallback
+            let exists = if let Some(crate::dom::Node::Root(d)) = document.nodes.get(node_id) {
+                d.taffy_node
+            } else {
+                None
+            };
+
+            return if let Some(t_node) = exists {
+                document.taffy_tree.set_style(t_node, style).unwrap();
+                t_node
+            } else {
+                let t_node = document.taffy_tree.new_leaf(style).unwrap();
+                if let Some(crate::dom::Node::Root(d)) = document.nodes.get_mut(node_id) {
+                    d.taffy_node = Some(t_node);
+                }
+                t_node
+            };
+        }
     };
 
     let font_size = computed.font_size;
@@ -217,52 +223,104 @@ fn build_taffy_node(
     if let Some(dim) = parse_dimension(&computed.width, vw, vh, font_size) {
         style.size.width = dim;
     }
-    
+
     if let Some(dim) = parse_dimension(&computed.height, vw, vh, font_size) {
         style.size.height = dim;
     }
 
-    if let Some(dim) = parse_length_percentage_auto(&computed.margin[0], vw, vh, font_size) { style.margin.top = dim; }
-    if let Some(dim) = parse_length_percentage_auto(&computed.margin[1], vw, vh, font_size) { style.margin.right = dim; }
-    if let Some(dim) = parse_length_percentage_auto(&computed.margin[2], vw, vh, font_size) { style.margin.bottom = dim; }
-    if let Some(dim) = parse_length_percentage_auto(&computed.margin[3], vw, vh, font_size) { style.margin.left = dim; }
+    if let Some(dim) = parse_length_percentage_auto(&computed.margin[0], vw, vh, font_size) {
+        style.margin.top = dim;
+    }
+    if let Some(dim) = parse_length_percentage_auto(&computed.margin[1], vw, vh, font_size) {
+        style.margin.right = dim;
+    }
+    if let Some(dim) = parse_length_percentage_auto(&computed.margin[2], vw, vh, font_size) {
+        style.margin.bottom = dim;
+    }
+    if let Some(dim) = parse_length_percentage_auto(&computed.margin[3], vw, vh, font_size) {
+        style.margin.left = dim;
+    }
 
-    if let Some(dim) = parse_length_percentage(&computed.padding[0], vw, vh, font_size) { style.padding.top = dim; }
-    if let Some(dim) = parse_length_percentage(&computed.padding[1], vw, vh, font_size) { style.padding.right = dim; }
-    if let Some(dim) = parse_length_percentage(&computed.padding[2], vw, vh, font_size) { style.padding.bottom = dim; }
-    if let Some(dim) = parse_length_percentage(&computed.padding[3], vw, vh, font_size) { style.padding.left = dim; }
+    if let Some(dim) = parse_length_percentage(&computed.padding[0], vw, vh, font_size) {
+        style.padding.top = dim;
+    }
+    if let Some(dim) = parse_length_percentage(&computed.padding[1], vw, vh, font_size) {
+        style.padding.right = dim;
+    }
+    if let Some(dim) = parse_length_percentage(&computed.padding[2], vw, vh, font_size) {
+        style.padding.bottom = dim;
+    }
+    if let Some(dim) = parse_length_percentage(&computed.padding[3], vw, vh, font_size) {
+        style.padding.left = dim;
+    }
 
-    if let Some(dim) = parse_length_percentage(&computed.border_width[0], vw, vh, font_size) { style.border.top = dim; }
-    if let Some(dim) = parse_length_percentage(&computed.border_width[1], vw, vh, font_size) { style.border.right = dim; }
-    if let Some(dim) = parse_length_percentage(&computed.border_width[2], vw, vh, font_size) { style.border.bottom = dim; }
-    if let Some(dim) = parse_length_percentage(&computed.border_width[3], vw, vh, font_size) { style.border.left = dim; }
+    if let Some(dim) = parse_length_percentage(&computed.border_width[0], vw, vh, font_size) {
+        style.border.top = dim;
+    }
+    if let Some(dim) = parse_length_percentage(&computed.border_width[1], vw, vh, font_size) {
+        style.border.right = dim;
+    }
+    if let Some(dim) = parse_length_percentage(&computed.border_width[2], vw, vh, font_size) {
+        style.border.bottom = dim;
+    }
+    if let Some(dim) = parse_length_percentage(&computed.border_width[3], vw, vh, font_size) {
+        style.border.left = dim;
+    }
 
-    if matches!(
-        document.nodes.get(node_id),
-        Some(crate::dom::Node::Text(_))
-    ) {
-        tree.new_leaf_with_context(
-            style,
-            TextMeasureContext {
-                node_id,
-                font_size,
-            },
-        )
-        .unwrap()
+    let exists = match document.nodes.get(node_id) {
+        Some(crate::dom::Node::Element(d)) => d.taffy_node,
+        Some(crate::dom::Node::Text(d)) => d.taffy_node,
+        _ => None,
+    };
+
+    let t_node = if let Some(existing_t_node) = exists {
+        document
+            .taffy_tree
+            .set_style(existing_t_node, style)
+            .unwrap();
+        existing_t_node
     } else {
+        let new_t_node = if is_text {
+            document
+                .taffy_tree
+                .new_leaf_with_context(style, crate::dom::TextMeasureContext { node_id, font_size })
+                .unwrap()
+        } else {
+            document.taffy_tree.new_leaf(style).unwrap()
+        };
+        if let Some(node) = document.nodes.get_mut(node_id) {
+            match node {
+                crate::dom::Node::Element(d) => d.taffy_node = Some(new_t_node),
+                crate::dom::Node::Text(d) => d.taffy_node = Some(new_t_node),
+                _ => {}
+            }
+        }
+        new_t_node
+    };
+
+    if !is_text {
         let mut taffy_children = Vec::new();
         let mut child_id = document.first_child_of(node_id);
         while let Some(c) = child_id {
-            taffy_children.push(build_taffy_node(tree, document, c, vw, vh));
+            taffy_children.push(build_taffy_node(document, c, vw, vh));
             child_id = document.next_sibling_of(c);
         }
-
-        tree.new_with_children(style, &taffy_children).unwrap()
+        document
+            .taffy_tree
+            .set_children(t_node, &taffy_children)
+            .unwrap();
     }
+
+    t_node
 }
 
 #[inline]
-fn parse_dimension(val: &crate::dom::StyleValue, vw: f32, vh: f32, font_size: f32) -> Option<Dimension> {
+fn parse_dimension(
+    val: &crate::dom::StyleValue,
+    vw: f32,
+    vh: f32,
+    font_size: f32,
+) -> Option<Dimension> {
     match val {
         crate::dom::StyleValue::Auto => Some(Dimension::auto()),
         crate::dom::StyleValue::LengthPx(num) => Some(Dimension::length(*num)),
@@ -276,28 +334,60 @@ fn parse_dimension(val: &crate::dom::StyleValue, vw: f32, vh: f32, font_size: f3
 }
 
 #[inline]
-fn parse_length_percentage_auto(val: &crate::dom::StyleValue, vw: f32, vh: f32, font_size: f32) -> Option<taffy::style::LengthPercentageAuto> {
+fn parse_length_percentage_auto(
+    val: &crate::dom::StyleValue,
+    vw: f32,
+    vh: f32,
+    font_size: f32,
+) -> Option<taffy::style::LengthPercentageAuto> {
     match val {
         crate::dom::StyleValue::Auto => Some(taffy::style::LengthPercentageAuto::auto()),
-        crate::dom::StyleValue::LengthPx(num) => Some(taffy::style::LengthPercentageAuto::length(*num)),
-        crate::dom::StyleValue::Percent(p) => Some(taffy::style::LengthPercentageAuto::percent(*p / 100.0)),
-        crate::dom::StyleValue::ViewportWidth(num) => Some(taffy::style::LengthPercentageAuto::length((num / 100.0) * vw)),
-        crate::dom::StyleValue::ViewportHeight(num) => Some(taffy::style::LengthPercentageAuto::length((num / 100.0) * vh)),
-        crate::dom::StyleValue::Em(num) => Some(taffy::style::LengthPercentageAuto::length(num * font_size)),
-        crate::dom::StyleValue::Rem(num) => Some(taffy::style::LengthPercentageAuto::length(num * font_size)),
+        crate::dom::StyleValue::LengthPx(num) => {
+            Some(taffy::style::LengthPercentageAuto::length(*num))
+        }
+        crate::dom::StyleValue::Percent(p) => {
+            Some(taffy::style::LengthPercentageAuto::percent(*p / 100.0))
+        }
+        crate::dom::StyleValue::ViewportWidth(num) => Some(
+            taffy::style::LengthPercentageAuto::length((num / 100.0) * vw),
+        ),
+        crate::dom::StyleValue::ViewportHeight(num) => Some(
+            taffy::style::LengthPercentageAuto::length((num / 100.0) * vh),
+        ),
+        crate::dom::StyleValue::Em(num) => {
+            Some(taffy::style::LengthPercentageAuto::length(num * font_size))
+        }
+        crate::dom::StyleValue::Rem(num) => {
+            Some(taffy::style::LengthPercentageAuto::length(num * font_size))
+        }
         _ => None,
     }
 }
 
 #[inline]
-fn parse_length_percentage(val: &crate::dom::StyleValue, vw: f32, vh: f32, font_size: f32) -> Option<taffy::style::LengthPercentage> {
+fn parse_length_percentage(
+    val: &crate::dom::StyleValue,
+    vw: f32,
+    vh: f32,
+    font_size: f32,
+) -> Option<taffy::style::LengthPercentage> {
     match val {
         crate::dom::StyleValue::LengthPx(num) => Some(taffy::style::LengthPercentage::length(*num)),
-        crate::dom::StyleValue::Percent(p) => Some(taffy::style::LengthPercentage::percent(*p / 100.0)),
-        crate::dom::StyleValue::ViewportWidth(num) => Some(taffy::style::LengthPercentage::length((num / 100.0) * vw)),
-        crate::dom::StyleValue::ViewportHeight(num) => Some(taffy::style::LengthPercentage::length((num / 100.0) * vh)),
-        crate::dom::StyleValue::Em(num) => Some(taffy::style::LengthPercentage::length(num * font_size)),
-        crate::dom::StyleValue::Rem(num) => Some(taffy::style::LengthPercentage::length(num * font_size)),
+        crate::dom::StyleValue::Percent(p) => {
+            Some(taffy::style::LengthPercentage::percent(*p / 100.0))
+        }
+        crate::dom::StyleValue::ViewportWidth(num) => {
+            Some(taffy::style::LengthPercentage::length((num / 100.0) * vw))
+        }
+        crate::dom::StyleValue::ViewportHeight(num) => {
+            Some(taffy::style::LengthPercentage::length((num / 100.0) * vh))
+        }
+        crate::dom::StyleValue::Em(num) => {
+            Some(taffy::style::LengthPercentage::length(num * font_size))
+        }
+        crate::dom::StyleValue::Rem(num) => {
+            Some(taffy::style::LengthPercentage::length(num * font_size))
+        }
         _ => None,
     }
 }

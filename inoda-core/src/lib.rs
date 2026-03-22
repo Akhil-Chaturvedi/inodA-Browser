@@ -39,8 +39,9 @@ mod tests {
 
         let mut font_system = cosmic_text::FontSystem::new();
         let mut buffer_cache = std::collections::HashMap::new();
-        let (layout_tree, root_node, _text_cache) = layout::compute_layout(&doc, 320.0, 240.0, &mut font_system, &mut buffer_cache);
-        taffy::print_tree(&layout_tree, root_node);
+        let (root_node, _text_cache) =
+            layout::compute_layout(&mut doc, 320.0, 240.0, &mut font_system, &mut buffer_cache);
+        taffy::print_tree(&doc.taffy_tree, root_node);
 
         // Test Renderer Bridge Compile
         // For testing the bridge algorithm itself without a concrete backend, we just verify
@@ -69,8 +70,6 @@ mod tests {
         // Test querySelector -- also returns a NodeHandle with tagName
         let result3 = engine.execute_script("document.querySelector('#test-id').tagName");
         assert_eq!(result3, "p");
-
-
 
         // Test NodeHandle getAttribute / setAttribute
         let _ = engine.execute_script(
@@ -143,10 +142,7 @@ mod tests {
         println!("Javascript execution completed successfully.");
     }
 
-    fn find_node(
-        doc: &crate::dom::Document,
-        name: &str,
-    ) -> Option<crate::dom::NodeId> {
+    fn find_node(doc: &crate::dom::Document, name: &str) -> Option<crate::dom::NodeId> {
         doc.nodes.iter().find_map(|(id, node)| {
             if let crate::dom::Node::Element(data) = node {
                 if &*data.tag_name == name {
@@ -171,6 +167,7 @@ mod tests {
             prev_sibling: None,
             next_sibling: None,
             computed: dom::ComputedStyle::default(),
+            taffy_node: None,
         }));
 
         let child = doc.add_node(dom::Node::Element(dom::ElementData {
@@ -183,6 +180,7 @@ mod tests {
             prev_sibling: None,
             next_sibling: None,
             computed: dom::ComputedStyle::default(),
+            taffy_node: None,
         }));
 
         let grandchild = doc.add_node(dom::Node::Text(dom::TextData {
@@ -191,6 +189,7 @@ mod tests {
             prev_sibling: None,
             next_sibling: None,
             computed: dom::ComputedStyle::default(),
+            taffy_node: None,
         }));
 
         doc.append_child(doc.root_id, parent);
@@ -264,7 +263,7 @@ mod tests {
             "Descendant combinator failed"
         );
 
-        // Since ComputedStyle currently tracks color manually, let's just make sure 
+        // Since ComputedStyle currently tracks color manually, let's just make sure
         // the color from the child combinator didn't cascade since it shouldn't match.
         assert_ne!(
             span_computed.color,

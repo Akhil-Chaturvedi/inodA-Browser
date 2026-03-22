@@ -211,7 +211,20 @@ pub fn parse_style_value(val: &str) -> crate::dom::StyleValue {
     if let Ok(num) = trimmed.parse::<f32>() {
         return crate::dom::StyleValue::Number(num);
     }
-    crate::dom::StyleValue::Keyword(string_cache::DefaultAtom::from(trimmed))
+
+    let known_keywords = [
+        "auto", "none", "block", "inline", "flex", "grid", 
+        "row", "column", "inherit",
+        "absolute", "relative", "fixed", "sticky",
+        "hidden", "visible", "scroll", "clip",
+        "center", "start", "end", "stretch", "space-between", "space-around"
+    ];
+
+    if known_keywords.contains(&trimmed) {
+        crate::dom::StyleValue::Keyword(string_cache::DefaultAtom::from(trimmed))
+    } else {
+        crate::dom::StyleValue::Keyword(string_cache::DefaultAtom::from("unknown"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +380,7 @@ fn match_compound_selector(
     compound: &CompoundSelector,
     tag_name: &crate::dom::LocalName,
     attributes: &[(string_cache::DefaultAtom, String)],
-    classes: &[String],
+    classes: &str,
 ) -> bool {
     if compound.parts.is_empty() {
         return false;
@@ -386,8 +399,7 @@ fn match_compound_selector(
                 }
             }
             SimpleSelector::Class(c) => {
-                let class_string = c.to_string();
-                if !classes.contains(&class_string) {
+                if !classes.split_whitespace().any(|cls| cls == c) {
                     return false;
                 }
             }
@@ -525,7 +537,7 @@ fn compute_node_styles_recursive(
                             lists.push(rules.as_slice());
                         }
                     }
-                    for class in &data.classes {
+                    for class in data.classes.split_whitespace() {
                         if let Some(rules) = stylesheet.by_class.get(class) {
                             lists.push(rules.as_slice());
                         }
@@ -584,16 +596,14 @@ fn compute_node_styles_recursive(
                     }
                 }
 
-                if let Some((_, style_attr)) = data.attributes.iter().find(|(k, _)| &**k == "style")
-                {
-                    let inline_decls = parse_inline_declarations(style_attr);
-                    for decl in &inline_decls {
+                if let Some(inline_decls) = &data.cached_inline_styles {
+                    for (name, value) in inline_decls {
                         if let Some(pos) =
-                            new_declarations.iter().position(|(k, _)| k == &decl.name)
+                            new_declarations.iter().position(|(k, _)| k == name)
                         {
-                            new_declarations[pos].1 = decl.value.clone();
+                            new_declarations[pos].1 = value.clone();
                         } else {
-                            new_declarations.push((decl.name.clone(), decl.value.clone()));
+                            new_declarations.push((name.clone(), value.clone()));
                         }
                     }
                 }

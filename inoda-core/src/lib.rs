@@ -160,7 +160,8 @@ mod tests {
         let parent = doc.add_node(dom::Node::Element(dom::ElementData {
             tag_name: dom::LocalName::Standard(string_cache::DefaultAtom::from("div")),
             attributes: Vec::new(),
-            classes: Vec::new(),
+            classes: String::new(),
+            cached_inline_styles: None,
             parent: None,
             first_child: None,
             last_child: None,
@@ -174,7 +175,8 @@ mod tests {
         let child = doc.add_node(dom::Node::Element(dom::ElementData {
             tag_name: dom::LocalName::Standard(string_cache::DefaultAtom::from("span")),
             attributes: Vec::new(),
-            classes: Vec::new(),
+            classes: String::new(),
+            cached_inline_styles: None,
             parent: None,
             first_child: None,
             last_child: None,

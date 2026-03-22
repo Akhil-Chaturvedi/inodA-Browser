@@ -20,7 +20,7 @@ css::compute_styles()       -- rebuilds document.stylesheet if styles_dirty,
 layout::compute_layout()    -- prepares text buffers in a pre-pass,
   |                            calculates max/min intrinsic widths,
   |                            builds a TaffyTree from the arena DOM,
-  |                            uses O(1) metrics for measure estimations,
+  |                            performs accurate re-wrapping via buffer.set_size(),
   |                            resolves dimensions (px, %, vw, vh, em, rem, auto),
   |                            runs Taffy flexbox/grid solver -> positioned Layout tree
   v
@@ -32,7 +32,7 @@ render::draw_layout_tree()  -- walks Taffy layout tree alongside the arena DOM,
 
 JavaScript execution is separate from this pipeline. DOM nodes exposed to JS carry a `js_handles` reference count. QuickJS wrapper objects are tracked by a `FinalizationRegistry`; when GC'd, they decrement the `js_handles` count for the corresponding Rust arena node. Detached nodes are only wiped from the arena when no JS handles remain.
 
-JS mutations set `document.dirty = true`. The host application is responsible for checking `dirty` and re-running `compute_styles`, `compute_layout`, and `draw_layout_tree` after JS mutations. Timer callbacks registered via `setTimeout` or `setInterval` fire only when the host calls `JsEngine::pump()`. Every 60 ticks, `runtime.run_gc()` is called to process the `FinalizationRegistry` and release unreferenced nodes.
+JS mutations set `document.dirty = true`. The host application is responsible for checking `dirty` and re-running `compute_styles`, `compute_layout`, and `draw_layout_tree` after JS mutations. Timer callbacks registered via `setTimeout` or `setInterval` fire only when the host calls `JsEngine::pump()`. Every 60 ticks, `runtime.run_gc()` and `document.collect_garbage()` are called to process the `FinalizationRegistry` and clear the batched deletion queue.
 
 ## Data structures
 
@@ -55,7 +55,8 @@ NodeId = generational_arena::Index  // type alias
 ElementData {
     tag_name: LocalName,                             // Standard(DefaultAtom) for HTML tags, Custom(String) for custom elements
     attributes: Vec<(string_cache::DefaultAtom, String)>,
-    classes: Vec<String>,                            // heap-allocated Strings; never interned to avoid global atom pool growth
+    classes: String,                                 // flat space-separated String; never interned to avoid global atom pool growth
+    cached_inline_styles: Option<Vec<(PropertyName, StyleValue)>>, // O(1) style lookup
     parent:       Option<NodeId>,
     first_child:  Option<NodeId>,
     last_child:   Option<NodeId>,
@@ -85,7 +86,7 @@ Generational indices prevent ABA problems. The DOM tree is wired as an intrusive
 
 `LocalName` separates standard HTML tags (interned as `DefaultAtom`) from custom element names (heap-allocated `String`). This prevents unbounded growth of the global `DefaultAtom` intern pool when arbitrary custom element names are created from JavaScript.
 
-`ElementData::classes` stores each class token as a plain `String`. CSS class names are uncontrolled user input (modern frameworks generate randomized names like `css-1x8g9u`); interning them as `DefaultAtom` would cause the global intern pool to grow unboundedly and never shrink. ID values are also stored as `String` in `id_map` and are looked up by `&str`. Attribute keys for recognized HTML attributes (e.g. `id`, `class`, `style`) are still interned as `DefaultAtom` since the set of valid attribute names is bounded.
+`ElementData::classes` stores class tokens in a single space-separated `String`. CSS class names are uncontrolled user input (modern frameworks generate randomized names like `css-1x8g9u`); interning them as `DefaultAtom` would cause the global intern pool to grow unboundedly and never shrink. ID values are also stored as `String` in `id_map` and are looked up by `&str`. Attribute keys for recognized HTML attributes (e.g. `id`, `class`, `style`) are interned as `DefaultAtom` since the set of valid attribute names is bounded. Unrecognized keywords in `StyleValue` are whitelisted to prevent arbitrary string leakage into the atom pool.
 
 ### ComputedStyle (dom/mod.rs)
 
@@ -95,9 +96,9 @@ ComputedStyle {
     flex_direction: DefaultAtom,       // "row", "column"
     width:         StyleValue,
     height:        StyleValue,
-    margin:        [StyleValue; 4],    // top, right, bottom, left
-    padding:       [StyleValue; 4],
-    border_width:  [StyleValue; 4],
+    margin:        Box<[StyleValue; 4]>,    // top, right, bottom, left (Boxed for cache locality)
+    padding:       Box<[StyleValue; 4]>,
+    border_width:  Box<[StyleValue; 4]>,
     bg_color:      Option<(u8, u8, u8)>,
     border_color:  Option<(u8, u8, u8)>,
     font_size:     f32,                // absolute pixels, resolved during cascade
@@ -152,7 +153,7 @@ PendingTimer {
 }
 ```
 
-Timers are stored in a `std::collections::BinaryHeap` ordered by `fire_at` (min-heap via reversed `Ord`). Cancelled timer IDs are tracked in a `HashSet<u32>`; `pump()` skips any popped timer whose ID is in the set. When an interval timer fires, `pump()` reschedules it by pushing a new `PendingTimer` with `fire_at = now + delay_ms`. The `BinaryHeap` does not support in-place cancellation -- the cancel set approach avoids rebuilding the heap on `clearTimeout`.
+Timers are stored in a `std::collections::BinaryHeap` ordered by `fire_at` (min-heap via reversed `Ord`). Active timer IDs are tracked in an `active_timers` HashSet; `pump()` skips any popped timer whose ID is no longer in the set. When an interval timer fires, `pump()` reschedules it by pushing a new `PendingTimer` with `fire_at = now + delay_ms`. The `BinaryHeap` does not support in-place cancellation -- the active set approach avoids rebuilding the heap on `clearTimeout`.
 
 ## Cascade and inheritance
 
@@ -172,9 +173,9 @@ Combinator evaluation (`>` child, space descendant) walks arena parent pointers 
 
 `JsEngine` holds the `Document` inside `Rc<RefCell<Document>>`. DOM-mutating JS functions call `doc.dirty = true` after making changes.
 
-Each DOM node exposed to JS carries a `__nodeKey` property: a two-element array `[u32 index, u64 generation]`. The `__nodeCache` Map is keyed by a `BigInt` value computed as `BigInt(index) | (BigInt(generation) << 32n)`. This avoids string allocation for cache keys. A `FinalizationRegistry` receives the integer array when QuickJS garbage-collects a wrapper; it recomputes the BigInt key for cache removal and calls `_garbageCollectNodeRaw` with the raw integer array. `_garbageCollectNodeRaw` reconstructs the `NodeId` directly from the two integers and removes the arena entry only if the node is not attached to the DOM tree.
+JavaScript object identity (`===`) is enforced via a `_wrapNode` WeakRef cache. Rust traversals (e.g. `parentNode`, `firstChild`) are patched onto the `NodeHandle` prototype as closures that proxy through this cache. A `FinalizationRegistry` receives the raw `[index, generation]` integer array when QuickJS garbage-collects a wrapper; it invokes `_garbageCollectNodeRaw` (mapped to `try_cleanup_node` in Rust) to decrement the handle count.
 
-`JsEngine` also maintains a `pump_ticks` counter. Every 60 calls to `pump()`, `runtime.run_gc()` is called synchronously. This forces QuickJS to sweep `FinalizationRegistry` callbacks that it would otherwise defer indefinitely, preventing the arena from accumulating detached nodes until the host runs out of memory.
+`JsEngine` also maintains a `pump_ticks` counter. Every 60 calls to `pump()`, `runtime.run_gc()` and `document.collect_garbage()` are called synchronously. This forces QuickJS to sweep `FinalizationRegistry` callbacks and triggers a batched sweep of the Rust arena for detached, unreferenced nodes.
 
 `NodeHandle` does not implement `Drop`. Nodes created by JavaScript persist in the arena until explicitly removed via `removeChild()`. This prevents QuickJS garbage collection from triggering arena mutations on nodes that are still part of the tree.
 
@@ -182,7 +183,7 @@ Each DOM node exposed to JS carries a `__nodeKey` property: a two-element array 
 
 The text render loop calls `buffer.layout_runs()` and invokes `draw_glyphs` once per `LayoutRun`, passing `run.glyphs` (a `&[LayoutGlyph]` slice borrowed directly from the buffer) and `run.line_y` as the vertical offset. No intermediate `Vec` is allocated during the render pass.
 
-During `compute_layout_with_measure`, the measure closure calls `buffer.set_size()` and `buffer.shape_until_scroll()` to re-wrap text at the available width. After the layout solver finishes, `finalize_text_measurements` reshapes each buffer at its final resolved width. The renderer reads `LayoutGlyph` iterators directly from `buffer.layout_runs()`.
+During `compute_layout_with_measure`, the measure closure calls `buffer.set_size()` and re-wraps text at the available width constraint. Accurate height resolution is achieved by querying the resulting layout runs. After the layout solver finishes, `finalize_text_measurements` reshapes each buffer at its final resolved width if necessary. The renderer reads `LayoutGlyph` iterators directly from `buffer.layout_runs()`.
 
 ## HTML parsing
 

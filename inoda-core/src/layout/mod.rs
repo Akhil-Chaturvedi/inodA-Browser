@@ -50,40 +50,49 @@ pub fn compute_layout(
     };
 
     let font_system_cell = RefCell::new(font_system);
+    {
+        let buffer_cache_cell = RefCell::new(&mut *buffer_cache);
 
-    tree.compute_layout_with_measure(
-        root_taffy_node,
-        available_space,
-        |_known_dimensions,
-         available_space,
-         _node_id,
-         context: Option<&mut crate::dom::TextMeasureContext>,
-         _style| {
-            let Some(ctx) = context else {
-                return taffy::geometry::Size::ZERO;
-            };
+        tree.compute_layout_with_measure(
+            root_taffy_node,
+            available_space,
+            |_known_dimensions,
+             available_space,
+             _node_id,
+             context: Option<&mut crate::dom::TextMeasureContext>,
+             _style| {
+                let Some(ctx) = context else {
+                    return taffy::geometry::Size::ZERO;
+                };
 
-            let width_constraint = match available_space.width {
-                AvailableSpace::Definite(w) if w.is_finite() && w > 0.0 => w,
-                _ => viewport_width.max(1.0),
-            };
+                let width_constraint = match available_space.width {
+                    AvailableSpace::Definite(w) if w.is_finite() && w > 0.0 => w,
+                    _ => viewport_width.max(1.0),
+                };
 
-            // $O(1)$ Estimation: height = ceil(max_width / width_constraint) * line_height
-            // This avoids HarfBuzz shaping in the tight Flexbox loop.
-            let width = ctx.max_intrinsic_width.min(width_constraint);
-            let line_count = if width_constraint >= ctx.max_intrinsic_width {
-                1.0
-            } else {
-                (ctx.max_intrinsic_width / width_constraint.max(1.0)).ceil().max(1.0)
-            };
+                let mut fs = font_system_cell.borrow_mut();
+                let mut bc = buffer_cache_cell.borrow_mut();
 
-            let line_height = (ctx.font_size * 1.2).max(1.0);
-            let height = line_count * line_height;
+                if let Some(buffer) = bc.get_mut(&ctx.node_id) {
+                    // Adjust width and trigger re-wrap (not full re-shape)
+                    buffer.set_size(&mut fs, Some(width_constraint), None);
+                    let line_count = buffer.layout_runs().count() as f32;
+                    let line_height = (ctx.font_size * 1.2).max(1.0);
+                    
+                    let width = ctx.max_intrinsic_width.min(width_constraint);
+                    let height = (line_count * line_height).max(line_height);
 
-            taffy::geometry::Size { width, height }
-        },
-    )
-    .unwrap();
+                    taffy::geometry::Size { width, height }
+                } else {
+                    // Fallback to minimal approximation if buffer is missing
+                    let width = ctx.max_intrinsic_width.min(width_constraint);
+                    let height = (ctx.font_size * 1.2).max(1.0);
+                    taffy::geometry::Size { width, height }
+                }
+            },
+        )
+        .unwrap();
+    }
 
     // We walk the tree one last time to enforce exact text heights for empty nodes
     finalize_text_measurements(

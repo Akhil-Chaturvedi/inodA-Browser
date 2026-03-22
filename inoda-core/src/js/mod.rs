@@ -15,12 +15,12 @@
 //! - `handle.removeChild(child)`
 //!
 //! Each `NodeHandle` carries a `__nodeKey` property: a two-element JS array
-//! `[u32 index, u64 generation]`. The `__nodeCache` Map is keyed by the
-//! string `"index:generation"` built from that array. A `FinalizationRegistry`
+//! `[u32 index, u64 generation]`. JavaScript object identity (`===`) is enforced
+//! via a `_wrapNode` WeakRef cache in the JS environment. A `FinalizationRegistry`
 //! receives the integer array when a wrapper is GC'd and calls the native Rust
-//! `_garbageCollectNodeRaw`, which reconstructs the `NodeId` from the two
-//! integers without string parsing and removes the node from the arena if it
-//! is detached from the DOM tree.
+//! `_garbageCollectNodeRaw` (mapped to `try_cleanup_node`), which decrements
+//! the handle count. Detached nodes are cleared from the arena by the batched
+//! `collect_garbage()` sweep.
 //!
 //! The Document is held behind `Rc<RefCell<Document>>` for single-threaded access.
 //! All JS operations are synchronous and serialized through this lock.
@@ -146,8 +146,8 @@ pub struct JsEngine {
     next_timer_id: Rc<Cell<u32>>,
     /// Min-Heap of pending timers waiting to fire.
     pending_timers: Rc<RefCell<std::collections::BinaryHeap<PendingTimer>>>,
-    /// Track cancelled timers natively preventing runaway intervals.
-    cancelled_timers: Rc<RefCell<std::collections::HashSet<u32>>>,
+    /// Track active timers natively preventing runaway intervals.
+    active_timers: Rc<RefCell<std::collections::HashSet<u32>>>,
     /// Track iterations for deterministic QuickJS garbage collection.
     pump_ticks: Rc<Cell<u32>>,
 }
@@ -163,7 +163,7 @@ impl JsEngine {
             document: Rc::new(RefCell::new(document)),
             next_timer_id: Rc::new(Cell::new(1)),
             pending_timers: Rc::new(RefCell::new(std::collections::BinaryHeap::new())),
-            cancelled_timers: Rc::new(RefCell::new(std::collections::HashSet::new())),
+            active_timers: Rc::new(RefCell::new(std::collections::HashSet::new())),
             pump_ticks: Rc::new(Cell::new(0)),
         };
 
@@ -176,12 +176,13 @@ impl JsEngine {
         let doc_ref = self.document.clone();
         let timer_id_counter = self.next_timer_id.clone();
         let pending_timers = self.pending_timers.clone();
-        let cancelled_timers = self.cancelled_timers.clone();
+        let active_timers = self.active_timers.clone();
 
         self.context.with(|ctx| {
             let globals = ctx.globals();
 
             // Register the NodeHandle class prototype
+            rquickjs::Class::<NodeHandle>::define(&globals).unwrap();
             let proto = rquickjs::Class::<NodeHandle>::prototype(&ctx)
                 .unwrap()
                 .unwrap();
@@ -253,13 +254,11 @@ impl JsEngine {
                         }
 
                         if &*local_attr == "class" {
-                            data.classes.clear();
-                            for c in value.split_whitespace() {
-                                let class_string = c.to_string();
-                                if !data.classes.contains(&class_string) {
-                                    data.classes.push(class_string);
-                                }
-                            }
+                            data.classes = value.trim().to_string();
+                        } else if &*local_attr == "style" {
+                            let decls = crate::css::parse_inline_declarations(&value);
+                            let mapped: Vec<_> = decls.into_iter().map(|d| (d.name, d.value)).collect();
+                            data.cached_inline_styles = Some(mapped);
                         }
                     }
                 }
@@ -299,7 +298,7 @@ impl JsEngine {
                 }
             })
             .unwrap();
-            proto.set("parentNode", parent_node_func).unwrap();
+            proto.set("_parentNodeRaw", parent_node_func).unwrap();
 
             let first_child_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
@@ -320,7 +319,7 @@ impl JsEngine {
                 }
             })
             .unwrap();
-            proto.set("firstChild", first_child_func).unwrap();
+            proto.set("_firstChildRaw", first_child_func).unwrap();
 
             let next_sibling_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
@@ -341,7 +340,7 @@ impl JsEngine {
                 }
             })
             .unwrap();
-            proto.set("nextSibling", next_sibling_func).unwrap();
+            proto.set("_nextSiblingRaw", next_sibling_func).unwrap();
 
             // --- console object ---
             let console_obj = rquickjs::Object::new(ctx.clone()).unwrap();
@@ -397,32 +396,46 @@ impl JsEngine {
                 let doc_ref = doc_ref.clone();
                 move |selector: String| -> Option<NodeHandle> {
                     let mut doc = doc_ref.borrow_mut();
-                    let mut found_id = None;
-                    let mut tag_name = String::new();
-                    
-                    for (node_id, node) in doc.nodes.iter() {
-                        if let crate::dom::Node::Element(data) = node {
-                            let is_match = if selector.starts_with('.') {
-                                let class_name = &selector[1..];
-                                data.classes.iter().any(|c| &**c == class_name)
-                            } else if selector.starts_with('#') {
-                                let id_name = &selector[1..];
-                                data.attributes
-                                    .iter()
-                                    .any(|(k, v)| &**k == "id" && v == id_name)
-                            } else {
-                                &*data.tag_name == selector
-                            };
+                    let root_id = doc.root_id;
 
-                            if is_match {
-                                found_id = Some(node_id);
-                                tag_name = data.tag_name.to_string();
-                                break;
-                            }
+                    fn matches_selector(selector: &str, data: &crate::dom::ElementData) -> bool {
+                        if selector.starts_with('.') {
+                            let class_name = &selector[1..];
+                            data.classes.split_whitespace().any(|c| c == class_name)
+                        } else if selector.starts_with('#') {
+                            let id_name = &selector[1..];
+                            data.attributes
+                                .iter()
+                                .any(|(k, v)| &**k == "id" && v == id_name)
+                        } else {
+                            &*data.tag_name == selector
                         }
                     }
 
-                    if let Some(node_id) = found_id {
+                    fn find_recursive(
+                        doc: &crate::dom::Document,
+                        current: crate::dom::NodeId,
+                        selector: &str,
+                    ) -> Option<(crate::dom::NodeId, String)> {
+                        if let Some(node) = doc.nodes.get(current) {
+                            if let crate::dom::Node::Element(data) = node {
+                                if matches_selector(selector, data) {
+                                    return Some((current, data.tag_name.to_string()));
+                                }
+                            }
+
+                            let mut child = doc.first_child_of(current);
+                            while let Some(c) = child {
+                                if let Some(found) = find_recursive(doc, c, selector) {
+                                    return Some(found);
+                                }
+                                child = doc.next_sibling_of(c);
+                            }
+                        }
+                        None
+                    }
+
+                    if let Some((node_id, tag_name)) = find_recursive(&doc, root_id, &selector) {
                         if let Some(node) = doc.nodes.get_mut(node_id) {
                             match node {
                                 crate::dom::Node::Element(d) => d.js_handles += 1,
@@ -464,7 +477,8 @@ impl JsEngine {
                     let node = crate::dom::Node::Element(crate::dom::ElementData {
                         tag_name: local_name.clone(),
                         attributes: Vec::new(),
-                        classes: Vec::new(),
+                        classes: String::new(),
+                        cached_inline_styles: None,
                         parent: None,
                         first_child: None,
                         last_child: None,
@@ -553,13 +567,27 @@ impl JsEngine {
                 )
                 .unwrap();
 
+            let patch_func: rquickjs::Function = ctx.eval(
+                r#"
+                (function(proto) {
+                    Object.defineProperty(proto, "parentNode", { get() { return document._wrapNode(this._parentNodeRaw()); } });
+                    Object.defineProperty(proto, "firstChild", { get() { return document._wrapNode(this._firstChildRaw()); } });
+                    Object.defineProperty(proto, "nextSibling", { get() { return document._wrapNode(this._nextSiblingRaw()); } });
+                })
+                "#,
+            ).unwrap();
+            let _: () = patch_func.call((proto.clone(),)).unwrap();
+
             // --- setTimeout with Persistent<Function> storage ---
             let set_timeout_func = rquickjs::Function::new(ctx.clone(), {
                 let timer_id_counter = timer_id_counter.clone();
                 let pending_timers = pending_timers.clone();
+                let active_timers = active_timers.clone();
                 move |cb: Persistent<rquickjs::Function<'static>>, delay: i32| -> u32 {
                     let timer_id = timer_id_counter.get();
                     timer_id_counter.set(timer_id + 1);
+
+                    active_timers.borrow_mut().insert(timer_id);
 
                     let delay_ms = delay.max(0) as u64;
                     let fire_at = Instant::now() + std::time::Duration::from_millis(delay_ms);
@@ -580,9 +608,12 @@ impl JsEngine {
             let set_interval_func = rquickjs::Function::new(ctx.clone(), {
                 let timer_id_counter = timer_id_counter.clone();
                 let pending_timers = pending_timers.clone();
+                let active_timers = active_timers.clone();
                 move |cb: Persistent<rquickjs::Function<'static>>, delay: i32| -> u32 {
                     let timer_id = timer_id_counter.get();
                     timer_id_counter.set(timer_id + 1);
+
+                    active_timers.borrow_mut().insert(timer_id);
 
                     let delay_ms = delay.max(0) as u64;
                     let fire_at = Instant::now() + std::time::Duration::from_millis(delay_ms);
@@ -601,9 +632,9 @@ impl JsEngine {
             .unwrap();
 
             let clear_timer_func = rquickjs::Function::new(ctx.clone(), {
-                let cancelled_timers = cancelled_timers.clone();
+                let active_timers = active_timers.clone();
                 move |id: u32| {
-                    cancelled_timers.borrow_mut().insert(id);
+                    active_timers.borrow_mut().remove(&id);
                 }
             })
             .unwrap();
@@ -626,12 +657,16 @@ impl JsEngine {
         let mut rescheduled = Vec::new();
         {
             let mut timers = self.pending_timers.borrow_mut();
-            let mut cancelled = self.cancelled_timers.borrow_mut();
+            let mut active = self.active_timers.borrow_mut();
             while let Some(top) = timers.peek() {
                 if top.fire_at <= now {
                     let timer = timers.pop().unwrap();
-                    if cancelled.remove(&timer.id) {
+                    if !active.contains(&timer.id) {
                         continue;
+                    }
+
+                    if !timer.is_interval {
+                        active.remove(&timer.id);
                     }
 
                     expired.push(timer.callback.clone());
@@ -672,6 +707,8 @@ impl JsEngine {
         } else {
             self.pump_ticks.set(ticks + 1);
         }
+
+        self.document.borrow_mut().collect_garbage();
 
         count
     }

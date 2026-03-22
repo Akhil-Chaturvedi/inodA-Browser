@@ -86,8 +86,9 @@ pub fn parse_html(html: &str) -> Document {
                 }
 
                 let mut attributes = Vec::new();
-                let mut classes = Vec::new();
+                let mut classes = String::new();
                 let mut id_val = None;
+                let mut cached_inline_styles = None;
 
                 for (key, value) in tag.attributes {
                     if let (Ok(k_str), Ok(v_str)) =
@@ -96,14 +97,18 @@ pub fn parse_html(html: &str) -> Document {
                         let k_atom = DefaultAtom::from(k_str);
 
                         if &*k_atom == "class" {
-                            for c in v_str.split_whitespace() {
-                                let class_string = c.to_string();
-                                if !classes.contains(&class_string) {
-                                    classes.push(class_string);
-                                }
+                            if classes.is_empty() {
+                                classes = v_str.trim().to_string();
+                            } else {
+                                classes.push(' ');
+                                classes.push_str(v_str.trim());
                             }
                         } else if &*k_atom == "id" {
                             id_val = Some(v_str.to_string());
+                        } else if &*k_atom == "style" {
+                            let decls = crate::css::parse_inline_declarations(v_str.trim());
+                            let mapped: Vec<_> = decls.into_iter().map(|d| (d.name, d.value)).collect();
+                            cached_inline_styles = Some(mapped);
                         }
                         attributes.push((k_atom, v_str.to_string()));
                     }
@@ -113,6 +118,7 @@ pub fn parse_html(html: &str) -> Document {
                     tag_name: tag_name.clone(),
                     attributes,
                     classes,
+                    cached_inline_styles,
                     parent: None,
                     first_child: None,
                     last_child: None,

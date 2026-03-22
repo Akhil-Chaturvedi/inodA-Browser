@@ -284,7 +284,10 @@ impl PropertyName {
 pub struct ElementData {
     pub tag_name: LocalName,
     pub attributes: Vec<(string_cache::DefaultAtom, String)>,
-    pub classes: Vec<String>,
+    /// Space-separated class list. Stored as a flat string to minimize heap fragments.
+    pub classes: String,
+    /// Pre-parsed inline styles to bypass re-parsing during the CSS cascade.
+    pub cached_inline_styles: Option<Vec<(PropertyName, StyleValue)>>,
     pub parent: Option<NodeId>,
     pub first_child: Option<NodeId>,
     pub last_child: Option<NodeId>,
@@ -336,9 +339,10 @@ pub struct ComputedStyle {
     pub flex_direction: string_cache::DefaultAtom,
     pub width: StyleValue,
     pub height: StyleValue,
-    pub margin: [StyleValue; 4],
-    pub padding: [StyleValue; 4],
-    pub border_width: [StyleValue; 4],
+    /// Top, Right, Bottom, Left. Boxed to reduce node struct size and improve cache locality.
+    pub margin: Box<[StyleValue; 4]>,
+    pub padding: Box<[StyleValue; 4]>,
+    pub border_width: Box<[StyleValue; 4]>,
     pub bg_color: Option<(u8, u8, u8)>,
     pub border_color: Option<(u8, u8, u8)>,
     pub font_size: f32,
@@ -352,24 +356,24 @@ impl Default for ComputedStyle {
             flex_direction: string_cache::DefaultAtom::from("row"),
             width: StyleValue::Auto,
             height: StyleValue::Auto,
-            margin: [
+            margin: Box::new([
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
-            ],
-            padding: [
+            ]),
+            padding: Box::new([
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
-            ],
-            border_width: [
+            ]),
+            border_width: Box::new([
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
-            ],
+            ]),
             bg_color: None,
             border_color: None,
             font_size: 16.0,
@@ -498,17 +502,28 @@ impl Document {
             if *handles > 0 {
                 *handles -= 1;
             }
+            if *handles == 0 {
+                self.dead_nodes.push(id);
+            }
         }
+    }
 
-        // If it's now detached and the whole tree has 0 handles, wipe it.
-        // We find the "detached root" first.
-        let mut detached_root = id;
-        while let Some(parent) = self.parent_of(detached_root) {
-            detached_root = parent;
-        }
+    /// Performs a batched sweep of potential dead nodes. 
+    /// Should be called by the host application at the end of each frame.
+    pub fn collect_garbage(&mut self) {
+        let potential = std::mem::take(&mut self.dead_nodes);
+        for id in potential {
+            if !self.nodes.contains(id) { continue; }
+            
+            // Find the "detached root" of this node
+            let mut detached_root = id;
+            while let Some(parent) = self.parent_of(detached_root) {
+                detached_root = parent;
+            }
 
-        if detached_root != self.root_id && self.can_wipe_detached_tree(detached_root) {
-            self.wipe_node_recursive(detached_root);
+            if detached_root != self.root_id && self.can_wipe_detached_tree(detached_root) {
+                self.wipe_node_recursive(detached_root);
+            }
         }
     }
 

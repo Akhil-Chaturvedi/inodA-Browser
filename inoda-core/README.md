@@ -39,9 +39,7 @@ src/
 
 Tag names are stored as `LocalName`, which is either `Standard(DefaultAtom)` for known HTML elements (interned, pointer-equality comparison) or `Custom(String)` for custom element names. This prevents unbounded growth of the global intern pool from arbitrary names passed through `document.createElement`.
 
-Tag names are stored as `LocalName`, which is either `Standard(DefaultAtom)` for known HTML elements (interned, pointer-equality comparison) or `Custom(String)` for custom element names. This prevents unbounded growth of the global intern pool from arbitrary names passed through `document.createElement`.
-
-Attribute keys for known HTML attributes are interned as `DefaultAtom`. Element classes are stored in a `Vec<String>` rather than `Vec<DefaultAtom>`. CSS class names are uncontrolled user input -- frameworks like Tailwind or CSS-in-JS generate thousands of randomized class names per session. Interning them as `DefaultAtom` would grow the global pool permanently and never release memory. ID values are also stored as `String` for the same reason.
+Attribute keys for known HTML attributes are interned as `DefaultAtom`. Element classes are stored in a flat `String` as a space-separated list rather than a `Vec<String>`. This significantly reduces heap allocation overhead per element node. CSS class names are uncontrolled user input; frameworks like Tailwind or CSS-in-JS generate thousands of randomized class names per session. Interning them as `DefaultAtom` would grow the global pool permanently and never release memory. ID values are also stored as `String` for the same reason.
 
 `ComputedStyle` is stored directly on `ElementData` and `TextData`, populated once during `css::compute_styles()`. Layout and rendering read from `computed` fields without scanning style tuples.
 
@@ -49,9 +47,8 @@ Attribute keys for known HTML attributes are interned as `DefaultAtom`. Element 
 - `nodes: Arena<Node>` -- the arena
 - `stylesheet: StyleSheet` -- persistent, merged in-place as `<style>` tags are parsed
 - `id_map: HashMap<String, NodeId>` -- O(1) `getElementById` lookup
-- `dead_nodes: Vec<NodeId>` -- iterative deletion queue used by `remove_node`
-- `dirty: bool` -- set `true` by JS DOM mutations; the host must re-run compute/layout/render when true
 - `styles_dirty: bool` -- tracks if `<style>` tags were added or removed, triggering a clean stylesheet rebuild.
+- `dead_nodes: Vec<NodeId>` -- iterative deletion queue used by `remove_node` and batched by `collect_garbage()`.
 
 Node deletion is iterative (queue-based) to avoid stack overflow on deeply nested trees.
 
@@ -81,7 +78,7 @@ Content inside `<script>` and `<style>` is accumulated as raw text via an `insid
 
 Walks the arena DOM and builds a parallel `TaffyTree<TextMeasureContext>`. `prepare_text_buffers` performs HarfBuzz shaping in a pre-pass to calculate `max_intrinsic_width` and `min_intrinsic_width`. The buffer cache is caller-owned and persists across frames.
 
-The Taffy measure closure uses these pre-calculated metrics for $O(1)$ height estimations, avoiding expensive shaping during the layout solver loop. After Taffy converges, `finalize_text_measurements` performs the final shaping at the confirmed resolved width.
+The Taffy measure closure invokes `buffer.set_size()` and re-calculates the line count during the solver loop. This ensures accurate Flexbox/Grid height resolution across different width constraints while still benefiting from once-per-allocation HarfBuzz shaping in the pre-pass. Final shaping at resolved widths is performed by `finalize_text_measurements`.
 
 Layout properties are read from `computed` fields on each arena node.
 
@@ -115,7 +112,7 @@ Embeds QuickJS via `rquickjs`. `JsEngine` holds `Document` behind `Rc<RefCell<Do
 Exposed globals:
 - `console.log(msg)`, `console.warn(msg)`, `console.error(msg)` -- print to stdout
 - `document.getElementById(id)` -- returns a cached `NodeHandle` or null
-- `document.querySelector(selector)` -- tag, class, and ID selectors only; returns a cached `NodeHandle` or null
+- `document.querySelector(selector)` -- tag, class, and ID selectors only; performs a recursive $O(D)$ traversal of the attached tree (where $D$ is document size), skipping detached arena nodes. Returns a cached `NodeHandle` or null.
 - `document.createElement(tagName)` -- creates a detached element in the arena, returns a cached `NodeHandle`
 - `document.appendChild(parent, child)` -- appends child node, sets `document.dirty = true`
 - `document.addEventListener(event, callback)` -- records registration; does not dispatch events
@@ -129,7 +126,7 @@ Exposed globals:
 - `handle.setAttribute(key, value)` -- updates or inserts attribute, sets `document.dirty = true`
 - `handle.removeChild(child)` -- detaches child from parent, sets `document.dirty = true`
 
-The `__nodeCache` Map is keyed by a `BigInt` value: `BigInt(index) | (BigInt(generation) << 32n)`. This avoids string allocation for cache key construction. A `FinalizationRegistry` receives the raw `[index, generation]` integer array when QuickJS GC collects a wrapper; it computes the BigInt key for cache cleanup and calls `_garbageCollectNodeRaw` with the integer array. `_garbageCollectNodeRaw` reconstructs the `NodeId` from the two integers directly. Nodes are removed from the arena only if they are not currently attached to the DOM tree.
+JavaScript object identity (`===`) is enforced via a `_wrapNode` WeakRef cache in the JS environment. Rust getters for traversals (e.g. `parentNode`, `firstChild`) are patched onto the `NodeHandle` prototype using closures that proxy through this cache. A `FinalizationRegistry` receives the raw `[index, generation]` integer array when QuickJS GC collects a wrapper; it invokes `_garbageCollectNodeRaw` (mapped to `try_cleanup_node` in Rust) to decrement the node's handle count. Nodes are queued in `dead_nodes` and permanently removed from the arena by `collect_garbage()` once they are both detached and unreferenced.
 
 `NodeHandle` does not implement `Drop`. Nodes created via JavaScript persist in the arena until explicitly removed via `removeChild()`. This prevents QuickJS GC from invalidating arena slots for nodes that are still attached to the tree.
 
@@ -137,7 +134,7 @@ The `__nodeCache` Map is keyed by a `BigInt` value: `BigInt(index) | (BigInt(gen
 
 Timer callbacks are stored as `rquickjs::Persistent<Function>`. Pending timers are in a `BinaryHeap` sorted by `fire_at`. Cancelled timer IDs are tracked in a `HashSet<u32>`; `pump()` skips popped timers whose IDs appear in the set. When an interval timer fires, a new `PendingTimer` is pushed with the next scheduled time. Rescheduled interval timers are collected into a separate local `Vec` before being pushed back to the heap; this prevents `setInterval(cb, 0)` from re-appearing at the top of the heap within the same `pump()` call and locking the loop.
 
-`JsEngine` maintains a `pump_ticks` counter. Every 60 calls to `pump()`, `runtime.run_gc()` is called synchronously. QuickJS defers `FinalizationRegistry` callbacks by default; without this periodic sweep, detached arena nodes accumulate until the host runs out of memory. The host application must call `pump()` on its event loop tick.
+`JsEngine` maintains a `pump_ticks` counter. Every 60 calls to `pump()`, `runtime.run_gc()` and `document.collect_garbage()` are called synchronously. This forces QuickJS to sweep `FinalizationRegistry` callbacks and ensures the Rust arena drains its batched deletion queue. Detached arena nodes and stale references are cleared deterministically, preventing unbounded memory growth. The host application must call `pump()` on its event loop tick.
 
 ## Building
 

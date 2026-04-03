@@ -433,6 +433,30 @@ impl JsEngine {
                         None
                     }
 
+                    if selector.starts_with('#') {
+                        let id_name = &selector[1..];
+                        if let Some(&node_id) = doc.id_map.get(id_name) {
+                            if let Some(node) = doc.nodes.get_mut(node_id) {
+                                let tag_name = match node {
+                                    crate::dom::Node::Element(d) => {
+                                        d.js_handles += 1;
+                                        d.tag_name.to_string()
+                                    }
+                                    crate::dom::Node::Text(d) => {
+                                        d.js_handles += 1;
+                                        "text".to_string()
+                                    }
+                                    crate::dom::Node::Root(d) => {
+                                        d.js_handles += 1;
+                                        "root".to_string()
+                                    }
+                                };
+                                return Some(NodeHandle::from_node_id(node_id, tag_name));
+                            }
+                        }
+                        return None;
+                    }
+
                     if let Some((node_id, tag_name)) = find_recursive(&doc, root_id, &selector) {
                         if let Some(node) = doc.nodes.get_mut(node_id) {
                             match node {
@@ -545,7 +569,11 @@ impl JsEngine {
                     let cachedRef = document.__nodeCache.get(mapKey);
                     if (cachedRef) {
                         let cachedObj = cachedRef.deref();
-                        if (cachedObj) return cachedObj;
+                        if (cachedObj) {
+                            // Leak fix: manually decrement Rust refcount for the discarded new handle
+                            document._garbageCollectNodeRaw(keyPair);
+                            return cachedObj;
+                        }
                     }
                     document.__nodeCache.set(mapKey, new WeakRef(rawNode));
                     document.__nodeRegistry.register(rawNode, keyPair);

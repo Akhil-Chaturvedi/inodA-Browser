@@ -365,10 +365,10 @@ pub struct ComputedStyle {
     pub flex_direction: string_cache::DefaultAtom,
     pub width: StyleValue,
     pub height: StyleValue,
-    /// Top, Right, Bottom, Left. Boxed to reduce node struct size and improve cache locality.
-    pub margin: Box<[StyleValue; 4]>,
-    pub padding: Box<[StyleValue; 4]>,
-    pub border_width: Box<[StyleValue; 4]>,
+    /// Top, Right, Bottom, Left. Inline for cache locality and to reduce allocation overhead.
+    pub margin: [StyleValue; 4],
+    pub padding: [StyleValue; 4],
+    pub border_width: [StyleValue; 4],
     pub bg_color: Option<(u8, u8, u8)>,
     pub border_color: Option<(u8, u8, u8)>,
     pub font_size: f32,
@@ -382,24 +382,24 @@ impl Default for ComputedStyle {
             flex_direction: string_cache::DefaultAtom::from("row"),
             width: StyleValue::Auto,
             height: StyleValue::Auto,
-            margin: Box::new([
+            margin: [
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
-            ]),
-            padding: Box::new([
+            ],
+            padding: [
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
-            ]),
-            border_width: Box::new([
+            ],
+            border_width: [
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
-            ]),
+            ],
             bg_color: None,
             border_color: None,
             font_size: 16.0,

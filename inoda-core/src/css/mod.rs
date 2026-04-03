@@ -603,7 +603,7 @@ fn compute_node_styles_recursive(
 
                     let next_list = &lists[min_idx][1..];
                     if next_list.is_empty() {
-                        lists.remove(min_idx);
+                        lists.swap_remove(min_idx); // O(1) swap instead of O(N) shift
                     } else {
                         lists[min_idx] = next_list;
                     }
@@ -872,6 +872,22 @@ fn parse_rule<'i, 't>(
                                 name: crate::dom::PropertyName::from_str(right),
                                 value: parse_style_value(parts[1]),
                             });
+                        }
+                        3 => {
+                            // top, horizontal, bottom
+                            let values = [
+                                parse_style_value(parts[0]), // top
+                                parse_style_value(parts[1]), // horizontal (right)
+                                parse_style_value(parts[2]), // bottom
+                                parse_style_value(parts[1]), // horizontal (left)
+                            ];
+                            let names = [top, right, bottom, left];
+                            for i in 0..4 {
+                                declarations.push(Declaration {
+                                    name: crate::dom::PropertyName::from_str(names[i]),
+                                    value: values[i].clone(),
+                                });
+                            }
                         }
                         4 => {
                             declarations.push(Declaration {

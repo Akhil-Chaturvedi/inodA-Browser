@@ -32,7 +32,7 @@ render::draw_layout_tree()  -- walks Taffy layout tree alongside the arena DOM,
 
 JavaScript execution is separate from this pipeline. DOM nodes exposed to JS carry a `js_handles` reference count. QuickJS wrapper objects are tracked by a `FinalizationRegistry`; when GC'd, they decrement the `js_handles` count for the corresponding Rust arena node. Detached nodes are only wiped from the arena when no JS handles remain.
 
-JS mutations set `document.dirty = true`. The host application is responsible for checking `dirty` and re-running `compute_styles`, `compute_layout`, and `draw_layout_tree` after JS mutations. Timer callbacks registered via `setTimeout` or `setInterval` fire only when the host calls `JsEngine::pump()`. Every 60 ticks, `runtime.run_gc()` and `document.collect_garbage()` are called to process the `FinalizationRegistry` and clear the batched deletion queue.
+JS mutations set `document.dirty = true`. The host application is responsible for checking `dirty` and re-running `compute_styles`, `compute_layout`, and `draw_layout_tree` after JS mutations. Timer callbacks registered via `setTimeout` or `setInterval` fire only when the host calls `JsEngine::pump()`. `pump()` executes pending JavaScript jobs (microtasks/promises) asynchronously to sweep `FinalizationRegistry` callbacks. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue and reclaim memory from detached, unreferenced nodes.
 
 ## Data structures
 
@@ -54,7 +54,7 @@ NodeId = generational_arena::Index  // type alias
 
 ElementData {
     tag_name: LocalName,                             // Standard(DefaultAtom) for HTML tags, Custom(String) for custom elements
-    attributes: Vec<(string_cache::DefaultAtom, String)>,
+    attributes: Vec<(String, String)>,
     classes: String,                                 // flat space-separated String; never interned to avoid global atom pool growth
     cached_inline_styles: Option<Vec<(PropertyName, StyleValue)>>, // O(1) style lookup
     parent:       Option<NodeId>,
@@ -86,7 +86,7 @@ Generational indices prevent ABA problems. The DOM tree is wired as an intrusive
 
 `LocalName` separates standard HTML tags (interned as `DefaultAtom`) from custom element names (heap-allocated `String`). This prevents unbounded growth of the global `DefaultAtom` intern pool when arbitrary custom element names are created from JavaScript.
 
-`ElementData::classes` stores class tokens in a single space-separated `String`. CSS class names are uncontrolled user input (modern frameworks generate randomized names like `css-1x8g9u`); interning them as `DefaultAtom` would cause the global intern pool to grow unboundedly and never shrink. ID values are also stored as `String` in `id_map` and are looked up by `&str`. Attribute keys for recognized HTML attributes (e.g. `id`, `class`, `style`) are interned as `DefaultAtom` since the set of valid attribute names is bounded. Unrecognized keywords in `StyleValue` are whitelisted to prevent arbitrary string leakage into the atom pool.
+`ElementData::classes` stores class tokens in a single space-separated `String`. CSS class names are uncontrolled user input (modern frameworks generate randomized names like `css-1x8g9u`); interning them as `DefaultAtom` would cause the global intern pool to grow unboundedly and never shrink. ID values and attribute keys are also stored as `String` for the same reason, preventing OOM attacks from unbounded attribute labels. Unrecognized keywords in `StyleValue` are whitelisted to prevent arbitrary string leakage into the atom pool.
 
 ### ComputedStyle (dom/mod.rs)
 
@@ -96,9 +96,9 @@ ComputedStyle {
     flex_direction: DefaultAtom,       // "row", "column"
     width:         StyleValue,
     height:        StyleValue,
-    margin:        Box<[StyleValue; 4]>,    // top, right, bottom, left (Boxed for cache locality)
-    padding:       Box<[StyleValue; 4]>,
-    border_width:  Box<[StyleValue; 4]>,
+    margin:        [StyleValue; 4],    // top, right, bottom, left (Inline for cache locality)
+    padding:       [StyleValue; 4],
+    border_width:  [StyleValue; 4],
     bg_color:      Option<(u8, u8, u8)>,
     border_color:  Option<(u8, u8, u8)>,
     font_size:     f32,                // absolute pixels, resolved during cascade
@@ -135,7 +135,7 @@ Combinator    = Descendant | Child
 Declaration   { name: PropertyName, value: StyleValue }
 ```
 
-`PropertyName` is a strongly-typed enum covering all CSS properties the engine recognizes (`Display`, `Width`, `MarginTop`, `Color`, `FontSize`, etc.) with an `Other(u64)` variant for unrecognized names. It replaces `DefaultAtom` as the key in `Declaration`, eliminating string-deref comparisons from the cascade hot path. Property matching during `compute_styles` is a direct enum equality check.
+`PropertyName` is a strongly-typed enum covering all CSS properties the engine recognizes (`Display`, `Width`, `MarginTop`, `Color`, `FontSize`, etc.). It replaces `DefaultAtom` as the key in `Declaration`, eliminating string-deref comparisons from the cascade hot path. Property matching during `compute_styles` is a direct integer comparison using pre-computed enum variants mapped to a fixed-size `[Option<StyleValue>; 25]` array.
 
 Selectors are pre-parsed into ASTs at stylesheet creation time. Specificity is computed once. Rules are distributed into hash-map buckets based on their right-most simple selector. During style resolution, matching buckets are merged via a k-way pointer walk over pre-sorted slices.
 
@@ -173,9 +173,9 @@ Combinator evaluation (`>` child, space descendant) walks arena parent pointers 
 
 `JsEngine` holds the `Document` inside `Rc<RefCell<Document>>`. DOM-mutating JS functions call `doc.dirty = true` after making changes.
 
-JavaScript object identity (`===`) is enforced via a `_wrapNode` WeakRef cache. Rust traversals (e.g. `parentNode`, `firstChild`) are patched onto the `NodeHandle` prototype as closures that proxy through this cache. A `FinalizationRegistry` receives the raw `[index, generation]` integer array when QuickJS garbage-collects a wrapper; it invokes `_garbageCollectNodeRaw` (mapped to `try_cleanup_node` in Rust) to decrement the handle count.
+JavaScript object identity (`===`) is enforced via a `_wrapNode` WeakRef cache. Rust traversals (e.g. `parentNode`, `firstChild`) are patched onto the `NodeHandle` prototype as closures that proxy through this cache. A `FinalizationRegistry` receives the raw `[index, generation]` integer array when QuickJS garbage-collects a wrapper; it invokes `_garbageCollectNodeRaw` (mapped to `try_cleanup_node` in Rust) to decrement the handle count. To prevent the "Fat Node" memory leak, `_wrapNode` manually triggers `_garbageCollectNodeRaw` when a duplicate handle is received but discarded in favor of a cached wrapper.
 
-`JsEngine` also maintains a `pump_ticks` counter. Every 60 calls to `pump()`, `runtime.run_gc()` and `document.collect_garbage()` are called synchronously. This forces QuickJS to sweep `FinalizationRegistry` callbacks and triggers a batched sweep of the Rust arena for detached, unreferenced nodes.
+`JsEngine::pump()` executes pending JavaScript jobs (microtasks/promises) asynchronously to sweep `FinalizationRegistry` callbacks. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue and process the `FinalizationRegistry`. This ensures deterministic memory reclamation without blocking the main thread for expensive GC synchronous sweeps.
 
 `NodeHandle` does not implement `Drop`. Nodes created by JavaScript persist in the arena until explicitly removed via `removeChild()`. This prevents QuickJS garbage collection from triggering arena mutations on nodes that are still part of the tree.
 

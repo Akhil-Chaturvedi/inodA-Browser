@@ -6,8 +6,10 @@
 //! through an abstract backend trait, and exposes a DOM API through an
 //! embedded QuickJS runtime.
 //!
-//! Tag names, attribute keys, and CSS property names are interned via
-//! `string_cache::DefaultAtom` to reduce allocations on constrained devices.
+//! Tag names are interned via `string_cache::DefaultAtom`, while attribute keys
+//! and values are stored as `String` to ensure OOM safety and deterministic
+//! memory reclamation. CSS property resolution uses a fixed-size array mapping
+//! for O(1) performance.
 //!
 //! This crate is a library. The host application must provide a window,
 //! event loop, and graphics backend.

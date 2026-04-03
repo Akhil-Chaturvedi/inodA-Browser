@@ -284,12 +284,22 @@ fn build_taffy_node(
             let mut min_intrinsic_width: f32 = 0.0;
             
             if let Some(buffer) = buffer_cache.get(&node_id) {
-                for run in buffer.layout_runs() {
-                    max_intrinsic_width = max_intrinsic_width.max(run.line_w);
-                    
-                    // Honest min_intrinsic_width: the widest single glyph
-                    for glyph in run.glyphs {
-                        min_intrinsic_width = min_intrinsic_width.max(glyph.w);
+                if let Some(crate::dom::Node::Text(text_node)) = document.nodes.get(node_id) {
+                    for run in buffer.layout_runs() {
+                        max_intrinsic_width = max_intrinsic_width.max(run.line_w);
+                        
+                        let mut current_word_width = 0.0;
+                        for glyph in run.glyphs {
+                            // Extract the character slice from the original text to identify whitespace boundaries
+                            let is_whitespace = text_node.text[glyph.start..glyph.end].chars().any(|c| c.is_whitespace());
+                            if is_whitespace {
+                                min_intrinsic_width = min_intrinsic_width.max(current_word_width);
+                                current_word_width = 0.0;
+                            } else {
+                                current_word_width += glyph.w;
+                            }
+                        }
+                        min_intrinsic_width = min_intrinsic_width.max(current_word_width);
                     }
                 }
             }

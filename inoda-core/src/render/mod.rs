@@ -28,6 +28,7 @@ pub trait RendererBackend {
         glyphs: &[cosmic_text::LayoutGlyph],
         size: f32,
         color: Color,
+        font_system: &mut cosmic_text::FontSystem,
     );
 }
 
@@ -40,6 +41,7 @@ pub fn draw_layout_tree<R: RendererBackend>(
     offset_x: f32,
     offset_y: f32,
     buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
+    font_system: &mut cosmic_text::FontSystem,
 ) {
     let computed = match document.nodes.get(node_id) {
         Some(crate::dom::Node::Element(data)) => &data.computed,
@@ -87,6 +89,7 @@ pub fn draw_layout_tree<R: RendererBackend>(
                     run.glyphs,
                     computed.font_size,
                     color,
+                    font_system,
                 );
             }
         } else {
@@ -109,6 +112,7 @@ pub fn draw_layout_tree<R: RendererBackend>(
                         abs_x,
                         abs_y,
                         buffer_cache,
+                        font_system,
                     );
                 }
                 dom_child_id = document.next_sibling_of(c);

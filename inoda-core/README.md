@@ -39,9 +39,9 @@ src/
 
 Tag names are stored as `LocalName`, which is either `Standard(DefaultAtom)` for known HTML elements (interned, pointer-equality comparison) or `Custom(String)` for custom element names. This prevents unbounded growth of the global intern pool from arbitrary names passed through `document.createElement`.
 
-Attribute keys for known HTML attributes are interned as `DefaultAtom`. Element classes are stored in a flat `String` as a space-separated list rather than a `Vec<String>`. This significantly reduces heap allocation overhead per element node. CSS class names are uncontrolled user input; frameworks like Tailwind or CSS-in-JS generate thousands of randomized class names per session. Interning them as `DefaultAtom` would grow the global pool permanently and never release memory. ID values are also stored as `String` for the same reason.
+Attribute keys and values are stored as `String`. To prevent OOM attacks from unbounded attribute names, interning into the global `DefaultAtom` pool is intentionally avoided for attributes. This ensures that memory consumption scales linearly with the DOM size and is fully reclaimed upon node destruction. IDs are also stored as `String` and indexed in an $O(1)$ `id_map`.
 
-`ComputedStyle` is stored directly on `ElementData` and `TextData`, populated once during `css::compute_styles()`. Layout and rendering read from `computed` fields without scanning style tuples.
+`ComputedStyle` is stored directly on `ElementData` and `TextData` as a contiguous inline struct (no heap pointer chasing), populated once during `css::compute_styles()`. Layout and rendering read from `computed` fields without scanning style tuples.
 
 `Document` fields:
 - `nodes: Arena<Node>` -- the arena
@@ -70,7 +70,7 @@ Content inside `<script>` and `<style>` is accumulated as raw text via an `insid
 - `compute_styles()` walks the arena DOM recursively, evaluates combinators (`>`, space) by walking arena parent pointers, populates `ComputedStyle` on each node via direct `PropertyName` enum matching.
 - Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent. Only inheritable properties are passed to children; non-inheritable properties like `width` or `margin` are filtered before recursing. Values are copied directly from the parent's resolved style to avoid redundant allocations.
 - `font-size` expressed as `Em` multiplies against the parent's resolved `font_size`. `Rem` always uses 16px as root baseline. Both are resolved during the cascade; the result stored in `computed.font_size` is always absolute pixels.
-- Expands `margin`, `padding` shorthands (1/2/4-value) and maps `background` to `background-color`.
+- Expands `margin`, `padding` shorthands (1/2/3/4-value) and maps `background` to `background-color`.
 - Inline `style=""` attributes are parsed via `cssparser`'s `DeclarationParser` trait and applied after stylesheet rules.
 - `document.stylesheet` is persistent but invalidates via `rebuild_styles()` when the DOM is mutated. Only rules from currently attached `<style>` tags are preserved, preventing memory leaks from removed nodes.
 
@@ -101,7 +101,7 @@ Recursively walks the Taffy layout tree alongside the arena DOM and issues backe
 
 Draw properties are read directly from `ComputedStyle` fields on each arena node. There is no intermediate draw cache or separate text layout struct.
 
-The `RendererBackend` trait requires `fill_rect`, `stroke_rect`, and `draw_glyphs`.
+The `RendererBackend` trait requires `fill_rect`, `stroke_rect`, and `draw_glyphs`. `draw_glyphs` accepts a `&mut cosmic_text::FontSystem` to allow the host to physically rasterize the provided glyph offsets.
 
 Color parsing handles the named colors `red`, `green`, `blue`, `black`, `white` and 6-digit hex (`#rrggbb`). No `rgb()`, `rgba()`, `hsl()`, shorthand hex, or alpha.
 
@@ -112,7 +112,7 @@ Embeds QuickJS via `rquickjs`. `JsEngine` holds `Document` behind `Rc<RefCell<Do
 Exposed globals:
 - `console.log(msg)`, `console.warn(msg)`, `console.error(msg)` -- print to stdout
 - `document.getElementById(id)` -- returns a cached `NodeHandle` or null
-- `document.querySelector(selector)` -- tag, class, and ID selectors only; performs a recursive $O(D)$ traversal of the attached tree (where $D$ is document size), skipping detached arena nodes. Returns a cached `NodeHandle` or null.
+- `document.querySelector(selector)` -- tag, class, and ID selectors only. Uses an $O(1)$ fast-path for exact `#id` selectors and falls back to a recursive traversal for class/tag queries. Returns a cached `NodeHandle` or null.
 - `document.createElement(tagName)` -- creates a detached element in the arena, returns a cached `NodeHandle`
 - `document.appendChild(parent, child)` -- appends child node, sets `document.dirty = true`
 - `document.addEventListener(event, callback)` -- records registration; does not dispatch events
@@ -134,7 +134,7 @@ JavaScript object identity (`===`) is enforced via a `_wrapNode` WeakRef cache i
 
 Timer callbacks are stored as `rquickjs::Persistent<Function>`. Pending timers are in a `BinaryHeap` sorted by `fire_at`. Cancelled timer IDs are tracked in a `HashSet<u32>`; `pump()` skips popped timers whose IDs appear in the set. When an interval timer fires, a new `PendingTimer` is pushed with the next scheduled time. Rescheduled interval timers are collected into a separate local `Vec` before being pushed back to the heap; this prevents `setInterval(cb, 0)` from re-appearing at the top of the heap within the same `pump()` call and locking the loop.
 
-`JsEngine` maintains a `pump_ticks` counter. Every 60 calls to `pump()`, `runtime.run_gc()` and `document.collect_garbage()` are called synchronously. This forces QuickJS to sweep `FinalizationRegistry` callbacks and ensures the Rust arena drains its batched deletion queue. Detached arena nodes and stale references are cleared deterministically, preventing unbounded memory growth. The host application must call `pump()` on its event loop tick.
+`JsEngine::pump()` executes pending JavaScript jobs (microtasks/promises) until the queue is empty before returning control to the host event loop. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue and process the `FinalizationRegistry`. This ensures deterministic memory reclamation without blocking the main thread for expensive GC synchronous sweeps. The `_wrapNode` bridge also handles manual refcount correction when QuickJS merges new handles into its identity cache.
 
 ## Building
 

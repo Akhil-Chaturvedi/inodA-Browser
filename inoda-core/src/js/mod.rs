@@ -210,54 +210,90 @@ impl JsEngine {
             let set_attr_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
                 move |This(this): This<rquickjs::Class<'_, NodeHandle>>,
-                      attr: String,
+                      key: String,
                       value: String| {
                     let mut doc = doc_ref.borrow_mut();
-                    doc.dirty = true;
                     let node_id = this.borrow().to_node_id();
+                    let mut old_id = None;
+                    let mut is_class = false;
+                    let mut is_style = false;
 
-                    if attr == "id" {
-                        // Securely remove the old ID from the ABA mapping
-                        let mut old_id_to_remove = None;
-                        if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
-                            if let Some((_, old_val)) =
-                                data.attributes.iter().find(|(k, _)| k == "id")
-                            {
-                                old_id_to_remove = Some(old_val.clone());
+                    if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
+                        if key == "class" { is_class = true; }
+                        else if key == "style" { is_style = true; }
+                        else if key == "id" {
+                            for (k, v) in &data.attributes {
+                                if k == "id" {
+                                    old_id = Some(v.clone());
+                                    break;
+                                }
                             }
                         }
-                        if let Some(old_id) = old_id_to_remove {
-                            doc.id_map.remove(&old_id);
+                    }
+
+                    let mut needs_style_recompute = false;
+                    if is_class {
+                        if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
+                            data.classes = value.clone();
+                            needs_style_recompute = true;
+                            
+                            // Also update attributes vector for consistency with getAttribute
+                            let mut found = false;
+                            for (k, v) in data.attributes.iter_mut() {
+                                if k == "class" {
+                                    *v = value.clone();
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if !found {
+                                data.attributes.push(("class".to_string(), value.clone()));
+                            }
+                        }
+                    } else if is_style {
+                        let decls = crate::css::parse_inline_declarations(&value);
+                        if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
+                            data.cached_inline_styles = Some(decls.into_iter().map(|d| (d.name, d.value)).collect());
+                            needs_style_recompute = true;
+
+                            // Also update attributes vector
+                            let mut found = false;
+                            for (k, v) in data.attributes.iter_mut() {
+                                if k == "style" {
+                                    *v = value.clone();
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if !found {
+                                data.attributes.push(("style".to_string(), value.clone()));
+                            }
+                        }
+                    } else {
+                        if key == "id" {
+                            if let Some(oid) = old_id {
+                                doc.id_map.remove(&oid);
+                            }
+                            doc.id_map.insert(value.clone(), node_id);
                         }
 
                         if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
-                            if let Some(pos) =
-                                data.attributes.iter().position(|(k, _)| k == "id")
-                            {
-                                data.attributes[pos].1 = value.clone();
-                            } else {
-                                data.attributes.push(("id".to_string(), value.clone()));
+                            let mut found = false;
+                            for (k, v) in data.attributes.iter_mut() {
+                                if k == &key {
+                                    *v = value.clone();
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if !found && data.attributes.len() < crate::dom::MAX_ATTRIBUTES {
+                                data.attributes.push((key, value));
                             }
                         }
+                    }
 
-                        doc.id_map.insert(value.clone(), node_id);
-                    } else if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id)
-                    {
-                        if let Some(pos) =
-                            data.attributes.iter().position(|(k, _)| k == &attr)
-                        {
-                            data.attributes[pos].1 = value.clone();
-                        } else {
-                            data.attributes.push((attr.clone(), value.clone()));
-                        }
-
-                        if attr == "class" {
-                            data.classes = value.trim().to_string();
-                        } else if attr == "style" {
-                            let decls = crate::css::parse_inline_declarations(&value);
-                            let mapped: Vec<_> = decls.into_iter().map(|d| (d.name, d.value)).collect();
-                            data.cached_inline_styles = Some(mapped);
-                        }
+                    if needs_style_recompute {
+                        doc.styles_dirty = true;
                     }
                 }
             })
@@ -496,21 +532,9 @@ impl JsEngine {
                     let safe_tag = tag_name.to_lowercase();
                     let local_name = crate::dom::LocalName::new(&safe_tag);
 
-                    let node = crate::dom::Node::Element(crate::dom::ElementData {
-                        tag_name: local_name.clone(),
-                        attributes: Vec::new(),
-                        classes: String::new(),
-                        cached_inline_styles: None,
-                        parent: None,
-                        first_child: None,
-                        last_child: None,
-                        prev_sibling: None,
-                        next_sibling: None,
-                        computed: crate::dom::ComputedStyle::default(),
-                        taffy_node: None,
-                        js_handles: 1, // Start with 1 as we return it to JS
-                    });
-                    let index = doc.add_node(node);
+                    let mut data = crate::dom::ElementData::new(local_name.clone());
+                    data.js_handles = 1; // Start with 1 as we return it to JS
+                    let index = doc.add_node(crate::dom::Node::Element(data));
                     drop(doc);
 
                     NodeHandle::from_node_id(index, local_name.to_string())
@@ -684,6 +708,14 @@ impl JsEngine {
         {
             let mut timers = self.pending_timers.borrow_mut();
             let mut active = self.active_timers.borrow_mut();
+            
+            // Periodic compaction to prevent memory drift from cancelled timers
+            if timers.len() > 128 {
+                let mut v = std::mem::take(&mut *timers).into_vec();
+                v.retain(|t| active.contains(&t.id));
+                *timers = std::collections::BinaryHeap::from(v);
+            }
+
             while let Some(top) = timers.peek() {
                 if top.fire_at <= now {
                     let timer = timers.pop().unwrap();

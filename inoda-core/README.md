@@ -39,9 +39,9 @@ src/
 
 Tag names are stored as `LocalName`, which is either `Standard(DefaultAtom)` for known HTML elements (interned, pointer-equality comparison) or `Custom(String)` for custom element names. This prevents unbounded growth of the global intern pool from arbitrary names passed through `document.createElement`.
 
-Attribute keys and values are stored as `String`. To prevent OOM attacks from unbounded attribute names, interning into the global `DefaultAtom` pool is intentionally avoided for attributes. This ensures that memory consumption scales linearly with the DOM size and is fully reclaimed upon node destruction. IDs are also stored as `String` and indexed in an $O(1)$ `id_map`.
+Attribute keys and values are stored as `String`. To prevent OOM attacks from unbounded attribute names, interning into the global `DefaultAtom` pool is intentionally avoided for attributes. For security, a limit of `MAX_ATTRIBUTES` (32) is enforced during both HTML parsing and JS `setAttribute` calls. This ensures that memory consumption scales linearly with the DOM size and is fully reclaimed upon node destruction. IDs are also stored as `String` and indexed in an $O(1)$ `id_map`.
 
-`ComputedStyle` is stored directly on `ElementData` and `TextData` as a contiguous inline struct (no heap pointer chasing), populated once during `css::compute_styles()`. Layout and rendering read from `computed` fields without scanning style tuples.
+`ComputedStyle` is shared via `Rc<ComputedStyle>` and a document-level `StyleCache`. During the cascade, identical styles are deduplicated to minimize memory footprint. Layout and rendering read from these shared fields without scanning style tuples.
 
 `Document` fields:
 - `nodes: Arena<Node>` -- the arena
@@ -67,12 +67,12 @@ Content inside `<script>` and `<style>` is accumulated as raw text via an `insid
 - Property names in `Declaration` use `PropertyName`, a strongly-typed enum (`Display`, `Width`, `MarginTop`, `FontSize`, etc.) with an `Other(u64)` fallback. This makes property matching during cascade an integer comparison rather than a string deref.
 - Specificity is computed as `(id_count, class_count, tag_count)` at parse time and stored on each `ComplexSelector`.
 - Rules are stored in `HashMap<String, Vec<IndexedRule>>` buckets keyed by class and ID (plain `String`), and `HashMap<DefaultAtom, Vec<IndexedRule>>` keyed by tag (bounded set of known tag names; interning is safe here). Class and ID keys are not interned because they are uncontrolled user input.
-- `compute_styles()` walks the arena DOM recursively, evaluates combinators (`>`, space) by walking arena parent pointers, populates `ComputedStyle` on each node via direct `PropertyName` enum matching.
-- Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent. Only inheritable properties are passed to children; non-inheritable properties like `width` or `margin` are filtered before recursing. Values are copied directly from the parent's resolved style to avoid redundant allocations.
+- `compute_styles()` performs an iterative stack-based traversal of the arena DOM, evaluating combinators (`>`, space) by walking arena parent pointers. It populates `ComputedStyle` on each node by matching against pre-parsed rules and deduplicating results via the `StyleCache`.
+- Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent. Values are copied directly from the parent's resolved style to avoid redundant allocations.
 - `font-size` expressed as `Em` multiplies against the parent's resolved `font_size`. `Rem` always uses 16px as root baseline. Both are resolved during the cascade; the result stored in `computed.font_size` is always absolute pixels.
 - Expands `margin`, `padding` shorthands (1/2/3/4-value) and maps `background` to `background-color`.
 - Inline `style=""` attributes are parsed via `cssparser`'s `DeclarationParser` trait and applied after stylesheet rules.
-- `document.stylesheet` is persistent but invalidates via `rebuild_styles()` when the DOM is mutated. Only rules from currently attached `<style>` tags are preserved, preventing memory leaks from removed nodes.
+- `document.stylesheet` is persistent; `append_stylesheet()` dynamically merges rules from new `<style>` tags into the existing AST without a full re-parse. Rebuilds only occur if nodes are removed or styles are explicitly cleared.
 
 ### layout
 
@@ -130,9 +130,7 @@ JavaScript object identity (`===`) is enforced via a `_wrapNode` WeakRef cache i
 
 `NodeHandle` does not implement `Drop`. Nodes created via JavaScript persist in the arena until explicitly removed via `removeChild()`. This prevents QuickJS GC from invalidating arena slots for nodes that are still attached to the tree.
 
-`NodeHandle` does not implement `Drop`. Nodes created via JavaScript persist in the arena until explicitly removed via `removeChild()`. This prevents QuickJS GC from invalidating arena slots for nodes that are still attached to the tree.
-
-Timer callbacks are stored as `rquickjs::Persistent<Function>`. Pending timers are in a `BinaryHeap` sorted by `fire_at`. Cancelled timer IDs are tracked in a `HashSet<u32>`; `pump()` skips popped timers whose IDs appear in the set. When an interval timer fires, a new `PendingTimer` is pushed with the next scheduled time. Rescheduled interval timers are collected into a separate local `Vec` before being pushed back to the heap; this prevents `setInterval(cb, 0)` from re-appearing at the top of the heap within the same `pump()` call and locking the loop.
+Timer callbacks are stored as `rquickjs::Persistent<Function>`. Pending timers are in a `BinaryHeap` sorted by `fire_at`. To prevent memory drift from cancelled timers, the heap is compacted when it expands beyond 128 items. Cancelled timer IDs are tracked in a `HashSet<u32>`; `pump()` skips popped timers whose IDs appear in the set. When an interval timer fires, a new `PendingTimer` is pushed with the next scheduled time. Rescheduled interval timers are collected into a separate local `Vec` before being pushed back to the heap; this prevents `setInterval(cb, 0)` from re-appearing at the top of the heap within the same `pump()` call and locking the loop.
 
 `JsEngine::pump()` executes pending JavaScript jobs (microtasks/promises) until the queue is empty before returning control to the host event loop. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue and process the `FinalizationRegistry`. This ensures deterministic memory reclamation without blocking the main thread for expensive GC synchronous sweeps. The `_wrapNode` bridge also handles manual refcount correction when QuickJS merges new handles into its identity cache.
 

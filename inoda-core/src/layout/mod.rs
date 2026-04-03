@@ -107,15 +107,20 @@ pub fn compute_layout(
 }
 
 fn prepare_text_buffers(
-    document: &crate::dom::Document,
+    document: &mut crate::dom::Document,
     node_id: crate::dom::NodeId,
     font_system: &mut FontSystem,
     buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
 ) {
-    if let Some(crate::dom::Node::Text(data)) = document.nodes.get(node_id) {
-        let font_size = data.computed.font_size;
+    if let Some(crate::dom::Node::Text(data)) = document.nodes.get_mut(node_id) {
+        if data.layout_dirty {
+            buffer_cache.remove(&node_id);
+            data.layout_dirty = false;
+        }
 
+        let font_size = data.computed.font_size;
         let line_height = (font_size * 1.2).max(1.0);
+        
         buffer_cache.entry(node_id).or_insert_with(|| {
             let mut b = Buffer::new(font_system, Metrics::new(font_size, line_height));
             b.set_wrap(font_system, Wrap::WordOrGlyph);

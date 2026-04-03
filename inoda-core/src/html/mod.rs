@@ -10,6 +10,7 @@
 
 use crate::dom::{Document, ElementData, Node, TextData};
 use html5gum::{Token, Tokenizer};
+
 pub fn parse_html(html: &str) -> Document {
     let mut doc = Document::default();
     let mut current_parent = doc.root_id;
@@ -22,109 +23,43 @@ pub fn parse_html(html: &str) -> Document {
                 let tag_name_str = String::from_utf8_lossy(&tag.name);
                 let tag_name = crate::dom::LocalName::new(&tag_name_str);
 
-                if let Some(ref raw) = inside_raw_tag {
-                    if &**raw == "style" {
-                        // Skip StartTags inside `<style>` (html5gum shouldn't emit them in Rawtext mode,
-                        // but if it does, ignore them to prevent recursive DOM construction).
-                    } else if let Some(last_child) = doc.last_child_of(current_parent) {
-                        if let Some(Node::Text(existing)) = doc.nodes.get_mut(last_child) {
-                            existing.text.push_str("<");
-                            existing.text.push_str(&tag_name_str);
-                            for (k, v) in tag.attributes.iter() {
-                                let k_str = std::str::from_utf8(k).unwrap_or("");
-                                let v_str = std::str::from_utf8(v).unwrap_or("");
-                                existing.text.push_str(" ");
-                                existing.text.push_str(k_str);
-                                existing.text.push_str("=\"");
-                                existing.text.push_str(v_str);
-                                existing.text.push_str("\"");
-                            }
-                            if tag.self_closing {
-                                existing.text.push_str("/>");
-                            } else {
-                                existing.text.push_str(">");
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                if &*tag_name == "style" || &*tag_name == "script" {
+                if &*tag_name == "script" || &*tag_name == "style" {
                     inside_raw_tag = Some(tag_name.clone());
-                }
-
-                let mut check_node = current_parent;
-                let mut found_close_target = false;
-
-                while let Some(Node::Element(data)) = doc.nodes.get(check_node) {
-                    let p_tag = &*data.tag_name;
-                    let should_close = match &*tag_name {
-                        "li" => p_tag == "li",
-                        "td" | "th" => p_tag == "td" || p_tag == "th",
-                        "tr" => p_tag == "tr",
-                        "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "ul" | "ol"
-                        | "table" => p_tag == "p",
-                        _ => false,
-                    };
-
-                    if should_close {
-                        found_close_target = true;
-                        break;
+                    if &*tag_name == "style" {
+                        current_style_text.clear();
                     }
-
-                    if matches!(p_tag, "div" | "body" | "td" | "th" | "table") {
-                        break;
-                    }
-
-                    check_node = doc.parent_of(check_node).unwrap_or(doc.root_id);
-                }
-
-                if found_close_target {
-                    current_parent = doc.parent_of(check_node).unwrap_or(doc.root_id);
                 }
 
                 let mut attributes = Vec::new();
                 let mut classes = String::new();
-                let mut id_val = None;
                 let mut cached_inline_styles = None;
+                let mut id_val = None;
 
                 for (key, value) in tag.attributes {
-                    if let (Ok(k_str), Ok(v_str)) =
-                        (std::str::from_utf8(&key), std::str::from_utf8(&value))
-                    {
+                    if attributes.len() >= crate::dom::MAX_ATTRIBUTES {
+                        break;
+                    }
+                    if let (Ok(k_str), Ok(v_str)) = (std::str::from_utf8(&key), std::str::from_utf8(&value)) {
                         if k_str == "class" {
-                            if classes.is_empty() {
-                                classes = v_str.trim().to_string();
-                            } else {
-                                classes.push(' ');
-                                classes.push_str(v_str.trim());
-                            }
+                            classes = v_str.to_string();
+                        } else if k_str == "style" {
+                            let decls = crate::css::parse_inline_declarations(v_str);
+                            cached_inline_styles = Some(decls.into_iter().map(|d| (d.name, d.value)).collect());
                         } else if k_str == "id" {
                             id_val = Some(v_str.to_string());
-                        } else if k_str == "style" {
-                            let decls = crate::css::parse_inline_declarations(v_str.trim());
-                            let mapped: Vec<_> = decls.into_iter().map(|d| (d.name, d.value)).collect();
-                            cached_inline_styles = Some(mapped);
+                            attributes.push((k_str.to_string(), v_str.to_string()));
+                        } else {
+                            attributes.push((k_str.to_string(), v_str.to_string()));
                         }
-                        attributes.push((k_str.to_string(), v_str.to_string()));
                     }
                 }
 
-                let node = Node::Element(ElementData {
-                    tag_name: tag_name.clone(),
-                    attributes,
-                    classes,
-                    cached_inline_styles,
-                    parent: None,
-                    first_child: None,
-                    last_child: None,
-                    prev_sibling: None,
-                    next_sibling: None,
-                    computed: crate::dom::ComputedStyle::default(),
-                    taffy_node: None,
-                    js_handles: 0,
-                });
+                let mut data = ElementData::new(tag_name.clone());
+                data.attributes = attributes;
+                data.classes = classes;
+                data.cached_inline_styles = cached_inline_styles;
 
+                let node = Node::Element(data);
                 let node_id = doc.add_node(node);
                 if let Some(id_str) = id_val {
                     doc.id_map.insert(id_str, node_id);
@@ -166,68 +101,45 @@ pub fn parse_html(html: &str) -> Document {
                             current_style_text.clear();
                         }
                     } else {
-                        // Skip EndTags inside `<style>` (html5gum shouldn't emit them in Rawtext mode,
-                        // but if it does, ignore them).
-                        if &**raw != "style" {
-                            if let Some(last_child) = doc.last_child_of(current_parent) {
-                                if let Some(Node::Text(existing)) = doc.nodes.get_mut(last_child) {
-                                    existing.text.push_str("</");
-                                    existing.text.push_str(&tag_name_str);
-                                    existing.text.push_str(">");
-                                }
+                        // Skip EndTags inside Rawtext tags unless they match
+                        continue;
+                    }
+                } else {
+                    // Walk up to find matching tag
+                    let mut p = Some(current_parent);
+                    while let Some(pid) = p {
+                        if let Some(Node::Element(data)) = doc.nodes.get(pid) {
+                            if data.tag_name == tag_name {
+                                current_parent = doc.parent_of(pid).unwrap_or(doc.root_id);
+                                break;
                             }
                         }
+                        p = doc.parent_of(pid);
                     }
-                    continue;
-                }
-
-                let mut p = Some(current_parent);
-                while let Some(pid) = p {
-                    if let Some(Node::Element(data)) = doc.nodes.get(pid) {
-                        if data.tag_name == tag_name {
-                            current_parent = doc.parent_of(pid).unwrap_or(doc.root_id);
-                            break;
-                        }
-                    } else if let Some(Node::Root(_)) = doc.nodes.get(pid) {
-                        break;
-                    }
-                    p = doc.parent_of(pid);
                 }
             }
             Token::String(s) => {
-                let text_str = std::str::from_utf8(&s).unwrap_or("");
-                if text_str.is_empty() {
+                let text = std::str::from_utf8(&s).unwrap_or("").to_string();
+                if text.is_empty() {
                     continue;
                 }
 
                 if let Some(ref raw) = inside_raw_tag {
                     if &**raw == "style" {
-                        current_style_text.push_str(text_str);
+                        current_style_text.push_str(&text);
+                        continue;
+                    }
+                    if &**raw == "script" {
+                        // Scripts are ignored for now but we consume their content
                         continue;
                     }
                 }
 
-                let mut combined = false;
-                if let Some(last_child) = doc.last_child_of(current_parent) {
-                    if let Some(Node::Text(existing)) = doc.nodes.get_mut(last_child) {
-                        existing.text.push_str(text_str);
-                        combined = true;
-                    }
-                }
-                if !combined {
-                    let id = doc.add_node(Node::Text(TextData {
-                        text: text_str.to_string(),
-                        parent: None,
-                        prev_sibling: None,
-                        next_sibling: None,
-                        computed: crate::dom::ComputedStyle::default(),
-                        taffy_node: None,
-                        js_handles: 0,
-                    }));
-                    doc.append_child(current_parent, id);
-                }
+                let node = Node::Text(TextData::new(text));
+                let node_id = doc.add_node(node);
+                doc.append_child(current_parent, node_id);
             }
-            Token::Comment(_) | Token::Doctype(_) | Token::Error(_) => {}
+            _ => {}
         }
     }
 

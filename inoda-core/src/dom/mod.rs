@@ -15,6 +15,9 @@
 //! than scanning dynamic trees.
 
 use generational_arena::{Arena, Index};
+use std::rc::Rc;
+
+pub const MAX_ATTRIBUTES: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
 pub struct TextMeasureContext {
@@ -39,6 +42,8 @@ pub struct Document {
     /// Stylesheet invalidation flag. True if `<style>` tags were added or removed.
     pub styles_dirty: bool,
     pub taffy_tree: taffy::TaffyTree<TextMeasureContext>,
+    /// Global cache for sharing computed styles across identical nodes.
+    pub style_cache: std::collections::HashMap<ComputedStyle, Rc<ComputedStyle>>,
 }
 
 /// A handle into the arena. Generational indices prevent ABA problems.
@@ -319,9 +324,31 @@ pub struct ElementData {
     pub last_child: Option<NodeId>,
     pub prev_sibling: Option<NodeId>,
     pub next_sibling: Option<NodeId>,
-    pub computed: ComputedStyle,
+    pub computed: Rc<ComputedStyle>,
     pub taffy_node: Option<taffy::NodeId>,
     pub js_handles: usize,
+    /// Set true when styles or content change, triggering a text re-shape.
+    pub layout_dirty: bool,
+}
+
+impl ElementData {
+    pub fn new(tag_name: LocalName) -> Self {
+        ElementData {
+            tag_name,
+            attributes: Vec::with_capacity(4),
+            classes: String::new(),
+            cached_inline_styles: None,
+            parent: None,
+            first_child: None,
+            last_child: None,
+            prev_sibling: None,
+            next_sibling: None,
+            computed: Rc::new(ComputedStyle::default()),
+            taffy_node: None,
+            js_handles: 0,
+            layout_dirty: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -330,9 +357,26 @@ pub struct TextData {
     pub parent: Option<NodeId>,
     pub prev_sibling: Option<NodeId>,
     pub next_sibling: Option<NodeId>,
-    pub computed: ComputedStyle,
+    pub computed: Rc<ComputedStyle>,
     pub taffy_node: Option<taffy::NodeId>,
     pub js_handles: usize,
+    /// Set true when text content changes, triggering a re-shape.
+    pub layout_dirty: bool,
+}
+
+impl TextData {
+    pub fn new(text: String) -> Self {
+        TextData {
+            text,
+            parent: None,
+            prev_sibling: None,
+            next_sibling: None,
+            computed: Rc::new(ComputedStyle::default()),
+            taffy_node: None,
+            js_handles: 0,
+            layout_dirty: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -358,6 +402,55 @@ pub enum StyleValue {
     None,
 }
 
+impl Eq for StyleValue {}
+
+impl std::hash::Hash for StyleValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            StyleValue::Keyword(a) => {
+                0.hash(state);
+                a.hash(state);
+            }
+            StyleValue::LengthPx(f) => {
+                1.hash(state);
+                f.to_bits().hash(state);
+            }
+            StyleValue::Percent(f) => {
+                2.hash(state);
+                f.to_bits().hash(state);
+            }
+            StyleValue::ViewportWidth(f) => {
+                3.hash(state);
+                f.to_bits().hash(state);
+            }
+            StyleValue::ViewportHeight(f) => {
+                4.hash(state);
+                f.to_bits().hash(state);
+            }
+            StyleValue::Em(f) => {
+                5.hash(state);
+                f.to_bits().hash(state);
+            }
+            StyleValue::Rem(f) => {
+                6.hash(state);
+                f.to_bits().hash(state);
+            }
+            StyleValue::Number(f) => {
+                7.hash(state);
+                f.to_bits().hash(state);
+            }
+            StyleValue::Color(r, g, b) => {
+                8.hash(state);
+                r.hash(state);
+                g.hash(state);
+                b.hash(state);
+            }
+            StyleValue::Auto => 9.hash(state),
+            StyleValue::None => 10.hash(state),
+        }
+    }
+}
+
 /// Pre-calculated native CSS properties to eliminate O(N) tuple lookups during Layout and Rendering loops.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComputedStyle {
@@ -373,6 +466,24 @@ pub struct ComputedStyle {
     pub border_color: Option<(u8, u8, u8)>,
     pub font_size: f32,
     pub color: (u8, u8, u8),
+}
+
+impl Eq for ComputedStyle {}
+
+impl std::hash::Hash for ComputedStyle {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.display.hash(state);
+        self.flex_direction.hash(state);
+        self.width.hash(state);
+        self.height.hash(state);
+        self.margin.hash(state);
+        self.padding.hash(state);
+        self.border_width.hash(state);
+        self.bg_color.hash(state);
+        self.border_color.hash(state);
+        self.font_size.to_bits().hash(state);
+        self.color.hash(state);
+    }
 }
 
 impl Default for ComputedStyle {
@@ -426,6 +537,7 @@ impl Default for Document {
             dirty: true,
             styles_dirty: true,
             taffy_tree: taffy::TaffyTree::new(),
+            style_cache: std::collections::HashMap::new(),
         }
     }
 }

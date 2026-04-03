@@ -8,8 +8,9 @@
 //!
 //! Tag names are interned via `string_cache::DefaultAtom`, while attribute keys
 //! and values are stored as `String` to ensure OOM safety and deterministic
-//! memory reclamation. CSS property resolution uses a fixed-size array mapping
-//! for O(1) performance.
+//! memory reclamation. For security, a limit of 32 attributes per element is enforced.
+//! CSS property resolution uses a fixed-size array mapping for O(1) performance,
+//! with computed styles shared via `Rc` to minimize memory footprint.
 //!
 //! This crate is a library. The host application must provide a window,
 //! event loop, and graphics backend.
@@ -159,45 +160,15 @@ mod tests {
     fn test_remove_node_removes_descendants() {
         let mut doc = dom::Document::new();
 
-        let parent = doc.add_node(dom::Node::Element(dom::ElementData {
-            tag_name: dom::LocalName::Standard(string_cache::DefaultAtom::from("div")),
-            attributes: Vec::new(),
-            classes: String::new(),
-            cached_inline_styles: None,
-            parent: None,
-            first_child: None,
-            last_child: None,
-            prev_sibling: None,
-            next_sibling: None,
-            computed: dom::ComputedStyle::default(),
-            taffy_node: None,
-            js_handles: 0,
-        }));
+        let parent = doc.add_node(dom::Node::Element(dom::ElementData::new(
+            dom::LocalName::Standard(string_cache::DefaultAtom::from("div")),
+        )));
 
-        let child = doc.add_node(dom::Node::Element(dom::ElementData {
-            tag_name: dom::LocalName::Standard(string_cache::DefaultAtom::from("span")),
-            attributes: Vec::new(),
-            classes: String::new(),
-            cached_inline_styles: None,
-            parent: None,
-            first_child: None,
-            last_child: None,
-            prev_sibling: None,
-            next_sibling: None,
-            computed: dom::ComputedStyle::default(),
-            taffy_node: None,
-            js_handles: 0,
-        }));
+        let child = doc.add_node(dom::Node::Element(dom::ElementData::new(
+            dom::LocalName::Standard(string_cache::DefaultAtom::from("span")),
+        )));
 
-        let grandchild = doc.add_node(dom::Node::Text(dom::TextData {
-            text: "hello".to_string(),
-            parent: None,
-            prev_sibling: None,
-            next_sibling: None,
-            computed: dom::ComputedStyle::default(),
-            taffy_node: None,
-            js_handles: 0,
-        }));
+        let grandchild = doc.add_node(dom::Node::Text(dom::TextData::new("hello".to_string())));
 
         doc.append_child(doc.root_id, parent);
         doc.append_child(parent, child);

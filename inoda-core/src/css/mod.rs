@@ -505,39 +505,20 @@ pub fn parse_stylesheet(css: &str) -> StyleSheet {
 }
 
 pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &StyleSheet) {
-    if document.styles_dirty {
-        document.rebuild_styles();
-    }
+    document.styles_dirty = false;
 
-    let doc_sheet = std::mem::take(&mut document.stylesheet);
+    let mut stack = vec![(document.root_id, None::<std::rc::Rc<crate::dom::ComputedStyle>>)];
 
-    compute_node_styles_recursive(
-        document,
-        document.root_id,
-        &[base_stylesheet, &doc_sheet],
-        None,
-    );
+    while let Some((node_id, parent_computed)) = stack.pop() {
+        let mut property_mask: u32 = 0;
+        let mut property_array: [Option<crate::dom::StyleValue>; crate::dom::NUM_PROPERTIES] =
+            core::array::from_fn(|_| None);
 
-    document.stylesheet = doc_sheet;
-}
+        let node = match document.nodes.get(node_id) {
+            Some(n) => n,
+            None => continue,
+        };
 
-pub fn append_stylesheet(css: &str, stylesheet: &mut StyleSheet) {
-    let mut input = cssparser::ParserInput::new(css);
-    let mut parser = cssparser::Parser::new(&mut input);
-    parse_rules_list(&mut parser, stylesheet);
-    stylesheet.sort_rules();
-}
-
-fn compute_node_styles_recursive(
-    document: &mut crate::dom::Document,
-    node_id: crate::dom::NodeId,
-    stylesheets: &[&StyleSheet],
-    parent_computed: Option<&crate::dom::ComputedStyle>,
-) {
-    let mut children_ids = Vec::new();
-    let mut property_array: [Option<crate::dom::StyleValue>; crate::dom::NUM_PROPERTIES] = core::array::from_fn(|_| None);
-
-    if let Some(node) = document.nodes.get(node_id) {
         match node {
             crate::dom::Node::Element(data) => {
                 let id_attr = data
@@ -547,10 +528,12 @@ fn compute_node_styles_recursive(
                     .map(|(_, v)| v.as_str());
 
                 let mut lists: Vec<&[IndexedRule]> = Vec::new();
+                let doc_sheet = &document.stylesheet;
+                let sheets = [base_stylesheet, doc_sheet];
 
-                for stylesheet in stylesheets {
-                    if let Some(id) = &id_attr {
-                        if let Some(rules) = stylesheet.by_id.get(*id) {
+                for stylesheet in sheets {
+                    if let Some(id) = id_attr {
+                        if let Some(rules) = stylesheet.by_id.get(id) {
                             lists.push(rules.as_slice());
                         }
                     }
@@ -578,7 +561,6 @@ fn compute_node_styles_recursive(
                     }
                 }
 
-                // Linear merge of pre-sorted specificity buckets instead of dynamic sorting.
                 while !lists.is_empty() {
                     let mut min_idx = 0;
                     for i in 1..lists.len() {
@@ -597,13 +579,15 @@ fn compute_node_styles_recursive(
                     let rule = &lists[min_idx][0];
                     if match_complex_selector(&rule.selector, node_id, document) {
                         for decl in rule.declarations.iter() {
-                            property_array[decl.name.to_index()] = Some(decl.value.clone());
+                            let idx = decl.name.to_index();
+                            property_array[idx] = Some(decl.value.clone());
+                            property_mask |= 1 << idx;
                         }
                     }
 
                     let next_list = &lists[min_idx][1..];
                     if next_list.is_empty() {
-                        lists.swap_remove(min_idx); // O(1) swap instead of O(N) shift
+                        lists.swap_remove(min_idx);
                     } else {
                         lists[min_idx] = next_list;
                     }
@@ -611,140 +595,113 @@ fn compute_node_styles_recursive(
 
                 if let Some(inline_decls) = &data.cached_inline_styles {
                     for (name, value) in inline_decls {
-                        property_array[name.to_index()] = Some(value.clone());
+                        let idx = name.to_index();
+                        property_array[idx] = Some(value.clone());
+                        property_mask |= 1 << idx;
                     }
                 }
+            }
+            crate::dom::Node::Root(_) | crate::dom::Node::Text(_) => {}
+        }
 
-                let mut child = document.first_child_of(node_id);
-                while let Some(c) = child {
-                    children_ids.push(c);
-                    child = document.next_sibling_of(c);
+        let mut next_computed = crate::dom::ComputedStyle::default();
+
+        // Default to inheriting from parent if possible
+        if let Some(pc) = &parent_computed {
+            next_computed.font_size = pc.font_size;
+            next_computed.color = pc.color;
+        }
+
+        let parent_font_size = parent_computed.as_ref().map(|pc| pc.font_size).unwrap_or(16.0);
+        if property_mask != 0 {
+            for i in 0..crate::dom::NUM_PROPERTIES {
+                if (property_mask & (1 << i)) != 0 {
+                    if let Some(val) = &property_array[i] {
+                        match i {
+                            0 => if let crate::dom::StyleValue::Keyword(v) = val { next_computed.display = v.clone(); },
+                            1 => if let crate::dom::StyleValue::Keyword(v) = val { next_computed.flex_direction = v.clone(); },
+                            2 => next_computed.width = val.clone(),
+                            3 => next_computed.height = val.clone(),
+                            4 => next_computed.margin[0] = val.clone(),
+                            5 => next_computed.margin[1] = val.clone(),
+                            6 => next_computed.margin[2] = val.clone(),
+                            7 => next_computed.margin[3] = val.clone(),
+                            8 => next_computed.padding[0] = val.clone(),
+                            9 => next_computed.padding[1] = val.clone(),
+                            10 => next_computed.padding[2] = val.clone(),
+                            11 => next_computed.padding[3] = val.clone(),
+                            12 => next_computed.border_width[0] = val.clone(),
+                            13 => next_computed.border_width[1] = val.clone(),
+                            14 => next_computed.border_width[2] = val.clone(),
+                            15 => next_computed.border_width[3] = val.clone(),
+                            16 => if let crate::dom::StyleValue::Color(r, g, b) = val { next_computed.bg_color = Some((*r, *g, *b)); },
+                            17 => if let crate::dom::StyleValue::Color(r, g, b) = val { next_computed.border_color = Some((*r, *g, *b)); },
+                            18 => if let crate::dom::StyleValue::Color(r, g, b) = val { next_computed.color = (*r, *g, *b); },
+                            19 => {
+                                match val {
+                                    crate::dom::StyleValue::LengthPx(px) => next_computed.font_size = *px,
+                                    crate::dom::StyleValue::Number(num) => next_computed.font_size = *num,
+                                    crate::dom::StyleValue::Em(num) => next_computed.font_size = num * parent_font_size,
+                                    crate::dom::StyleValue::Rem(num) => next_computed.font_size = num * 16.0,
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
-            crate::dom::Node::Root(_) => {
-                let mut child = document.first_child_of(node_id);
-                while let Some(c) = child {
-                    children_ids.push(c);
-                    child = document.next_sibling_of(c);
+        }
+        
+        if next_computed.font_size == 0.0 {
+            next_computed.font_size = 16.0;
+        }
+
+        // Style Sharing: Consult the cache
+        let shared_style = if let Some(existing) = document.style_cache.get(&next_computed) {
+            std::rc::Rc::clone(existing)
+        } else {
+            let rc = std::rc::Rc::new(next_computed.clone());
+            document.style_cache.insert(next_computed, std::rc::Rc::clone(&rc));
+            rc
+        };
+
+        if let Some(node) = document.nodes.get_mut(node_id) {
+            match node {
+                crate::dom::Node::Element(data) => {
+                    if data.computed != shared_style {
+                        data.computed = shared_style.clone();
+                        data.layout_dirty = true;
+                    }
                 }
+                crate::dom::Node::Text(data) => {
+                    if data.computed != shared_style {
+                        data.computed = shared_style.clone();
+                        data.layout_dirty = true;
+                    }
+                }
+                crate::dom::Node::Root(_) => {}
             }
-            crate::dom::Node::Text(_) => {}
+        }
+
+        // Push children to stack (reverse for stack order if we wanted DFS, here it's just a traversal)
+        let mut child = document.first_child_of(node_id);
+        let mut children = Vec::new();
+        while let Some(c) = child {
+            children.push(c);
+            child = document.next_sibling_of(c);
+        }
+        for c in children.into_iter().rev() {
+            stack.push((c, Some(std::rc::Rc::clone(&shared_style))));
         }
     }
+}
 
-    let mut computed = crate::dom::ComputedStyle::default();
-
-    // Default to inheriting from parent if possible
-    if let Some(pc) = parent_computed {
-        computed.font_size = pc.font_size;
-        computed.color = pc.color;
-    }
-
-    // Resolve parent font-size for em unit resolution in the cascade.
-    let parent_font_size = parent_computed.map(|pc| pc.font_size).unwrap_or(16.0);
-
-    let get_prop = |key: crate::dom::PropertyName| -> Option<&crate::dom::StyleValue> {
-        property_array[key.to_index()].as_ref()
-    };
-
-    use crate::dom::PropertyName as P;
-
-    if let Some(crate::dom::StyleValue::Keyword(v)) = get_prop(P::Display) {
-        computed.display = v.clone();
-    }
-    if let Some(crate::dom::StyleValue::Keyword(v)) = get_prop(P::FlexDirection) {
-        computed.flex_direction = v.clone();
-    }
-    if let Some(v) = get_prop(P::Width) {
-        computed.width = v.clone();
-    }
-    if let Some(v) = get_prop(P::Height) {
-        computed.height = v.clone();
-    }
-
-    if let Some(v) = get_prop(P::MarginTop) {
-        computed.margin[0] = v.clone();
-    }
-    if let Some(v) = get_prop(P::MarginRight) {
-        computed.margin[1] = v.clone();
-    }
-    if let Some(v) = get_prop(P::MarginBottom) {
-        computed.margin[2] = v.clone();
-    }
-    if let Some(v) = get_prop(P::MarginLeft) {
-        computed.margin[3] = v.clone();
-    }
-
-    if let Some(v) = get_prop(P::PaddingTop) {
-        computed.padding[0] = v.clone();
-    }
-    if let Some(v) = get_prop(P::PaddingRight) {
-        computed.padding[1] = v.clone();
-    }
-    if let Some(v) = get_prop(P::PaddingBottom) {
-        computed.padding[2] = v.clone();
-    }
-    if let Some(v) = get_prop(P::PaddingLeft) {
-        computed.padding[3] = v.clone();
-    }
-
-    if let Some(v) = get_prop(P::BorderTopWidth) {
-        computed.border_width[0] = v.clone();
-    }
-    if let Some(v) = get_prop(P::BorderRightWidth) {
-        computed.border_width[1] = v.clone();
-    }
-    if let Some(v) = get_prop(P::BorderBottomWidth) {
-        computed.border_width[2] = v.clone();
-    }
-    if let Some(v) = get_prop(P::BorderLeftWidth) {
-        computed.border_width[3] = v.clone();
-    }
-
-    if let Some(crate::dom::StyleValue::Color(r, g, b)) = get_prop(P::BackgroundColor) {
-        computed.bg_color = Some((*r, *g, *b));
-    }
-    if let Some(crate::dom::StyleValue::Color(r, g, b)) = get_prop(P::BorderColor) {
-        computed.border_color = Some((*r, *g, *b));
-    }
-
-    // Resolve font-size: em/rem are resolved here relative to parent; others pass through.
-    if let Some(v) = get_prop(P::FontSize) {
-        match v {
-            crate::dom::StyleValue::LengthPx(px) => {
-                computed.font_size = *px;
-            }
-            crate::dom::StyleValue::Number(num) => {
-                computed.font_size = *num;
-            }
-            crate::dom::StyleValue::Em(num) => {
-                computed.font_size = num * parent_font_size;
-            }
-            crate::dom::StyleValue::Rem(num) => {
-                computed.font_size = num * 16.0;
-            }
-            _ => {}
-        }
-    }
-    if computed.font_size == 0.0 {
-        computed.font_size = 16.0;
-    }
-
-    if let Some(crate::dom::StyleValue::Color(r, g, b)) = get_prop(P::Color) {
-        computed.color = (*r, *g, *b);
-    }
-
-    if let Some(node) = document.nodes.get_mut(node_id) {
-        match node {
-            crate::dom::Node::Element(data) => data.computed = computed.clone(),
-            crate::dom::Node::Text(data) => data.computed = computed.clone(),
-            crate::dom::Node::Root(_) => {}
-        }
-    }
-
-    for child_id in children_ids {
-        compute_node_styles_recursive(document, child_id, stylesheets, Some(&computed));
-    }
+pub fn append_stylesheet(css: &str, stylesheet: &mut StyleSheet) {
+    let mut input = cssparser::ParserInput::new(css);
+    let mut parser = cssparser::Parser::new(&mut input);
+    parse_rules_list(&mut parser, stylesheet);
+    stylesheet.sort_rules();
 }
 
 fn parse_rules_list<'i, 't>(parser: &mut Parser<'i, 't>, stylesheet: &mut StyleSheet) {

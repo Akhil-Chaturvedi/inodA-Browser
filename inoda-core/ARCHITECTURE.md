@@ -11,12 +11,13 @@ HTML string
 html::parse_html()          -- html5gum token loop -> arena DOM (Document)
   |                            <style> tag mutations set document.styles_dirty = true
   v
-css::compute_styles()       -- rebuilds document.stylesheet if styles_dirty,
-  |                            walks the arena DOM recursively,
+css::compute_styles()       -- iterative stack-based traversal (no recursion),
   |                            resolves specificity against StyleSheet hash-map buckets,
   |                            evaluates combinators by walking parent pointers,
-  |                            populates ComputedStyle in-place on each ElementData/TextData
-  v
+  |                            deduplicates ComputedStyle pointers via StyleCache,
+  |                            assigns Rc<ComputedStyle> to each ElementData/TextData
+  |
+v
 layout::compute_layout()    -- prepares text buffers in a pre-pass,
   |                            calculates max/min intrinsic widths,
   |                            builds a TaffyTree from the arena DOM,
@@ -47,6 +48,7 @@ Document {
     dead_nodes: Vec<NodeId>,         // iterative deletion queue for remove_node
     dirty: bool,                     // set true by JS DOM mutations, cleared by host after re-render
     styles_dirty: bool,              // set true when <style> tags change, triggers rebuild
+    style_cache: HashMap<ComputedStyle, Rc<ComputedStyle>>, // style sharing pool
 }
 
 Node = Element(ElementData) | Text(TextData) | Root(RootData)
@@ -62,8 +64,9 @@ ElementData {
     last_child:   Option<NodeId>,
     prev_sibling: Option<NodeId>,
     next_sibling: Option<NodeId>,
-    computed: ComputedStyle,          // populated by css::compute_styles()
+    computed: Rc<ComputedStyle>,      // shared via StyleCache
     js_handles: usize,                // reference count for JS engine
+    layout_dirty: bool,               // triggers text buffer re-shaping
 }
 
 TextData {
@@ -71,8 +74,9 @@ TextData {
     parent:       Option<NodeId>,
     prev_sibling: Option<NodeId>,
     next_sibling: Option<NodeId>,
-    computed: ComputedStyle,
+    computed: Rc<ComputedStyle>,      // shared via StyleCache
     js_handles: usize,
+    layout_dirty: bool,
 }
 
 RootData {
@@ -86,7 +90,7 @@ Generational indices prevent ABA problems. The DOM tree is wired as an intrusive
 
 `LocalName` separates standard HTML tags (interned as `DefaultAtom`) from custom element names (heap-allocated `String`). This prevents unbounded growth of the global `DefaultAtom` intern pool when arbitrary custom element names are created from JavaScript.
 
-`ElementData::classes` stores class tokens in a single space-separated `String`. CSS class names are uncontrolled user input (modern frameworks generate randomized names like `css-1x8g9u`); interning them as `DefaultAtom` would cause the global intern pool to grow unboundedly and never shrink. ID values and attribute keys are also stored as `String` for the same reason, preventing OOM attacks from unbounded attribute labels. Unrecognized keywords in `StyleValue` are whitelisted to prevent arbitrary string leakage into the atom pool.
+`ElementData::classes` stores class tokens in a single space-separated `String`. CSS class names are uncontrolled user input (modern frameworks generate randomized names like `css-1x8g9u`); interning them as `DefaultAtom` would cause the global intern pool to grow unboundedly and never shrink. ID values and attribute keys are also stored as `String` for the same reason, preventing OOM attacks from unbounded attribute labels. Unrecognized keywords in `StyleValue` are whitelisted to prevent arbitrary string leakage into the atom pool. A hard limit of `MAX_ATTRIBUTES = 32` is enforced during parsing and mutation.
 
 ### ComputedStyle (dom/mod.rs)
 
@@ -106,7 +110,7 @@ ComputedStyle {
 }
 ```
 
-`ComputedStyle` is stored directly inside `ElementData` and `TextData`. It is populated once during `css::compute_styles()` and read by both `layout::compute_layout()` and `render::draw_layout_tree()`. There is no intermediate styled-node tree that gets built and dropped per frame.
+`ComputedStyle` is shared between nodes using `Rc<ComputedStyle>` and a document-level `StyleCache`. During style resolution, identical computed properties are deduplicated to point to the same heap allocation, significantly reducing the memory footprint for complex pages. There is no intermediate styled-node tree that gets built and dropped per frame.
 
 `StyleValue` is:
 
@@ -157,17 +161,17 @@ Timers are stored in a `std::collections::BinaryHeap` ordered by `fire_at` (min-
 
 ## Cascade and inheritance
 
-`css::compute_styles()` walks the arena DOM recursively. For each element node it:
+`css::compute_styles()` performs an iterative stack-based traversal of the arena DOM. For each element node it:
 
 1. Looks up matching rules from `document.stylesheet` buckets (by ID, class, tag, universal).
 2. Merges matched rules using a k-way specificity-ordered pointer walk.
 3. Applies inline `style` attribute declarations last (highest priority).
-4. Builds a new `Vec<(PropertyName, StyleValue)>` of matched declarations.
-5. Inherits inheritable properties (`color`, `font-size`, `font-family`, `font-weight`, `line-height`, `text-align`, `visibility`) from the parent via `Rc::clone` when no new inheritable values apply.
-6. Populates `ComputedStyle` on the node via direct enum matching on `PropertyName`.
-7. Recurses into children, passing the updated inheritable-style vector.
+4. Resolves the final property set against a fixed-size `[Option<StyleValue>; 25]` array using property bitmasks.
+5. Deduplicates the resulting `ComputedStyle` against the `StyleCache` to retrieve an `Rc<ComputedStyle>`.
+6. Assigns the `Rc` to the node and marks `layout_dirty = true` if the style changed.
+7. Pushes children onto the traversal stack.
 
-Combinator evaluation (`>` child, space descendant) walks arena parent pointers rather than maintaining a separate ancestor stack.
+Inheritable properties (`color`, `font-size`, etc.) are resolved during the cascade and stored in the `ComputedStyle`. Combinator evaluation (`>` child, space descendant) walks arena parent pointers rather than maintaining a separate ancestor stack.
 
 ## JavaScript bridge
 

@@ -89,22 +89,29 @@ pub fn draw_layout_tree<R: RendererBackend>(
                     color,
                 );
             }
-        } else if let Ok(children) = layout_tree.children(layout_node_id) {
+        } else {
             let mut dom_child_id = document.first_child_of(node_id);
-            for taffy_child in children {
-                if let Some(c) = dom_child_id {
+            while let Some(c) = dom_child_id {
+                let t_node = match document.nodes.get(c) {
+                    Some(crate::dom::Node::Element(d)) => d.taffy_node,
+                    Some(crate::dom::Node::Text(d)) => d.taffy_node,
+                    Some(crate::dom::Node::Root(d)) => d.taffy_node,
+                    _ => None,
+                };
+
+                if let Some(tn) = t_node {
                     draw_layout_tree(
                         renderer,
                         document,
                         layout_tree,
                         c,
-                        taffy_child,
+                        tn,
                         abs_x,
                         abs_y,
                         buffer_cache,
                     );
-                    dom_child_id = document.next_sibling_of(c);
                 }
+                dom_child_id = document.next_sibling_of(c);
             }
         }
     }

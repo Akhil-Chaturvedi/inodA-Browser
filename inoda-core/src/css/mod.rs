@@ -213,7 +213,7 @@ pub fn parse_style_value(val: &str) -> crate::dom::StyleValue {
     }
 
     let known_keywords = [
-        "auto", "none", "block", "inline", "flex", "grid", 
+        "auto", "none", "block", "inline", "flex", "grid",
         "row", "column", "inherit",
         "absolute", "relative", "fixed", "sticky",
         "hidden", "visible", "scroll", "clip",
@@ -375,51 +375,6 @@ fn parse_compound_selector(s: &str) -> CompoundSelector {
 // Selector matching -- enum comparison, no string parsing.
 // ---------------------------------------------------------------------------
 
-/// Match a pre-parsed compound selector against an element's tag name and attributes.
-fn match_compound_selector(
-    compound: &CompoundSelector,
-    tag_name: &crate::dom::LocalName,
-    attributes: &[(string_cache::DefaultAtom, String)],
-    classes: &str,
-) -> bool {
-    if compound.parts.is_empty() {
-        return false;
-    }
-
-    let id_attr = attributes
-        .iter()
-        .find(|(k, _)| &**k == "id")
-        .map(|(_, v)| v.as_str());
-
-    for part in &compound.parts {
-        match part {
-            SimpleSelector::Tag(t) => {
-                if t != &**tag_name {
-                    return false;
-                }
-            }
-            SimpleSelector::Class(c) => {
-                if !classes.split_whitespace().any(|cls| cls == c) {
-                    return false;
-                }
-            }
-            SimpleSelector::Id(id) => {
-                if Some(id.as_str()) != id_attr {
-                    return false;
-                }
-            }
-            SimpleSelector::PseudoClass(_) => {
-                // Pseudo-classes are not matched against DOM state yet.
-                // Treat as always-matching for now.
-            }
-            SimpleSelector::Universal => {
-                // Always matches.
-            }
-        }
-    }
-    true
-}
-
 fn match_ancestors_recursive(
     ancestors: &[(Combinator, CompoundSelector)],
     ancestor_idx: usize,
@@ -435,7 +390,7 @@ fn match_ancestors_recursive(
 
     while let Some(pid) = check_id {
         if let Some(crate::dom::Node::Element(data)) = document.nodes.get(pid) {
-            if match_compound_selector(compound, &data.tag_name, &data.attributes, &data.classes) {
+            if match_compound_selector(compound, &data.tag_name, &data.attributes, &data.classes, document) {
                 if match_ancestors_recursive(ancestors, ancestor_idx + 1, pid, document) {
                     return true;
                 }
@@ -445,10 +400,26 @@ fn match_ancestors_recursive(
         if *comb == Combinator::Child {
             break;
         }
-
         check_id = document.parent_of(pid);
     }
+    false
+}
 
+fn has_class(classes: &str, target: &str) -> bool {
+    if target.is_empty() { return false; }
+    let mut start = 0;
+    while let Some(pos) = classes[start..].find(target) {
+        let actual_pos = start + pos;
+        let end = actual_pos + target.len();
+
+        let before_ok = actual_pos == 0 || classes.as_bytes()[actual_pos - 1].is_ascii_whitespace();
+        let after_ok = end == classes.len() || classes.as_bytes()[end].is_ascii_whitespace();
+
+        if before_ok && after_ok {
+            return true;
+        }
+        start = actual_pos + 1;
+    }
     false
 }
 
@@ -463,6 +434,7 @@ fn match_complex_selector(
             &data.tag_name,
             &data.attributes,
             &data.classes,
+            document,
         ) {
             return false;
         }
@@ -471,6 +443,51 @@ fn match_complex_selector(
     }
 
     match_ancestors_recursive(&complex.ancestors, 0, node_id, document)
+}
+
+fn match_compound_selector(
+    compound: &CompoundSelector,
+    tag_name: &crate::dom::LocalName,
+    attributes: &[(String, String)],
+    classes: &str,
+    _document: &crate::dom::Document,
+) -> bool {
+    if compound.parts.is_empty() {
+        return false;
+    }
+
+    for part in &compound.parts {
+        match part {
+            SimpleSelector::Tag(t) => {
+                if t != &**tag_name {
+                    return false;
+                }
+            }
+            SimpleSelector::Class(c) => {
+                if !has_class(classes, c) {
+                    return false;
+                }
+            }
+            SimpleSelector::Id(id) => {
+                // Use the documented safe lookup
+                let mut found = false;
+                for (k, v) in attributes {
+                    if k == "id" {
+                        if v == id {
+                            found = true;
+                        }
+                        break;
+                    }
+                }
+                if !found { return false; }
+            }
+            SimpleSelector::PseudoClass(_) => {
+                // Not supported
+            }
+            SimpleSelector::Universal => {}
+        }
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -517,8 +534,8 @@ fn compute_node_styles_recursive(
     stylesheets: &[&StyleSheet],
     parent_computed: Option<&crate::dom::ComputedStyle>,
 ) {
-    let mut new_declarations = Vec::new();
     let mut children_ids = Vec::new();
+    let mut property_array: [Option<crate::dom::StyleValue>; crate::dom::NUM_PROPERTIES] = core::array::from_fn(|_| None);
 
     if let Some(node) = document.nodes.get(node_id) {
         match node {
@@ -526,7 +543,7 @@ fn compute_node_styles_recursive(
                 let id_attr = data
                     .attributes
                     .iter()
-                    .find(|(k, _)| &**k == "id")
+                    .find(|(k, _)| k == "id")
                     .map(|(_, v)| v.as_str());
 
                 let mut lists: Vec<&[IndexedRule]> = Vec::new();
@@ -580,31 +597,21 @@ fn compute_node_styles_recursive(
                     let rule = &lists[min_idx][0];
                     if match_complex_selector(&rule.selector, node_id, document) {
                         for decl in rule.declarations.iter() {
-                            if let Some(pos) =
-                                new_declarations.iter().position(|(k, _)| k == &decl.name)
-                            {
-                                new_declarations[pos].1 = decl.value.clone();
-                            } else {
-                                new_declarations.push((decl.name.clone(), decl.value.clone()));
-                            }
+                            property_array[decl.name.to_index()] = Some(decl.value.clone());
                         }
                     }
 
-                    lists[min_idx] = &lists[min_idx][1..];
-                    if lists[min_idx].is_empty() {
+                    let next_list = &lists[min_idx][1..];
+                    if next_list.is_empty() {
                         lists.remove(min_idx);
+                    } else {
+                        lists[min_idx] = next_list;
                     }
                 }
 
                 if let Some(inline_decls) = &data.cached_inline_styles {
                     for (name, value) in inline_decls {
-                        if let Some(pos) =
-                            new_declarations.iter().position(|(k, _)| k == name)
-                        {
-                            new_declarations[pos].1 = value.clone();
-                        } else {
-                            new_declarations.push((name.clone(), value.clone()));
-                        }
+                        property_array[name.to_index()] = Some(value.clone());
                     }
                 }
 
@@ -637,10 +644,7 @@ fn compute_node_styles_recursive(
     let parent_font_size = parent_computed.map(|pc| pc.font_size).unwrap_or(16.0);
 
     let get_prop = |key: crate::dom::PropertyName| -> Option<&crate::dom::StyleValue> {
-        new_declarations
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| v)
+        property_array[key.to_index()].as_ref()
     };
 
     use crate::dom::PropertyName as P;

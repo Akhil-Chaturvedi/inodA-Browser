@@ -40,8 +40,9 @@ pub fn compute_layout(
 
     prepare_text_buffers(document, document.root_id, font_system, buffer_cache);
 
+    let mut scratchpad = Vec::with_capacity(128);
     let root_taffy_node =
-        build_taffy_node(document, document.root_id, viewport_width, viewport_height, buffer_cache);
+        build_taffy_node(document, document.root_id, viewport_width, viewport_height, buffer_cache, &mut scratchpad);
 
     let tree = &mut document.taffy_tree;
     let available_space = Size {
@@ -167,6 +168,7 @@ fn build_taffy_node(
     vw: f32,
     vh: f32,
     buffer_cache: &HashMap<crate::dom::NodeId, Buffer>,
+    scratchpad: &mut Vec<taffy::NodeId>,
 ) -> taffy::NodeId {
     let mut style = Style::DEFAULT;
 
@@ -284,10 +286,11 @@ fn build_taffy_node(
             if let Some(buffer) = buffer_cache.get(&node_id) {
                 for run in buffer.layout_runs() {
                     max_intrinsic_width = max_intrinsic_width.max(run.line_w);
-                    // Approximation for min_intrinsic_width (longest word)
-                    // In a real browser we'd track this during shaping.
-                    // For now, we'll use a conservative 10% of max or some heuristic.
-                    min_intrinsic_width = min_intrinsic_width.max(run.line_w * 0.1f32);
+                    
+                    // Honest min_intrinsic_width: the widest single glyph
+                    for glyph in run.glyphs {
+                        min_intrinsic_width = min_intrinsic_width.max(glyph.w);
+                    }
                 }
             }
 
@@ -314,16 +317,22 @@ fn build_taffy_node(
     };
 
     if !is_text {
-        let mut taffy_children = Vec::new();
+        let start_idx = scratchpad.len();
         let mut child_id = document.first_child_of(node_id);
         while let Some(c) = child_id {
-            taffy_children.push(build_taffy_node(document, c, vw, vh, buffer_cache));
+            let t_child = build_taffy_node(document, c, vw, vh, buffer_cache, scratchpad);
+            scratchpad.push(t_child);
             child_id = document.next_sibling_of(c);
         }
+        
+        let children_slice = &scratchpad[start_idx..];
         document
             .taffy_tree
-            .set_children(t_node, &taffy_children)
+            .set_children(t_node, children_slice)
             .unwrap();
+        
+        // Truncate back to preserve the scratchpad for sibling branches
+        scratchpad.truncate(start_idx);
     }
 
     t_node

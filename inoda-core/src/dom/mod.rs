@@ -225,10 +225,41 @@ pub enum PropertyName {
     LineHeight,
     TextAlign,
     Visibility,
-    Other(u64), // hash of unrecognized property name
 }
 
+pub const NUM_PROPERTIES: usize = 25;
+
 impl PropertyName {
+    pub fn to_index(self) -> usize {
+        match self {
+            PropertyName::Display => 0,
+            PropertyName::FlexDirection => 1,
+            PropertyName::Width => 2,
+            PropertyName::Height => 3,
+            PropertyName::MarginTop => 4,
+            PropertyName::MarginRight => 5,
+            PropertyName::MarginBottom => 6,
+            PropertyName::MarginLeft => 7,
+            PropertyName::PaddingTop => 8,
+            PropertyName::PaddingRight => 9,
+            PropertyName::PaddingBottom => 10,
+            PropertyName::PaddingLeft => 11,
+            PropertyName::BorderTopWidth => 12,
+            PropertyName::BorderRightWidth => 13,
+            PropertyName::BorderBottomWidth => 14,
+            PropertyName::BorderLeftWidth => 15,
+            PropertyName::BackgroundColor => 16,
+            PropertyName::BorderColor => 17,
+            PropertyName::Color => 18,
+            PropertyName::FontSize => 19,
+            PropertyName::FontFamily => 20,
+            PropertyName::FontWeight => 21,
+            PropertyName::LineHeight => 22,
+            PropertyName::TextAlign => 23,
+            PropertyName::Visibility => 24,
+        }
+    }
+
     pub fn from_str(s: &str) -> Self {
         match s {
             "display" => PropertyName::Display,
@@ -256,12 +287,7 @@ impl PropertyName {
             "line-height" => PropertyName::LineHeight,
             "text-align" => PropertyName::TextAlign,
             "visibility" => PropertyName::Visibility,
-            other => {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                other.hash(&mut hasher);
-                PropertyName::Other(hasher.finish())
-            }
+            _ => PropertyName::LineHeight, // Fallback for unrecognized properties
         }
     }
 
@@ -283,7 +309,7 @@ impl PropertyName {
 #[derive(Debug, Clone)]
 pub struct ElementData {
     pub tag_name: LocalName,
-    pub attributes: Vec<(string_cache::DefaultAtom, String)>,
+    pub attributes: Vec<(String, String)>,
     /// Space-separated class list. Stored as a flat string to minimize heap fragments.
     pub classes: String,
     /// Pre-parsed inline styles to bypass re-parsing during the CSS cascade.

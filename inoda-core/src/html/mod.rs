@@ -10,8 +10,6 @@
 
 use crate::dom::{Document, ElementData, Node, TextData};
 use html5gum::{Token, Tokenizer};
-use string_cache::DefaultAtom;
-
 pub fn parse_html(html: &str) -> Document {
     let mut doc = Document::default();
     let mut current_parent = doc.root_id;
@@ -94,23 +92,21 @@ pub fn parse_html(html: &str) -> Document {
                     if let (Ok(k_str), Ok(v_str)) =
                         (std::str::from_utf8(&key), std::str::from_utf8(&value))
                     {
-                        let k_atom = DefaultAtom::from(k_str);
-
-                        if &*k_atom == "class" {
+                        if k_str == "class" {
                             if classes.is_empty() {
                                 classes = v_str.trim().to_string();
                             } else {
                                 classes.push(' ');
                                 classes.push_str(v_str.trim());
                             }
-                        } else if &*k_atom == "id" {
+                        } else if k_str == "id" {
                             id_val = Some(v_str.to_string());
-                        } else if &*k_atom == "style" {
+                        } else if k_str == "style" {
                             let decls = crate::css::parse_inline_declarations(v_str.trim());
                             let mapped: Vec<_> = decls.into_iter().map(|d| (d.name, d.value)).collect();
                             cached_inline_styles = Some(mapped);
                         }
-                        attributes.push((k_atom, v_str.to_string()));
+                        attributes.push((k_str.to_string(), v_str.to_string()));
                     }
                 }
 

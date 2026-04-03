@@ -196,7 +196,7 @@ impl JsEngine {
                     let node_id = this.borrow().to_node_id();
                     if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
                         for (k, v) in &data.attributes {
-                            if &**k == attr {
+                            if k == &attr {
                                 return Some(v.clone());
                             }
                         }
@@ -221,7 +221,7 @@ impl JsEngine {
                         let mut old_id_to_remove = None;
                         if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
                             if let Some((_, old_val)) =
-                                data.attributes.iter().find(|(k, _)| &**k == "id")
+                                data.attributes.iter().find(|(k, _)| k == "id")
                             {
                                 old_id_to_remove = Some(old_val.clone());
                             }
@@ -231,31 +231,29 @@ impl JsEngine {
                         }
 
                         if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
-                            let local_attr = string_cache::DefaultAtom::from("id");
                             if let Some(pos) =
-                                data.attributes.iter().position(|(k, _)| *k == local_attr)
+                                data.attributes.iter().position(|(k, _)| k == "id")
                             {
                                 data.attributes[pos].1 = value.clone();
                             } else {
-                                data.attributes.push((local_attr, value.clone()));
+                                data.attributes.push(("id".to_string(), value.clone()));
                             }
                         }
 
                         doc.id_map.insert(value.clone(), node_id);
                     } else if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id)
                     {
-                        let local_attr = string_cache::DefaultAtom::from(attr.as_str());
                         if let Some(pos) =
-                            data.attributes.iter().position(|(k, _)| *k == local_attr)
+                            data.attributes.iter().position(|(k, _)| k == &attr)
                         {
                             data.attributes[pos].1 = value.clone();
                         } else {
-                            data.attributes.push((local_attr.clone(), value.clone()));
+                            data.attributes.push((attr.clone(), value.clone()));
                         }
 
-                        if &*local_attr == "class" {
+                        if attr == "class" {
                             data.classes = value.trim().to_string();
-                        } else if &*local_attr == "style" {
+                        } else if attr == "style" {
                             let decls = crate::css::parse_inline_declarations(&value);
                             let mapped: Vec<_> = decls.into_iter().map(|d| (d.name, d.value)).collect();
                             data.cached_inline_styles = Some(mapped);
@@ -699,16 +697,16 @@ impl JsEngine {
             });
         }
 
-        // Deterministic GC limit mapping
-        let ticks = self.pump_ticks.get();
-        if ticks > 60 {
-            self.runtime.run_gc(); // Sweep abandoned closures + DOM Nodes deterministically
+        // Only sweep every 60 ticks to avoid blocking the event loop
+        let ticks = self.pump_ticks.get() + 1;
+        self.pump_ticks.set(ticks);
+        if ticks >= 60 {
+            // Document batched GC handle cleanup
+            self.document.borrow_mut().collect_garbage();
             self.pump_ticks.set(0);
-        } else {
-            self.pump_ticks.set(ticks + 1);
         }
 
-        self.document.borrow_mut().collect_garbage();
+        while let Ok(true) = self.runtime.execute_pending_job() {}
 
         count
     }

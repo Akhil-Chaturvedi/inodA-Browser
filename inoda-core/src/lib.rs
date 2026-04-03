@@ -6,11 +6,10 @@
 //! through an abstract backend trait, and exposes a DOM API through an
 //! embedded QuickJS runtime.
 //!
-//! Tag names are interned via `string_cache::DefaultAtom`, while attribute keys
 //! and values are stored as `String` to ensure OOM safety and deterministic
 //! memory reclamation. For security, a limit of 32 attributes per element is enforced.
 //! CSS property resolution uses a fixed-size array mapping for O(1) performance,
-//! with computed styles shared via `Rc` to minimize memory footprint.
+//! with computed styles stored inline to prioritize L1 cache locality.
 //!
 //! This crate is a library. The host application must provide a window,
 //! event loop, and graphics backend.

@@ -295,8 +295,12 @@ fn build_taffy_node(
                         
                         let mut current_word_width = 0.0;
                         for glyph in run.glyphs {
-                            // Extract the character slice from the original text to identify whitespace boundaries
-                            let is_whitespace = text_node.text[glyph.start..glyph.end].chars().any(|c| c.is_whitespace());
+                            // Extract the character slice safely from the original text to identify whitespace boundaries.
+                            // Uses .get() to avoid panicking on unaligned UTF-8 char boundaries.
+                            let is_whitespace = text_node.text.get(glyph.start..glyph.end)
+                                .map(|s| s.chars().any(|c| c.is_whitespace()))
+                                .unwrap_or(false);
+
                             if is_whitespace {
                                 min_intrinsic_width = min_intrinsic_width.max(current_word_width);
                                 current_word_width = 0.0;
@@ -341,10 +345,15 @@ fn build_taffy_node(
         }
         
         let children_slice = &scratchpad[start_idx..];
-        document
-            .taffy_tree
-            .set_children(t_node, children_slice)
-            .unwrap();
+        
+        // Only update children if the document is structurally dirty.
+        // This avoids violent allocator thrashing inside Taffy's edge arrays on every frame.
+        if document.dirty {
+            document
+                .taffy_tree
+                .set_children(t_node, children_slice)
+                .unwrap();
+        }
         
         // Truncate back to preserve the scratchpad for sibling branches
         scratchpad.truncate(start_idx);

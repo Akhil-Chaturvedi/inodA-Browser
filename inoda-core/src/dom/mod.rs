@@ -15,7 +15,6 @@
 //! than scanning dynamic trees.
 
 use generational_arena::{Arena, Index};
-use std::rc::Rc;
 
 pub const MAX_ATTRIBUTES: usize = 32;
 
@@ -42,8 +41,6 @@ pub struct Document {
     /// Stylesheet invalidation flag. True if `<style>` tags were added or removed.
     pub styles_dirty: bool,
     pub taffy_tree: taffy::TaffyTree<TextMeasureContext>,
-    /// Global cache for sharing computed styles across identical nodes.
-    pub style_cache: std::collections::HashMap<ComputedStyle, Rc<ComputedStyle>>,
 }
 
 /// A handle into the arena. Generational indices prevent ABA problems.
@@ -324,7 +321,7 @@ pub struct ElementData {
     pub last_child: Option<NodeId>,
     pub prev_sibling: Option<NodeId>,
     pub next_sibling: Option<NodeId>,
-    pub computed: Rc<ComputedStyle>,
+    pub computed: ComputedStyle,
     pub taffy_node: Option<taffy::NodeId>,
     pub js_handles: usize,
     /// Set true when styles or content change, triggering a text re-shape.
@@ -343,7 +340,7 @@ impl ElementData {
             last_child: None,
             prev_sibling: None,
             next_sibling: None,
-            computed: Rc::new(ComputedStyle::default()),
+            computed: ComputedStyle::default(),
             taffy_node: None,
             js_handles: 0,
             layout_dirty: false,
@@ -357,7 +354,7 @@ pub struct TextData {
     pub parent: Option<NodeId>,
     pub prev_sibling: Option<NodeId>,
     pub next_sibling: Option<NodeId>,
-    pub computed: Rc<ComputedStyle>,
+    pub computed: ComputedStyle,
     pub taffy_node: Option<taffy::NodeId>,
     pub js_handles: usize,
     /// Set true when text content changes, triggering a re-shape.
@@ -371,7 +368,7 @@ impl TextData {
             parent: None,
             prev_sibling: None,
             next_sibling: None,
-            computed: Rc::new(ComputedStyle::default()),
+            computed: ComputedStyle::default(),
             taffy_node: None,
             js_handles: 0,
             layout_dirty: false,
@@ -404,53 +401,6 @@ pub enum StyleValue {
 
 impl Eq for StyleValue {}
 
-impl std::hash::Hash for StyleValue {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        match self {
-            StyleValue::Keyword(a) => {
-                0.hash(state);
-                a.hash(state);
-            }
-            StyleValue::LengthPx(f) => {
-                1.hash(state);
-                f.to_bits().hash(state);
-            }
-            StyleValue::Percent(f) => {
-                2.hash(state);
-                f.to_bits().hash(state);
-            }
-            StyleValue::ViewportWidth(f) => {
-                3.hash(state);
-                f.to_bits().hash(state);
-            }
-            StyleValue::ViewportHeight(f) => {
-                4.hash(state);
-                f.to_bits().hash(state);
-            }
-            StyleValue::Em(f) => {
-                5.hash(state);
-                f.to_bits().hash(state);
-            }
-            StyleValue::Rem(f) => {
-                6.hash(state);
-                f.to_bits().hash(state);
-            }
-            StyleValue::Number(f) => {
-                7.hash(state);
-                f.to_bits().hash(state);
-            }
-            StyleValue::Color(r, g, b) => {
-                8.hash(state);
-                r.hash(state);
-                g.hash(state);
-                b.hash(state);
-            }
-            StyleValue::Auto => 9.hash(state),
-            StyleValue::None => 10.hash(state),
-        }
-    }
-}
-
 /// Pre-calculated native CSS properties to eliminate O(N) tuple lookups during Layout and Rendering loops.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComputedStyle {
@@ -470,21 +420,6 @@ pub struct ComputedStyle {
 
 impl Eq for ComputedStyle {}
 
-impl std::hash::Hash for ComputedStyle {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.display.hash(state);
-        self.flex_direction.hash(state);
-        self.width.hash(state);
-        self.height.hash(state);
-        self.margin.hash(state);
-        self.padding.hash(state);
-        self.border_width.hash(state);
-        self.bg_color.hash(state);
-        self.border_color.hash(state);
-        self.font_size.to_bits().hash(state);
-        self.color.hash(state);
-    }
-}
 
 impl Default for ComputedStyle {
     fn default() -> Self {
@@ -537,7 +472,6 @@ impl Default for Document {
             dirty: true,
             styles_dirty: true,
             taffy_tree: taffy::TaffyTree::new(),
-            style_cache: std::collections::HashMap::new(),
         }
     }
 }
@@ -650,17 +584,25 @@ impl Document {
     /// Should be called by the host application at the end of each frame.
     pub fn collect_garbage(&mut self) {
         let potential = std::mem::take(&mut self.dead_nodes);
+        let mut detached_roots = std::collections::HashSet::new();
+
         for id in potential {
             if !self.nodes.contains(id) { continue; }
             
-            // Find the "detached root" of this node
-            let mut detached_root = id;
-            while let Some(parent) = self.parent_of(detached_root) {
-                detached_root = parent;
+            // Find the "detached root" of this node branch
+            let mut curr = id;
+            while let Some(parent) = self.parent_of(curr) {
+                curr = parent;
             }
 
-            if detached_root != self.root_id && self.can_wipe_detached_tree(detached_root) {
-                self.wipe_node_recursive(detached_root);
+            if curr != self.root_id {
+                detached_roots.insert(curr);
+            }
+        }
+
+        for root in detached_roots {
+            if self.can_wipe_detached_tree(root) {
+                self.wipe_node_recursive(root);
             }
         }
     }
@@ -721,6 +663,15 @@ impl Document {
     }
 
     pub fn append_child(&mut self, parent_id: NodeId, child_id: NodeId) {
+        // Cycle check: Ensure child_id is not an ancestor of parent_id
+        let mut curr = Some(parent_id);
+        while let Some(pid) = curr {
+            if pid == child_id {
+                return; // Cycle detected, abort append
+            }
+            curr = self.parent_of(pid);
+        }
+
         self.dirty = true;
         
         // If we are appending a <style> tag, mark styles as dirty

@@ -14,8 +14,7 @@ html::parse_html()          -- html5gum token loop -> arena DOM (Document)
 css::compute_styles()       -- iterative stack-based traversal (no recursion),
   |                            resolves specificity against StyleSheet hash-map buckets,
   |                            evaluates combinators by walking parent pointers,
-  |                            deduplicates ComputedStyle pointers via StyleCache,
-  |                            assigns Rc<ComputedStyle> to each ElementData/TextData
+  |                            assigns ComputedStyle inline to each ElementData/TextData
   |
 v
 layout::compute_layout()    -- prepares text buffers in a pre-pass,
@@ -48,7 +47,6 @@ Document {
     dead_nodes: Vec<NodeId>,         // iterative deletion queue for remove_node
     dirty: bool,                     // set true by JS DOM mutations, cleared by host after re-render
     styles_dirty: bool,              // set true when <style> tags change, triggers rebuild
-    style_cache: HashMap<ComputedStyle, Rc<ComputedStyle>>, // style sharing pool
 }
 
 Node = Element(ElementData) | Text(TextData) | Root(RootData)
@@ -64,7 +62,7 @@ ElementData {
     last_child:   Option<NodeId>,
     prev_sibling: Option<NodeId>,
     next_sibling: Option<NodeId>,
-    computed: Rc<ComputedStyle>,      // shared via StyleCache
+    computed: ComputedStyle,           // stored inline for cache locality
     js_handles: usize,                // reference count for JS engine
     layout_dirty: bool,               // triggers text buffer re-shaping
 }
@@ -74,7 +72,7 @@ TextData {
     parent:       Option<NodeId>,
     prev_sibling: Option<NodeId>,
     next_sibling: Option<NodeId>,
-    computed: Rc<ComputedStyle>,      // shared via StyleCache
+    computed: ComputedStyle,           // stored inline
     js_handles: usize,
     layout_dirty: bool,
 }
@@ -110,7 +108,7 @@ ComputedStyle {
 }
 ```
 
-`ComputedStyle` is shared between nodes using `Rc<ComputedStyle>` and a document-level `StyleCache`. During style resolution, identical computed properties are deduplicated to point to the same heap allocation, significantly reducing the memory footprint for complex pages. There is no intermediate styled-node tree that gets built and dropped per frame.
+`ComputedStyle` is stored directly inside `ElementData` and `TextData`. It is populated once during `css::compute_styles()` and read by both `layout::compute_layout()` and `render::draw_layout_tree()`. Storage is inline to prioritize L1 cache locality and avoid the CPU overhead of deep-hashing styles for deduplication. There is no intermediate styled-node tree built per frame.
 
 `StyleValue` is:
 
@@ -167,9 +165,8 @@ Timers are stored in a `std::collections::BinaryHeap` ordered by `fire_at` (min-
 2. Merges matched rules using a k-way specificity-ordered pointer walk.
 3. Applies inline `style` attribute declarations last (highest priority).
 4. Resolves the final property set against a fixed-size `[Option<StyleValue>; 25]` array using property bitmasks.
-5. Deduplicates the resulting `ComputedStyle` against the `StyleCache` to retrieve an `Rc<ComputedStyle>`.
-6. Assigns the `Rc` to the node and marks `layout_dirty = true` if the style changed.
-7. Pushes children onto the traversal stack.
+5. Assigns the resulting `ComputedStyle` directly to the node and marks `layout_dirty = true` if the style changed.
+6. Pushes children onto the traversal stack.
 
 Inheritable properties (`color`, `font-size`, etc.) are resolved during the cascade and stored in the `ComputedStyle`. Combinator evaluation (`>` child, space descendant) walks arena parent pointers rather than maintaining a separate ancestor stack.
 
@@ -191,7 +188,7 @@ During `compute_layout_with_measure`, the measure closure calls `buffer.set_size
 
 ## HTML parsing
 
-The HTML module iterates `html5gum` tokens in a loop. `StartTag` tokens create `ElementData` nodes and append them under `current_parent`. Before appending, the parser checks whether the new tag should implicitly close an open ancestor (e.g., `<div>` closing an open `<p>`). The walk stops at block-level boundary tags (`div`, `body`, `td`, `th`, `table`). `EndTag` tokens walk `current_parent` back up to the matching ancestor. Byte slices are validated as UTF-8 directly without allocating through `String::from_utf8_lossy`.
+The HTML module iterates `html5gum` tokens in a loop. `StartTag` tokens create `ElementData` nodes and append them under `current_parent`. `EndTag` tokens walk `current_parent` back up to the matching ancestor to reconcile the tree state if nesting is malformed. Byte slices are validated as UTF-8 directly without allocating through `String::from_utf8_lossy`.
 
 Content inside `<script>` and `<style>` is accumulated as raw text. The matching closing tag exits the raw state. `<style>` content is parsed immediately into `document.stylesheet` via `css::append_stylesheet()`.
 

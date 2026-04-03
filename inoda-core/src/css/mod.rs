@@ -406,21 +406,7 @@ fn match_ancestors_recursive(
 }
 
 fn has_class(classes: &str, target: &str) -> bool {
-    if target.is_empty() { return false; }
-    let mut start = 0;
-    while let Some(pos) = classes[start..].find(target) {
-        let actual_pos = start + pos;
-        let end = actual_pos + target.len();
-
-        let before_ok = actual_pos == 0 || classes.as_bytes()[actual_pos - 1].is_ascii_whitespace();
-        let after_ok = end == classes.len() || classes.as_bytes()[end].is_ascii_whitespace();
-
-        if before_ok && after_ok {
-            return true;
-        }
-        start = actual_pos + 1;
-    }
-    false
+    classes.split_whitespace().any(|c| c == target)
 }
 
 fn match_complex_selector(
@@ -507,7 +493,7 @@ pub fn parse_stylesheet(css: &str) -> StyleSheet {
 pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &StyleSheet) {
     document.styles_dirty = false;
 
-    let mut stack = vec![(document.root_id, None::<std::rc::Rc<crate::dom::ComputedStyle>>)];
+    let mut stack = vec![(document.root_id, None::<crate::dom::ComputedStyle>)];
 
     while let Some((node_id, parent_computed)) = stack.pop() {
         let mut property_mask: u32 = 0;
@@ -657,32 +643,25 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
             next_computed.font_size = 16.0;
         }
 
-        // Style Sharing: Consult the cache
-        let shared_style = if let Some(existing) = document.style_cache.get(&next_computed) {
-            std::rc::Rc::clone(existing)
-        } else {
-            let rc = std::rc::Rc::new(next_computed.clone());
-            document.style_cache.insert(next_computed, std::rc::Rc::clone(&rc));
-            rc
-        };
-
         if let Some(node) = document.nodes.get_mut(node_id) {
             match node {
                 crate::dom::Node::Element(data) => {
-                    if data.computed != shared_style {
-                        data.computed = shared_style.clone();
+                    if data.computed != next_computed {
+                        data.computed = next_computed.clone();
                         data.layout_dirty = true;
                     }
                 }
                 crate::dom::Node::Text(data) => {
-                    if data.computed != shared_style {
-                        data.computed = shared_style.clone();
+                    if data.computed != next_computed {
+                        data.computed = next_computed.clone();
                         data.layout_dirty = true;
                     }
                 }
                 crate::dom::Node::Root(_) => {}
             }
         }
+
+        let shared_style = next_computed; // For pushing to stack
 
         // Push children to stack (reverse for stack order if we wanted DFS, here it's just a traversal)
         let mut child = document.first_child_of(node_id);
@@ -692,7 +671,7 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
             child = document.next_sibling_of(c);
         }
         for c in children.into_iter().rev() {
-            stack.push((c, Some(std::rc::Rc::clone(&shared_style))));
+            stack.push((c, Some(shared_style.clone())));
         }
     }
 }

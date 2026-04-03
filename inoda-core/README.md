@@ -41,7 +41,7 @@ Tag names are stored as `LocalName`, which is either `Standard(DefaultAtom)` for
 
 Attribute keys and values are stored as `String`. To prevent OOM attacks from unbounded attribute names, interning into the global `DefaultAtom` pool is intentionally avoided for attributes. For security, a limit of `MAX_ATTRIBUTES` (32) is enforced during both HTML parsing and JS `setAttribute` calls. This ensures that memory consumption scales linearly with the DOM size and is fully reclaimed upon node destruction. IDs are also stored as `String` and indexed in an $O(1)$ `id_map`.
 
-`ComputedStyle` is shared via `Rc<ComputedStyle>` and a document-level `StyleCache`. During the cascade, identical styles are deduplicated to minimize memory footprint. Layout and rendering read from these shared fields without scanning style tuples.
+`ComputedStyle` is stored directly inside `ElementData` and `TextData` for optimal L1 cache locality. It is populated once by `css::compute_styles()` during the cascade; layout and rendering read from these resolved fields without scanning style tuples. Storage is inline to eliminate the CPU overhead of deep-hashing style objects for deduplication.
 
 `Document` fields:
 - `nodes: Arena<Node>` -- the arena
@@ -56,9 +56,7 @@ Node deletion is iterative (queue-based) to avoid stack overflow on deeply neste
 
 Streams `html5gum` tokens into the arena in a single pass. Byte slices are validated with `std::str::from_utf8` directly, avoiding intermediate `String` allocations.
 
-Implicit tag auto-closing walks up the ancestor chain from `current_parent`. For example, a `<div>` token will first close an open `<p>`, but the walk stops at block-level boundary tags (`div`, `body`, `td`, `th`, `table`) to prevent over-closing. `EndTag` tokens walk `current_parent` back to the matching ancestor.
-
-Content inside `<script>` and `<style>` is accumulated as raw text via an `inside_raw_tag` state variable. The matching closing tag exits this state. Text from `<style>` elements is parsed immediately into `document.stylesheet` via `css::append_stylesheet()`.
+Content inside `<script>` and `<style>` is accumulated as raw text via an `inside_raw_tag` state variable. The matching closing tag exits this state. Text from `<style>` elements is parsed immediately into `document.stylesheet` via `css::append_stylesheet()`. If an `EndTag` does not match the `current_parent`, the parser walks up the ancestor chain to find a match and reconciles the tree state.
 
 ### css
 
@@ -67,7 +65,7 @@ Content inside `<script>` and `<style>` is accumulated as raw text via an `insid
 - Property names in `Declaration` use `PropertyName`, a strongly-typed enum (`Display`, `Width`, `MarginTop`, `FontSize`, etc.) with an `Other(u64)` fallback. This makes property matching during cascade an integer comparison rather than a string deref.
 - Specificity is computed as `(id_count, class_count, tag_count)` at parse time and stored on each `ComplexSelector`.
 - Rules are stored in `HashMap<String, Vec<IndexedRule>>` buckets keyed by class and ID (plain `String`), and `HashMap<DefaultAtom, Vec<IndexedRule>>` keyed by tag (bounded set of known tag names; interning is safe here). Class and ID keys are not interned because they are uncontrolled user input.
-- `compute_styles()` performs an iterative stack-based traversal of the arena DOM, evaluating combinators (`>`, space) by walking arena parent pointers. It populates `ComputedStyle` on each node by matching against pre-parsed rules and deduplicating results via the `StyleCache`.
+- `compute_styles()` performs an iterative stack-based traversal of the arena DOM, evaluating combinators (`>`, space) by walking arena parent pointers. It populates `ComputedStyle` on each node by matching against pre-parsed rules and resolving inheritance.
 - Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent. Values are copied directly from the parent's resolved style to avoid redundant allocations.
 - `font-size` expressed as `Em` multiplies against the parent's resolved `font_size`. `Rem` always uses 16px as root baseline. Both are resolved during the cascade; the result stored in `computed.font_size` is always absolute pixels.
 - Expands `margin`, `padding` shorthands (1/2/3/4-value) and maps `background` to `background-color`.

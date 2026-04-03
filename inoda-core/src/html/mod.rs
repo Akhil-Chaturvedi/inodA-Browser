@@ -39,18 +39,19 @@ pub fn parse_html(html: &str) -> Document {
                     if attributes.len() >= crate::dom::MAX_ATTRIBUTES {
                         break;
                     }
-                    if let (Ok(k_str), Ok(v_str)) = (std::str::from_utf8(&key), std::str::from_utf8(&value)) {
-                        if k_str == "class" {
-                            classes = v_str.to_string();
-                        } else if k_str == "style" {
-                            let decls = crate::css::parse_inline_declarations(v_str);
-                            cached_inline_styles = Some(decls.into_iter().map(|d| (d.name, d.value)).collect());
-                        } else if k_str == "id" {
-                            id_val = Some(v_str.to_string());
-                            attributes.push((k_str.to_string(), v_str.to_string()));
-                        } else {
-                            attributes.push((k_str.to_string(), v_str.to_string()));
-                        }
+                    let k_str = String::from_utf8_lossy(&key).into_owned();
+                    let v_str = String::from_utf8_lossy(&value).into_owned();
+                    
+                    if k_str == "class" {
+                        classes = v_str.to_string();
+                    } else if k_str == "style" {
+                        let decls = crate::css::parse_inline_declarations(&v_str);
+                        cached_inline_styles = Some(decls.into_iter().map(|d| (d.name, d.value)).collect());
+                    } else if k_str == "id" {
+                        id_val = Some(v_str.to_string());
+                        attributes.push((k_str, v_str));
+                    } else {
+                        attributes.push((k_str, v_str));
                     }
                 }
 

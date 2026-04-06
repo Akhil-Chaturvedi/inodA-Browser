@@ -1,6 +1,7 @@
 //! Rendering module.
 //!
-//! Walks the Taffy layout tree alongside the arena DOM and issues draw commands
+//! Iteratively walks the Taffy layout tree alongside the arena DOM using an
+//! explicit stack to prevent overflow on deep DOM trees. Issues draw commands
 //! to an abstract renderer backend. Text is rendered via pre-shaped
 //! `cosmic_text::LayoutGlyph` iterators rather than raw strings.
 //! Draw properties (`bg_color`, `border_color`, `font_size`, `color`) are
@@ -36,86 +37,86 @@ pub fn draw_layout_tree<R: RendererBackend>(
     renderer: &mut R,
     document: &crate::dom::Document,
     layout_tree: &taffy::TaffyTree,
-    node_id: crate::dom::NodeId,
-    layout_node_id: taffy::NodeId,
-    offset_x: f32,
-    offset_y: f32,
+    root_node_id: crate::dom::NodeId,
+    root_layout_node_id: taffy::NodeId,
+    root_offset_x: f32,
+    root_offset_y: f32,
     buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
     font_system: &mut cosmic_text::FontSystem,
 ) {
-    let computed = match document.nodes.get(node_id) {
-        Some(crate::dom::Node::Element(data)) => &data.computed,
-        Some(crate::dom::Node::Text(data)) => &data.computed,
-        _ => return,
-    };
+    let mut stack = vec![(root_node_id, root_layout_node_id, root_offset_x, root_offset_y)];
 
-    if let Ok(layout) = layout_tree.layout(layout_node_id) {
-        let abs_x = offset_x + layout.location.x;
-        let abs_y = offset_y + layout.location.y;
+    while let Some((node_id, layout_node_id, offset_x, offset_y)) = stack.pop() {
+        let computed = match document.nodes.get(node_id) {
+            Some(crate::dom::Node::Element(data)) => &data.computed,
+            Some(crate::dom::Node::Text(data)) => &data.computed,
+            _ => continue,
+        };
 
-        if let Some((r, g, b)) = computed.bg_color {
-            renderer.fill_rect(
-                abs_x,
-                abs_y,
-                layout.size.width,
-                layout.size.height,
-                Color { r, g, b },
-            );
-        }
+        if let Ok(layout) = layout_tree.layout(layout_node_id) {
+            let abs_x = offset_x + layout.location.x;
+            let abs_y = offset_y + layout.location.y;
 
-        if let Some((r, g, b)) = computed.border_color {
-            renderer.stroke_rect(
-                abs_x,
-                abs_y,
-                layout.size.width,
-                layout.size.height,
-                1.0,
-                Color { r, g, b },
-            );
-        }
-
-        if let crate::dom::Node::Text(_) = document.nodes.get(node_id).unwrap() {
-            let buffer = buffer_cache.get_mut(&node_id).unwrap();
-            let color = Color {
-                r: computed.color.0,
-                g: computed.color.1,
-                b: computed.color.2,
-            };
-
-            for run in buffer.layout_runs() {
-                renderer.draw_glyphs(
+            if let Some((r, g, b)) = computed.bg_color {
+                renderer.fill_rect(
                     abs_x,
-                    abs_y + run.line_y,
-                    run.glyphs,
-                    computed.font_size,
-                    color,
-                    font_system,
+                    abs_y,
+                    layout.size.width,
+                    layout.size.height,
+                    Color { r, g, b },
                 );
             }
-        } else {
-            let mut dom_child_id = document.first_child_of(node_id);
-            while let Some(c) = dom_child_id {
-                let t_node = match document.nodes.get(c) {
-                    Some(crate::dom::Node::Element(d)) => d.taffy_node,
-                    Some(crate::dom::Node::Text(d)) => d.taffy_node,
-                    Some(crate::dom::Node::Root(d)) => d.taffy_node,
-                    _ => None,
+
+            if let Some((r, g, b)) = computed.border_color {
+                renderer.stroke_rect(
+                    abs_x,
+                    abs_y,
+                    layout.size.width,
+                    layout.size.height,
+                    1.0,
+                    Color { r, g, b },
+                );
+            }
+
+            if let crate::dom::Node::Text(_) = document.nodes.get(node_id).unwrap() {
+                let buffer = buffer_cache.get_mut(&node_id).unwrap();
+                let color = Color {
+                    r: computed.color.0,
+                    g: computed.color.1,
+                    b: computed.color.2,
                 };
 
-                if let Some(tn) = t_node {
-                    draw_layout_tree(
-                        renderer,
-                        document,
-                        layout_tree,
-                        c,
-                        tn,
+                for run in buffer.layout_runs() {
+                    renderer.draw_glyphs(
                         abs_x,
-                        abs_y,
-                        buffer_cache,
+                        abs_y + run.line_y,
+                        run.glyphs,
+                        computed.font_size,
+                        color,
                         font_system,
                     );
                 }
-                dom_child_id = document.next_sibling_of(c);
+            } else {
+                let mut children_to_push = Vec::new();
+                let mut dom_child_id = document.first_child_of(node_id);
+                while let Some(c) = dom_child_id {
+                    let t_node = match document.nodes.get(c) {
+                        Some(crate::dom::Node::Element(d)) => d.taffy_node,
+                        Some(crate::dom::Node::Text(d)) => d.taffy_node,
+                        Some(crate::dom::Node::Root(d)) => d.taffy_node,
+                        _ => None,
+                    };
+
+                    if let Some(tn) = t_node {
+                        children_to_push.push((c, tn, abs_x, abs_y));
+                    }
+                    dom_child_id = document.next_sibling_of(c);
+                }
+                
+                // Push in reverse order so that the first child is popped first
+                for child in children_to_push.into_iter().rev() {
+                    stack.push(child);
+                }
             }
         }
     }

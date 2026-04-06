@@ -4,8 +4,9 @@
 //! index invalidation. Nodes can be safely removed and their indices
 //! will not be reused until the generation wraps.
 //!
-//! Tag names and attribute keys are interned using `string_cache::DefaultAtom`
-//! to minimize memory usage and enable O(1) comparison.
+//! Tag names are interned using `string_cache::DefaultAtom`
+//! to minimize memory usage, while attribute keys and values are stored
+//! directly as `String` to prevent unbounded memory growth in the global pool.
 //!
 //! Parent pointers are stored directly on nodes to keep parent traversal
 //! cache-friendly and avoid hashmap overhead in embedded environments.

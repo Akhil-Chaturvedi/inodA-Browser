@@ -9,7 +9,7 @@
 //!
 //! DOM handles are exposed to JavaScript as native `NodeHandle` class instances
 //! wrapping a `generational_arena::Index`. Methods include:
-//! - `handle.tagName`
+//! - `handle.tagName` (lazy lookup in arena, no redundant string storage)
 //! - `handle.getAttribute(key)`
 //! - `handle.setAttribute(key, value)`
 //! - `handle.removeChild(child)`
@@ -17,10 +17,9 @@
 //! Each `NodeHandle` carries a `__nodeKey` property: a two-element JS array
 //! `[u32 index, u64 generation]`. JavaScript object identity (`===`) is enforced
 //! via a `_wrapNode` WeakRef cache in the JS environment. A `FinalizationRegistry`
-//! receives the integer array when a wrapper is GC'd and calls the native Rust
-//! `_garbageCollectNodeRaw` (mapped to `try_cleanup_node`), which decrements
-//! the handle count. Detached nodes are cleared from the arena by the batched
-//! `collect_garbage()` sweep.
+//! receives this raw integer array when a wrapper is GC'd and calls the native
+//! Rust `_garbageCollectNodeRaw`, which decrements the handle count. Detached
+//! nodes are cleared from the arena by the batched `collect_garbage()` sweep.
 //!
 //! The Document is held behind `Rc<RefCell<Document>>` for single-threaded access.
 //! All JS operations are synchronous and serialized through this lock.
@@ -46,17 +45,10 @@ use std::time::Instant;
 pub struct NodeHandle {
     pub index: u32,
     pub generation: u64,
-    pub tag_name: String,
 }
 
 #[rquickjs::methods]
 impl NodeHandle {
-    #[qjs(get)]
-    #[allow(non_snake_case)]
-    pub fn tagName(&self) -> String {
-        self.tag_name.clone()
-    }
-
     #[qjs(get, rename = "__nodeKey")]
     pub fn node_key<'js>(&self, ctx: rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Array<'js>> {
         let arr = rquickjs::Array::new(ctx)?;
@@ -67,12 +59,11 @@ impl NodeHandle {
 }
 
 impl NodeHandle {
-    pub fn from_node_id(id: NodeId, tag_name: String) -> Self {
+    pub fn from_node_id(id: NodeId) -> Self {
         let (index, generation) = id.into_raw_parts();
         NodeHandle {
             index: index as u32,
             generation,
-            tag_name,
         }
     }
 
@@ -186,6 +177,20 @@ impl JsEngine {
             let proto = rquickjs::Class::<NodeHandle>::prototype(&ctx)
                 .unwrap()
                 .unwrap();
+
+            let tag_name_func = rquickjs::Function::new(ctx.clone(), {
+                let doc_ref = doc_ref.clone();
+                move |This(this): This<rquickjs::Class<'_, NodeHandle>>| -> String {
+                    let doc = doc_ref.borrow();
+                    let node_id = this.borrow().to_node_id();
+                    match doc.nodes.get(node_id) {
+                        Some(crate::dom::Node::Element(data)) => data.tag_name.to_string(),
+                        _ => String::new(),
+                    }
+                }
+            })
+            .unwrap();
+            proto.set("_tagNameRaw", tag_name_func).unwrap();
 
             let get_attr_func = rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
@@ -320,12 +325,12 @@ impl JsEngine {
                     let node_id = this.borrow().to_node_id();
                     if let Some(parent_id) = doc.parent_of(node_id) {
                         if let Some(node) = doc.nodes.get_mut(parent_id) {
-                            let tag_name = match node {
-                                crate::dom::Node::Element(d) => { d.js_handles += 1; d.tag_name.to_string() },
-                                crate::dom::Node::Text(d) => { d.js_handles += 1; "text".to_string() },
-                                crate::dom::Node::Root(d) => { d.js_handles += 1; "root".to_string() },
-                            };
-                            return Some(NodeHandle::from_node_id(parent_id, tag_name));
+                            match node {
+                                crate::dom::Node::Element(d) => d.js_handles += 1,
+                                crate::dom::Node::Text(d) => d.js_handles += 1,
+                                crate::dom::Node::Root(d) => d.js_handles += 1,
+                            }
+                            return Some(NodeHandle::from_node_id(parent_id));
                         }
                     }
                     None
@@ -341,12 +346,12 @@ impl JsEngine {
                     let node_id = this.borrow().to_node_id();
                     if let Some(child_id) = doc.first_child_of(node_id) {
                         if let Some(node) = doc.nodes.get_mut(child_id) {
-                            let tag_name = match node {
-                                crate::dom::Node::Element(d) => { d.js_handles += 1; d.tag_name.to_string() },
-                                crate::dom::Node::Text(d) => { d.js_handles += 1; "text".to_string() },
-                                crate::dom::Node::Root(d) => { d.js_handles += 1; "root".to_string() },
-                            };
-                            return Some(NodeHandle::from_node_id(child_id, tag_name));
+                            match node {
+                                crate::dom::Node::Element(d) => d.js_handles += 1,
+                                crate::dom::Node::Text(d) => d.js_handles += 1,
+                                crate::dom::Node::Root(d) => d.js_handles += 1,
+                            }
+                            return Some(NodeHandle::from_node_id(child_id));
                         }
                     }
                     None
@@ -362,12 +367,12 @@ impl JsEngine {
                     let node_id = this.borrow().to_node_id();
                     if let Some(sibling_id) = doc.next_sibling_of(node_id) {
                         if let Some(node) = doc.nodes.get_mut(sibling_id) {
-                            let tag_name = match node {
-                                crate::dom::Node::Element(d) => { d.js_handles += 1; d.tag_name.to_string() },
-                                crate::dom::Node::Text(d) => { d.js_handles += 1; "text".to_string() },
-                                crate::dom::Node::Root(d) => { d.js_handles += 1; "root".to_string() },
-                            };
-                            return Some(NodeHandle::from_node_id(sibling_id, tag_name));
+                            match node {
+                                crate::dom::Node::Element(d) => d.js_handles += 1,
+                                crate::dom::Node::Text(d) => d.js_handles += 1,
+                                crate::dom::Node::Root(d) => d.js_handles += 1,
+                            }
+                            return Some(NodeHandle::from_node_id(sibling_id));
                         }
                     }
                     None
@@ -410,10 +415,7 @@ impl JsEngine {
                     if let Some(&node_id) = doc.id_map.get(&id) {
                         if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
                             data.js_handles += 1;
-                            return Some(NodeHandle::from_node_id(
-                                node_id,
-                                data.tag_name.to_string(),
-                            ));
+                            return Some(NodeHandle::from_node_id(node_id));
                         }
                     }
                     None
@@ -446,24 +448,31 @@ impl JsEngine {
                         }
                     }
 
-                    fn find_recursive(
+                    fn find_iterative(
                         doc: &crate::dom::Document,
-                        current: crate::dom::NodeId,
+                        root: crate::dom::NodeId,
                         selector: &str,
-                    ) -> Option<(crate::dom::NodeId, String)> {
-                        if let Some(node) = doc.nodes.get(current) {
-                            if let crate::dom::Node::Element(data) = node {
-                                if matches_selector(selector, data) {
-                                    return Some((current, data.tag_name.to_string()));
+                    ) -> Option<crate::dom::NodeId> {
+                        // Depth-first search using an explicit stack
+                        let mut stack = vec![root];
+                        while let Some(current) = stack.pop() {
+                            if let Some(node) = doc.nodes.get(current) {
+                                if let crate::dom::Node::Element(data) = node {
+                                    if matches_selector(selector, data) {
+                                        return Some(current);
+                                    }
                                 }
-                            }
-
-                            let mut child = doc.first_child_of(current);
-                            while let Some(c) = child {
-                                if let Some(found) = find_recursive(doc, c, selector) {
-                                    return Some(found);
+                                
+                                // Push children in reverse order so first child is popped first
+                                let mut children_to_push = Vec::new();
+                                let mut child = doc.first_child_of(current);
+                                while let Some(c) = child {
+                                    children_to_push.push(c);
+                                    child = doc.next_sibling_of(c);
                                 }
-                                child = doc.next_sibling_of(c);
+                                for c in children_to_push.into_iter().rev() {
+                                    stack.push(c);
+                                }
                             }
                         }
                         None
@@ -473,27 +482,18 @@ impl JsEngine {
                         let id_name = &selector[1..];
                         if let Some(&node_id) = doc.id_map.get(id_name) {
                             if let Some(node) = doc.nodes.get_mut(node_id) {
-                                let tag_name = match node {
-                                    crate::dom::Node::Element(d) => {
-                                        d.js_handles += 1;
-                                        d.tag_name.to_string()
-                                    }
-                                    crate::dom::Node::Text(d) => {
-                                        d.js_handles += 1;
-                                        "text".to_string()
-                                    }
-                                    crate::dom::Node::Root(d) => {
-                                        d.js_handles += 1;
-                                        "root".to_string()
-                                    }
-                                };
-                                return Some(NodeHandle::from_node_id(node_id, tag_name));
+                                match node {
+                                    crate::dom::Node::Element(d) => d.js_handles += 1,
+                                    crate::dom::Node::Text(d) => d.js_handles += 1,
+                                    crate::dom::Node::Root(d) => d.js_handles += 1,
+                                }
+                                return Some(NodeHandle::from_node_id(node_id));
                             }
                         }
                         return None;
                     }
 
-                    if let Some((node_id, tag_name)) = find_recursive(&doc, root_id, &selector) {
+                    if let Some(node_id) = find_iterative(&doc, root_id, &selector) {
                         if let Some(node) = doc.nodes.get_mut(node_id) {
                             match node {
                                 crate::dom::Node::Element(d) => d.js_handles += 1,
@@ -501,7 +501,7 @@ impl JsEngine {
                                 crate::dom::Node::Root(d) => d.js_handles += 1,
                             }
                         }
-                        return Some(NodeHandle::from_node_id(node_id, tag_name));
+                        return Some(NodeHandle::from_node_id(node_id));
                     }
                     None
                 }
@@ -537,7 +537,7 @@ impl JsEngine {
                     let index = doc.add_node(crate::dom::Node::Element(data));
                     drop(doc);
 
-                    NodeHandle::from_node_id(index, local_name.to_string())
+                    NodeHandle::from_node_id(index)
                 }
             })
             .unwrap();
@@ -623,6 +623,7 @@ impl JsEngine {
                     Object.defineProperty(proto, "parentNode", { get() { return document._wrapNode(this._parentNodeRaw()); } });
                     Object.defineProperty(proto, "firstChild", { get() { return document._wrapNode(this._firstChildRaw()); } });
                     Object.defineProperty(proto, "nextSibling", { get() { return document._wrapNode(this._nextSiblingRaw()); } });
+                    Object.defineProperty(proto, "tagName", { get() { return this._tagNameRaw(); } });
                 })
                 "#,
             ).unwrap();

@@ -92,7 +92,7 @@ Properties not wired: `align-items`, `justify-content`, `gap`, `flex-wrap`, `fle
 
 ### render
 
-Recursively walks the Taffy layout tree alongside the arena DOM and issues backend draw calls:
+Iteratively walks the Taffy layout tree alongside the arena DOM using an explicit stack to avoid overflow on deep trees. Issues backend draw calls:
 - Background rectangles (`background-color`)
 - Border strokes (`border-color`)
 - Text: calls `draw_glyphs` once per `LayoutRun` from `buffer.layout_runs()`, passing `run.glyphs` (a `&[LayoutGlyph]` slice borrowed directly from the pre-shaped buffer) and `abs_y + run.line_y` as the vertical position. No intermediate `Vec` is allocated in the render loop.
@@ -110,7 +110,7 @@ Embeds QuickJS via `rquickjs`. `JsEngine` holds `Document` behind `Rc<RefCell<Do
 Exposed globals:
 - `console.log(msg)`, `console.warn(msg)`, `console.error(msg)` -- print to stdout
 - `document.getElementById(id)` -- returns a cached `NodeHandle` or null
-- `document.querySelector(selector)` -- tag, class, and ID selectors only. Uses an $O(1)$ fast-path for exact `#id` selectors and falls back to a recursive traversal for class/tag queries. Returns a cached `NodeHandle` or null.
+- `document.querySelector(selector)` -- tag, class, and ID selectors only. Uses an $O(1)$ fast-path for exact `#id` selectors and falls back to an iterative traversal for class/tag queries. Returns a cached `NodeHandle` or null.
 - `document.createElement(tagName)` -- creates a detached element in the arena, returns a cached `NodeHandle`
 - `document.appendChild(parent, child)` -- appends child node, sets `document.dirty = true`
 - `document.addEventListener(event, callback)` -- records registration; does not dispatch events
@@ -119,7 +119,7 @@ Exposed globals:
 - `clearTimeout(id)`, `clearInterval(id)` -- cancels a pending timer by ID
 
 `NodeHandle` class methods:
-- `handle.tagName` -- returns the tag name string
+- `handle.tagName` -- returns the tag name string via a lazy lookup in the arena prototype getter. No redundant string storage on the handle.
 - `handle.getAttribute(key)` -- returns value or null
 - `handle.setAttribute(key, value)` -- updates or inserts attribute, sets `document.dirty = true`
 - `handle.removeChild(child)` -- detaches child from parent, sets `document.dirty = true`

@@ -24,8 +24,9 @@ layout::compute_layout()    -- prepares text buffers in a pre-pass,
   |                            resolves dimensions (px, %, vw, vh, em, rem, auto),
   |                            runs Taffy flexbox/grid solver -> positioned Layout tree
   v
-render::draw_layout_tree()  -- walks Taffy layout tree alongside the arena DOM,
-                               reads ComputedStyle directly from each node,
+render::draw_layout_tree()  -- iterative stack-based traversal (no recursion),
+                                walks Taffy layout tree alongside the arena DOM,
+                                reads ComputedStyle directly from each node,
                                issues draw calls: fill_rect (bg), stroke_rect (border),
                                draw_glyphs (text content)
 ```
@@ -84,7 +85,7 @@ RootData {
 }
 ```
 
-Generational indices prevent ABA problems. The DOM tree is wired as an intrusive linked list; mutations do not allocate child vectors. Node deletion uses an iterative queue rather than recursion to avoid stack overflow on deep trees.
+Generational indices prevent ABA problems. The DOM tree is wired as an intrusive linked list; mutations do not allocate child vectors. Node deletion, rendering, and selector matching all use iterative stack-based traversals rather than recursion to avoid stack overflow on deep trees.
 
 `LocalName` separates standard HTML tags (interned as `DefaultAtom`) from custom element names (heap-allocated `String`). This prevents unbounded growth of the global `DefaultAtom` intern pool when arbitrary custom element names are created from JavaScript.
 
@@ -174,7 +175,7 @@ Inheritable properties (`color`, `font-size`, etc.) are resolved during the casc
 
 `JsEngine` holds the `Document` inside `Rc<RefCell<Document>>`. DOM-mutating JS functions call `doc.dirty = true` after making changes.
 
-JavaScript object identity (`===`) is enforced via a `_wrapNode` WeakRef cache. Rust traversals (e.g. `parentNode`, `firstChild`) are patched onto the `NodeHandle` prototype as closures that proxy through this cache. A `FinalizationRegistry` receives the raw `[index, generation]` integer array when QuickJS garbage-collects a wrapper; it invokes `_garbageCollectNodeRaw` (mapped to `try_cleanup_node` in Rust) to decrement the handle count. To prevent the "Fat Node" memory leak, `_wrapNode` manually triggers `_garbageCollectNodeRaw` when a duplicate handle is received but discarded in favor of a cached wrapper.
+JavaScript object identity (`===`) is enforced via a `_wrapNode` WeakRef cache. Rust traversals (e.g. `parentNode`, `firstChild`) and properties like `tagName` are patched onto the `NodeHandle` prototype as getters using closures that proxy through this cache and the arena. A `FinalizationRegistry` receives the raw `[u32 index, u64 generation]` integer array when QuickJS garbage-collects a wrapper; it invokes `_garbageCollectNodeRaw` (mapped to `try_cleanup_node` in Rust) to decrement the handle count. To prevent the "Fat Node" memory leak, `_wrapNode` manually triggers `_garbageCollectNodeRaw` when a duplicate handle is received but discarded in favor of a cached wrapper. `NodeHandle` itself contains no heap-allocated strings, only raw arena identifiers.
 
 `JsEngine::pump()` executes pending JavaScript jobs (microtasks/promises) asynchronously to sweep `FinalizationRegistry` callbacks. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue and process the `FinalizationRegistry`. This ensures deterministic memory reclamation without blocking the main thread for expensive GC synchronous sweeps.
 

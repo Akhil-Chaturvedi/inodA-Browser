@@ -7,9 +7,9 @@
 //!
 //! Attribute keys and values are stored as `String` to ensure OOM safety and
 //! deterministic memory reclamation. For security, a limit of 32 attributes
-//! per element is enforced. CSS property resolution uses a fixed-size array
-//! mapping for O(1) performance, with computed styles stored inline to
-//! prioritize L1 cache locality.
+//! per element and 16 KB per attribute value is enforced. CSS property
+//! resolution uses a fixed-size array mapping for O(1) performance, with
+//! computed styles stored inline to prioritize L1 cache locality.
 //!
 //! This crate is a library. The host application must provide a window,
 //! event loop, and graphics backend.

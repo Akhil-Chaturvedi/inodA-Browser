@@ -108,7 +108,7 @@ Iteratively walks the Taffy layout tree alongside the arena DOM using an explici
 
 Draw properties are read directly from `ComputedStyle` fields on each arena node. There is no intermediate draw cache or separate text layout struct.
 
-The `RendererBackend` trait requires `fill_rect`, `stroke_rect`, `draw_glyphs`, and `draw_image` (default no-op). `draw_glyphs` accepts a `&mut cosmic_text::FontSystem` to allow the host to physically rasterize the provided glyph offsets. `draw_image` receives screen coordinates, dimensions, and the `src` URL; the host is responsible for decoding and blitting pixel data.
+The `RendererBackend` trait requires `fill_rect`, `stroke_rect`, `draw_glyphs`, and `draw_image` (default no-op). `draw_glyphs` accepts pre-shaped geometric glyph slices; it does not receive the `FontSystem`, ensuring that hosts can implement hardware-accelerated drawing without a CPU-side shaping dependency. `draw_image` receives screen coordinates, dimensions, and the `src` URL; the host is responsible for decoding and blitting pixel data.
 
 Color values use RGBA 4-channel tuples `(u8, u8, u8, u8)`. Parsing supports named colors (`red`, `green`, `blue`, `black`, `white`, `transparent`), 3/4/6/8-digit hex (`#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`), `rgb()`, `rgba()`, `hsl()`, and `hsla()` functional notation.
 

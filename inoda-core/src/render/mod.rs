@@ -8,6 +8,9 @@
 //! read directly from `ComputedStyle` embedded in each arena node.
 //! `inoda-core` does not depend on any graphics APIs; platform binaries
 //! implement the `RendererBackend` trait using their own raster target.
+//! The renderer is decoupled from the shaping system, receiving pre-shaped
+//! glyph slices to allow for hardware-accelerated backends without
+//! CPU-side font-shaping dependencies.
 
 use cosmic_text::Buffer;
 use std::collections::HashMap;
@@ -30,7 +33,6 @@ pub trait RendererBackend {
         glyphs: &[cosmic_text::LayoutGlyph],
         size: f32,
         color: Color,
-        font_system: &mut cosmic_text::FontSystem,
     );
     fn draw_image(&mut self, _x: f32, _y: f32, _w: f32, _h: f32, _url: &str) {}
 }
@@ -44,7 +46,6 @@ pub fn draw_layout_tree<R: RendererBackend>(
     root_offset_x: f32,
     root_offset_y: f32,
     buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
-    font_system: &mut cosmic_text::FontSystem,
 ) {
     let mut stack = vec![(root_node_id, root_layout_node_id, root_offset_x, root_offset_y)];
 
@@ -96,7 +97,6 @@ pub fn draw_layout_tree<R: RendererBackend>(
                         run.glyphs,
                         computed.font_size,
                         color,
-                        font_system,
                     );
                 }
             } else if let Some(crate::dom::Node::Element(d)) = document.nodes.get(node_id) {

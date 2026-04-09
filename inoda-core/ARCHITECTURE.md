@@ -186,9 +186,14 @@ JavaScript object identity (`===`) is enforced via a `_wrapNode` WeakRef cache. 
 
 ## Text measurement
 
-The text render loop calls `buffer.layout_runs()` and invokes `draw_glyphs` once per `LayoutRun`, passing `run.glyphs` (a `&[LayoutGlyph]` slice borrowed directly from the buffer) and `run.line_y` as the vertical offset. No intermediate `Vec` is allocated during the render pass.
+The text render loop calls `buffer.layout_runs()` and invokes `draw_glyphs` once per `LayoutRun`, passing `run.glyphs` (a `&[LayoutGlyph]` slice borrowed directly from the buffer) and `run.line_y` as the vertical offset. `draw_layout_tree` does not pass the `FontSystem` to the `RendererBackend` trait. This architectural decoupling ensures that hosts employing hardware-accelerated GPU rasterization (e.g. wgpu atlas rendering) are not forced to maintain a dependency on the CPU-side `cosmic_text::FontSystem` that shaped the layout. No intermediate `Vec` is allocated during the render pass.
 
 During `compute_layout_with_measure`, the measure closure calls `buffer.set_size()` and re-wraps text at the available width constraint. Accurate height resolution is achieved by querying the resulting layout runs. After the layout solver finishes, `finalize_text_measurements` reshapes each buffer at its final resolved width if necessary. The renderer reads `LayoutGlyph` iterators directly from `buffer.layout_runs()`.
+
+## Future Optimizations
+The current architecture is tailored for embedded Linux / HMI devices with 64+ MB RAM. Future micro-optimizations may include:
+- **SmallVec Attributes**: Changing `ElementData::attributes` from `Vec<(String, String)>` to `SmallVec<[(String, String); 4]>` to further reduce heap fragmentation.
+- **Per-Document Atom Tables**: Interning class/ID names into a per-document arena table instead of hashing standard `String` allocations, allowing for pointer comparisons during the hot path of style cascade.
 
 ## HTML parsing
 

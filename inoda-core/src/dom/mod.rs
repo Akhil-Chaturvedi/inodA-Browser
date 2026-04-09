@@ -31,6 +31,7 @@ pub struct TextMeasureContext {
 pub struct Document {
     pub nodes: Arena<Node>,
     pub root_id: NodeId,
+    pub root_font_size: f32,
     /// Persistent CSS parsed actively when `<style>` tags change.
     pub stylesheet: crate::css::StyleSheet,
     /// O(1) lookup map for `getElementById`.
@@ -228,9 +229,20 @@ pub enum PropertyName {
     LineHeight,
     TextAlign,
     Visibility,
+    AlignItems,
+    JustifyContent,
+    FlexWrap,
+    FlexGrow,
+    FlexShrink,
+    RowGap,
+    ColumnGap,
+    MinWidth,
+    MaxWidth,
+    MinHeight,
+    MaxHeight,
 }
 
-pub const NUM_PROPERTIES: usize = 25;
+pub const NUM_PROPERTIES: usize = 36;
 
 impl PropertyName {
     pub fn to_index(self) -> usize {
@@ -260,6 +272,17 @@ impl PropertyName {
             PropertyName::LineHeight => 22,
             PropertyName::TextAlign => 23,
             PropertyName::Visibility => 24,
+            PropertyName::AlignItems => 25,
+            PropertyName::JustifyContent => 26,
+            PropertyName::FlexWrap => 27,
+            PropertyName::FlexGrow => 28,
+            PropertyName::FlexShrink => 29,
+            PropertyName::RowGap => 30,
+            PropertyName::ColumnGap => 31,
+            PropertyName::MinWidth => 32,
+            PropertyName::MaxWidth => 33,
+            PropertyName::MinHeight => 34,
+            PropertyName::MaxHeight => 35,
         }
     }
 
@@ -290,6 +313,17 @@ impl PropertyName {
             "line-height" => PropertyName::LineHeight,
             "text-align" => PropertyName::TextAlign,
             "visibility" => PropertyName::Visibility,
+            "align-items" => PropertyName::AlignItems,
+            "justify-content" => PropertyName::JustifyContent,
+            "flex-wrap" => PropertyName::FlexWrap,
+            "flex-grow" => PropertyName::FlexGrow,
+            "flex-shrink" => PropertyName::FlexShrink,
+            "row-gap" => PropertyName::RowGap,
+            "column-gap" => PropertyName::ColumnGap,
+            "min-width" => PropertyName::MinWidth,
+            "max-width" => PropertyName::MaxWidth,
+            "min-height" => PropertyName::MinHeight,
+            "max-height" => PropertyName::MaxHeight,
             _ => PropertyName::LineHeight, // Fallback for unrecognized properties
         }
     }
@@ -395,7 +429,7 @@ pub enum StyleValue {
     Em(f32),
     Rem(f32),
     Number(f32),
-    Color(u8, u8, u8),
+    Color(u8, u8, u8, u8),
     Auto,
     None,
 }
@@ -407,28 +441,45 @@ impl Eq for StyleValue {}
 pub struct ComputedStyle {
     pub display: string_cache::DefaultAtom,
     pub flex_direction: string_cache::DefaultAtom,
+    pub align_items: string_cache::DefaultAtom,
+    pub justify_content: string_cache::DefaultAtom,
+    pub flex_wrap: string_cache::DefaultAtom,
     pub width: StyleValue,
     pub height: StyleValue,
+    pub min_width: StyleValue,
+    pub max_width: StyleValue,
+    pub min_height: StyleValue,
+    pub max_height: StyleValue,
     /// Top, Right, Bottom, Left. Inline for cache locality and to reduce allocation overhead.
     pub margin: [StyleValue; 4],
     pub padding: [StyleValue; 4],
     pub border_width: [StyleValue; 4],
-    pub bg_color: Option<(u8, u8, u8)>,
-    pub border_color: Option<(u8, u8, u8)>,
+    pub row_gap: StyleValue,
+    pub column_gap: StyleValue,
+    pub bg_color: Option<(u8, u8, u8, u8)>,
+    pub border_color: Option<(u8, u8, u8, u8)>,
     pub font_size: f32,
-    pub color: (u8, u8, u8),
+    pub color: (u8, u8, u8, u8),
+    pub flex_grow: f32,
+    pub flex_shrink: f32,
 }
 
 impl Eq for ComputedStyle {}
-
 
 impl Default for ComputedStyle {
     fn default() -> Self {
         ComputedStyle {
             display: string_cache::DefaultAtom::from("block"),
             flex_direction: string_cache::DefaultAtom::from("row"),
+            align_items: string_cache::DefaultAtom::from("stretch"),
+            justify_content: string_cache::DefaultAtom::from("flex-start"),
+            flex_wrap: string_cache::DefaultAtom::from("nowrap"),
             width: StyleValue::Auto,
             height: StyleValue::Auto,
+            min_width: StyleValue::Auto,
+            max_width: StyleValue::Auto,
+            min_height: StyleValue::Auto,
+            max_height: StyleValue::Auto,
             margin: [
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
@@ -447,10 +498,14 @@ impl Default for ComputedStyle {
                 StyleValue::LengthPx(0.0),
                 StyleValue::LengthPx(0.0),
             ],
+            row_gap: StyleValue::LengthPx(0.0),
+            column_gap: StyleValue::LengthPx(0.0),
             bg_color: None,
             border_color: None,
             font_size: 16.0,
-            color: (0, 0, 0),
+            color: (0, 0, 0, 255),
+            flex_grow: 0.0,
+            flex_shrink: 1.0,
         }
     }
 }
@@ -467,6 +522,7 @@ impl Default for Document {
         Document {
             nodes: arena,
             root_id,
+            root_font_size: 16.0,
             stylesheet: crate::css::StyleSheet::default(),
             id_map: std::collections::HashMap::new(),
             dead_nodes: Vec::new(),
@@ -847,5 +903,47 @@ impl Document {
                 Node::Root(_) => {}
             }
         }
+    }
+
+    pub fn hit_test(&self, px: f32, py: f32) -> Option<NodeId> {
+        let root_taffy = match self.nodes.get(self.root_id) {
+            Some(Node::Root(r)) => r.taffy_node?,
+            _ => return None,
+        };
+
+        let mut hit = None;
+        let mut stack = vec![(self.root_id, root_taffy, 0.0, 0.0)];
+
+        while let Some((node_id, taffy_id, offset_x, offset_y)) = stack.pop() {
+            if let Ok(layout) = self.taffy_tree.layout(taffy_id) {
+                let abs_x = offset_x + layout.location.x;
+                let abs_y = offset_y + layout.location.y;
+
+                if px >= abs_x && px <= abs_x + layout.size.width &&
+                   py >= abs_y && py <= abs_y + layout.size.height {
+                       
+                    hit = Some(node_id);
+
+                     let mut children = Vec::new();
+                     let mut child_id = self.first_child_of(node_id);
+                     while let Some(c) = child_id {
+                         children.push(c);
+                         child_id = self.next_sibling_of(c);
+                     }
+
+                     for c in children {
+                         let c_taffy = match self.nodes.get(c) {
+                             Some(Node::Element(d)) => d.taffy_node,
+                             Some(Node::Text(d)) => d.taffy_node,
+                             _ => None,
+                         };
+                         if let Some(t) = c_taffy {
+                             stack.push((c, t, abs_x, abs_y));
+                         }
+                     }
+                }
+            }
+        }
+        hit
     }
 }

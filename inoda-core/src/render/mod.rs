@@ -17,6 +17,7 @@ pub struct Color {
     pub r: u8,
     pub g: u8,
     pub b: u8,
+    pub a: u8,
 }
 
 pub trait RendererBackend {
@@ -31,6 +32,7 @@ pub trait RendererBackend {
         color: Color,
         font_system: &mut cosmic_text::FontSystem,
     );
+    fn draw_image(&mut self, _x: f32, _y: f32, _w: f32, _h: f32, _url: &str) {}
 }
 
 pub fn draw_layout_tree<R: RendererBackend>(
@@ -57,24 +59,24 @@ pub fn draw_layout_tree<R: RendererBackend>(
             let abs_x = offset_x + layout.location.x;
             let abs_y = offset_y + layout.location.y;
 
-            if let Some((r, g, b)) = computed.bg_color {
+            if let Some((r, g, b, a)) = computed.bg_color {
                 renderer.fill_rect(
                     abs_x,
                     abs_y,
                     layout.size.width,
                     layout.size.height,
-                    Color { r, g, b },
+                    Color { r, g, b, a },
                 );
             }
 
-            if let Some((r, g, b)) = computed.border_color {
+            if let Some((r, g, b, a)) = computed.border_color {
                 renderer.stroke_rect(
                     abs_x,
                     abs_y,
                     layout.size.width,
                     layout.size.height,
                     1.0,
-                    Color { r, g, b },
+                    Color { r, g, b, a },
                 );
             }
 
@@ -84,6 +86,7 @@ pub fn draw_layout_tree<R: RendererBackend>(
                     r: computed.color.0,
                     g: computed.color.1,
                     b: computed.color.2,
+                    a: computed.color.3,
                 };
 
                 for run in buffer.layout_runs() {
@@ -96,7 +99,13 @@ pub fn draw_layout_tree<R: RendererBackend>(
                         font_system,
                     );
                 }
-            } else {
+            } else if let Some(crate::dom::Node::Element(d)) = document.nodes.get(node_id) {
+                if &*d.tag_name == "img" {
+                    if let Some((_, src)) = d.attributes.iter().find(|(k, _)| k == "src") {
+                        renderer.draw_image(abs_x, abs_y, layout.size.width, layout.size.height, src);
+                    }
+                }
+                
                 let mut children_to_push = Vec::new();
                 let mut dom_child_id = document.first_child_of(node_id);
                 while let Some(c) = dom_child_id {

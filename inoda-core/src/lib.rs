@@ -23,6 +23,7 @@ pub mod render;
 
 pub trait ResourceLoader {
     fn fetch(&self, url: &str) -> Vec<u8>;
+    fn fetch_image(&self, _url: &str) -> Option<(u32, u32, Vec<u8>)> { None }
 }
 
 #[cfg(test)]
@@ -236,7 +237,7 @@ mod tests {
 
         assert_eq!(
             span_computed.color,
-            (255, 0, 0),
+            (255, 0, 0, 255),
             "Descendant combinator failed"
         );
 
@@ -244,7 +245,7 @@ mod tests {
         // the color from the child combinator didn't cascade since it shouldn't match.
         assert_ne!(
             span_computed.color,
-            (0, 0, 255),
+            (0, 0, 255, 255),
             "Child combinator incorrectly matched descendant"
         );
     }

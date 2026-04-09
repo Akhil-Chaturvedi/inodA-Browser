@@ -4,8 +4,8 @@
 //! - `console.log`, `console.warn`, `console.error` (print to stdout)
 //! - `document.getElementById`, `document.querySelector` (return native `NodeHandle` objects)
 //! - `document.createElement`, `document.appendChild` (mutate the arena DOM)
-//! - `document.addEventListener` (logs registration, does not dispatch events)
-//! - `setTimeout` (cooperative timer queue via `pump()`)
+//! - `element.addEventListener` (registers callbacks; dispatched via `JsEngine::dispatch_event`)
+//! - `setTimeout`, `setInterval` (cooperative timer queue via `pump()`)
 //!
 //! DOM handles are exposed to JavaScript as native `NodeHandle` class instances
 //! wrapping a `generational_arena::Index`. Methods include:
@@ -144,6 +144,27 @@ pub struct JsEngine {
 }
 
 impl JsEngine {
+    pub fn dispatch_event(&self, x: f32, y: f32, event_type: &str) {
+        let hit = {
+            let doc = self.document.borrow();
+            doc.hit_test(x, y)
+        };
+        if let Some(node_id) = hit {
+            let event_type_str = event_type.to_string();
+            let _ = self.context.with(|ctx| {
+                let globals = ctx.globals();
+                if let Ok(doc_obj) = globals.get::<_, rquickjs::Object>("document") {
+                    if let Ok(dispatch_func) = doc_obj.get::<_, rquickjs::Function>("_triggerEvent") {
+                        let (idx, generation) = node_id.into_raw_parts();
+                        let arr = rquickjs::Array::new(ctx.clone()).unwrap();
+                        arr.set(0, idx as u64).unwrap();
+                        arr.set(1, generation).unwrap();
+                        let _ = dispatch_func.call::<_, ()>((arr, event_type_str));
+                    }
+                }
+            });
+        }
+    }
     pub fn new(document: Document) -> Self {
         let runtime = Runtime::new().unwrap();
         let context = Context::full(&runtime).unwrap();
@@ -512,17 +533,7 @@ impl JsEngine {
                 .set("_querySelectorRaw", query_selector_func)
                 .unwrap();
 
-            let add_event_listener_func = rquickjs::Function::new(
-                ctx.clone(),
-                move |event: String, _cb: rquickjs::Function| {
-                    println!("[JS addEventListener] Registered event: {}", event);
-                },
-            )
-            .unwrap();
-
-            document_obj
-                .set("addEventListener", add_event_listener_func)
-                .unwrap();
+            // addEventListener is implemented via JS polyfill on the Prototype now
 
             // createElement: creates an unattached node, returns a NodeHandle JS object
             let create_element_func = rquickjs::Function::new(ctx.clone(), {
@@ -613,6 +624,22 @@ impl JsEngine {
                 document.createElement = function(tag) {
                     return this._wrapNode(this._createElementRaw(tag));
                 };
+                document.addEventListener = function(eventType, cb) {
+                    this.__listeners = this.__listeners || {};
+                    this.__listeners[eventType] = this.__listeners[eventType] || [];
+                    this.__listeners[eventType].push(cb);
+                };
+                document._triggerEvent = function(keyPair, eventType) {
+                    let mapKey = BigInt(keyPair[0]) | (BigInt(keyPair[1]) << 32n);
+                    let cachedRef = document.__nodeCache.get(mapKey);
+                    if (!cachedRef) return;
+                    let target = cachedRef.deref();
+                    if (!target) return;
+                    if (target.__listeners && target.__listeners[eventType]) {
+                        let event = { target, type: eventType };
+                        for (let cb of target.__listeners[eventType]) cb(event);
+                    }
+                };
             "#,
                 )
                 .unwrap();
@@ -624,6 +651,11 @@ impl JsEngine {
                     Object.defineProperty(proto, "firstChild", { get() { return document._wrapNode(this._firstChildRaw()); } });
                     Object.defineProperty(proto, "nextSibling", { get() { return document._wrapNode(this._nextSiblingRaw()); } });
                     Object.defineProperty(proto, "tagName", { get() { return this._tagNameRaw(); } });
+                    proto.addEventListener = function(eventType, cb) {
+                        this.__listeners = this.__listeners || {};
+                        this.__listeners[eventType] = this.__listeners[eventType] || [];
+                        this.__listeners[eventType].push(cb);
+                    };
                 })
                 "#,
             ).unwrap();

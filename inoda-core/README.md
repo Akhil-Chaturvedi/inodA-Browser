@@ -65,9 +65,9 @@ Content inside `<script>` and `<style>` is accumulated as raw text via an `insid
 - Property names in `Declaration` use `PropertyName`, a strongly-typed enum (`Display`, `Width`, `MarginTop`, `FontSize`, etc.) with an `Other(u64)` fallback. This makes property matching during cascade an integer comparison rather than a string deref.
 - Specificity is computed as `(id_count, class_count, tag_count)` at parse time and stored on each `ComplexSelector`.
 - Rules are stored in `HashMap<String, Vec<IndexedRule>>` buckets keyed by class and ID (plain `String`), and `HashMap<DefaultAtom, Vec<IndexedRule>>` keyed by tag (bounded set of known tag names; interning is safe here). Class and ID keys are not interned because they are uncontrolled user input.
-- `compute_styles()` performs an iterative stack-based traversal of the arena DOM, evaluating combinators (`>`, space) by walking arena parent pointers. It populates `ComputedStyle` on each node by matching against pre-parsed rules and resolving inheritance.
+- `compute_styles()` performs an iterative stack-based traversal of the arena DOM, evaluating combinators (`>`, space, `+`, `~`) by walking arena parent and sibling pointers. Attribute selectors (`[attr]`, `[attr=value]`) are matched against `ElementData::attributes`. It populates `ComputedStyle` on each node by matching against pre-parsed rules and resolving inheritance.
 - Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent. Values are copied directly from the parent's resolved style to avoid redundant allocations.
-- `font-size` expressed as `Em` multiplies against the parent's resolved `font_size`. `Rem` always uses 16px as root baseline. Both are resolved during the cascade; the result stored in `computed.font_size` is always absolute pixels.
+- `font-size` expressed as `Em` multiplies against the parent's resolved `font_size`. `Rem` resolves against `Document.root_font_size` (defaults to 16px, configurable by the host). Both are resolved during the cascade; the result stored in `computed.font_size` is always absolute pixels.
 - Expands `margin`, `padding` shorthands (1/2/3/4-value) and maps `background` to `background-color`.
 - Inline `style=""` attributes are parsed via `cssparser`'s `DeclarationParser` trait and applied after stylesheet rules.
 - `document.stylesheet` is persistent; `append_stylesheet()` dynamically merges rules from new `<style>` tags into the existing AST without a full re-parse. Rebuilds only occur if nodes are removed or styles are explicitly cleared.
@@ -85,10 +85,14 @@ Supported CSS properties mapped to Taffy:
 - `flex-direction`: row, column
 - `width`, `height` with units: `px`, `%`, `vw`, `vh`, `em`, `rem`, `auto`
 - `margin-*`, `padding-*`, `border-*-width` (including `auto` for margins)
+- `align-items`, `justify-content`, `flex-wrap`, `flex-grow`, `flex-shrink`
+- `row-gap`, `column-gap`
+- `min-width`, `max-width`, `min-height`, `max-height`
+- `<img>` intrinsic sizing via `width`/`height` HTML attributes and Taffy `aspect_ratio`
 
 Non-flex elements default to `flex-direction: column` to approximate block stacking.
 
-Properties not wired: `align-items`, `justify-content`, `gap`, `flex-wrap`, `flex-grow`, `flex-shrink`, `min-*`, `max-*`, `position`, `overflow`.
+Properties not wired: `position`, `overflow`, `z-index`, `float`.
 
 ### render
 
@@ -99,9 +103,9 @@ Iteratively walks the Taffy layout tree alongside the arena DOM using an explici
 
 Draw properties are read directly from `ComputedStyle` fields on each arena node. There is no intermediate draw cache or separate text layout struct.
 
-The `RendererBackend` trait requires `fill_rect`, `stroke_rect`, and `draw_glyphs`. `draw_glyphs` accepts a `&mut cosmic_text::FontSystem` to allow the host to physically rasterize the provided glyph offsets.
+The `RendererBackend` trait requires `fill_rect`, `stroke_rect`, `draw_glyphs`, and `draw_image` (default no-op). `draw_glyphs` accepts a `&mut cosmic_text::FontSystem` to allow the host to physically rasterize the provided glyph offsets. `draw_image` receives screen coordinates, dimensions, and the `src` URL; the host is responsible for decoding and blitting pixel data.
 
-Color parsing handles the named colors `red`, `green`, `blue`, `black`, `white` and 6-digit hex (`#rrggbb`). No `rgb()`, `rgba()`, `hsl()`, shorthand hex, or alpha.
+Color values use RGBA 4-channel tuples `(u8, u8, u8, u8)`. Parsing supports named colors (`red`, `green`, `blue`, `black`, `white`, `transparent`), 3/4/6/8-digit hex (`#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`), `rgb()`, `rgba()`, `hsl()`, and `hsla()` functional notation.
 
 ### js
 
@@ -113,7 +117,8 @@ Exposed globals:
 - `document.querySelector(selector)` -- tag, class, and ID selectors only. Uses an $O(1)$ fast-path for exact `#id` selectors and falls back to an iterative traversal for class/tag queries. Returns a cached `NodeHandle` or null.
 - `document.createElement(tagName)` -- creates a detached element in the arena, returns a cached `NodeHandle`
 - `document.appendChild(parent, child)` -- appends child node, sets `document.dirty = true`
-- `document.addEventListener(event, callback)` -- records registration; does not dispatch events
+- `document.addEventListener(event, callback)` -- registers a callback on the document
+- `element.addEventListener(event, callback)` -- registers a callback on a specific element
 - `setTimeout(callback, delay)` -- registers a one-shot cooperative timer; returns a timer ID
 - `setInterval(callback, delay)` -- registers a repeating cooperative timer; returns a timer ID
 - `clearTimeout(id)`, `clearInterval(id)` -- cancels a pending timer by ID
@@ -150,19 +155,17 @@ Tests in `lib.rs` cover HTML parsing, CSS combinator matching, JS bridge round-t
 
 This list is not exhaustive. The engine is a working skeleton, not a production browser.
 
-- No networking, resource loading, or URL resolution.
-- No `<img>`, `<video>`, `<canvas>`, `<iframe>`, or form elements.
+- No networking, resource loading, or URL resolution. The host fetches resources via the `ResourceLoader` trait.
+- No `<video>`, `<canvas>`, `<iframe>`, or form elements. `<img>` has layout support (intrinsic sizing); decoding is the host's responsibility.
 - Inline formatting context is incomplete (no baseline alignment or float interaction).
 - Font loading and fallback are backend-specific and must be provided by the host.
 - `display: inline` and `inline-block` are parsed but treated identically to block.
-- Layout properties `position`, `overflow`, `z-index`, `float`, `align-items`, `justify-content`, `gap`, `flex-grow`, `flex-shrink`, `min-*`, `max-*` are not wired to Taffy.
-- Color parsing is limited to 5 named colors and 6-digit hex.
+- Layout properties `position`, `overflow`, `z-index`, `float` are not wired to Taffy.
 - No `@media`, `@import`, `@keyframes`, CSS variables, or `calc()`.
-- Selector matching supports `>` (child) and space (descendant) combinators, but not `+`, `~`, attribute selectors, or `:pseudo-class()` with arguments.
-- `addEventListener` records the registration but never dispatches any events.
+- Selector matching supports `>` (child), space (descendant), `+` (next-sibling), `~` (subsequent-sibling) combinators and `[attr]`/`[attr=value]` attribute selectors, but not `:pseudo-class()` with arguments.
+- Event dispatching uses flat hit-testing on layout geometry; there is no DOM event bubbling or capture phase.
 - `setTimeout` and `setInterval` fire only when the host calls `pump()`. There is no background thread.
 - The host is responsible for detecting `document.dirty` and re-running the style/layout/render pipeline after JS mutations.
-- `rem` unit resolution uses a fixed 16px root baseline; there is no `<html>` element font-size negotiation.
 
 ## License
 

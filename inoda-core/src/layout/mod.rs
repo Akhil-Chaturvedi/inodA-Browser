@@ -9,8 +9,13 @@
 //! The Taffy measure closure calls `buffer.set_size()` to adjust the width
 //! constraint, then `buffer.shape_until_scroll()` to re-wrap text. Layout
 //! properties (`width`, `height`, `margin`, `padding`, `border-width`, `display`,
-//! `flex-direction`) are read directly from `node.computed` (a `ComputedStyle`
+//! `flex-direction`, `align-items`, `justify-content`, `flex-wrap`, `flex-grow`,
+//! `flex-shrink`, `row-gap`, `column-gap`, `min-width`, `max-width`, `min-height`,
+//! `max-height`) are read directly from `node.computed` (a `ComputedStyle`
 //! embedded in each arena `ElementData` or `TextData`).
+//!
+//! `<img>` elements use intrinsic sizing from HTML `width`/`height` attributes
+//! and Taffy's `aspect_ratio` property.
 //!
 //! Supported dimension units: px, %, vw, vh, em, rem, auto.
 //! Supported display modes: flex, grid, block, none.
@@ -224,6 +229,55 @@ fn build_taffy_node(
         style.flex_direction = FlexDirection::Column;
     }
 
+    match &*computed.align_items {
+        "flex-start" | "start" => style.align_items = Some(AlignItems::FlexStart),
+        "flex-end" | "end" => style.align_items = Some(AlignItems::FlexEnd),
+        "center" => style.align_items = Some(AlignItems::Center),
+        "baseline" => style.align_items = Some(AlignItems::Baseline),
+        "stretch" => style.align_items = Some(AlignItems::Stretch),
+        _ => {}
+    }
+
+    match &*computed.justify_content {
+        "flex-start" | "start" => style.justify_content = Some(JustifyContent::FlexStart),
+        "flex-end" | "end" => style.justify_content = Some(JustifyContent::FlexEnd),
+        "center" => style.justify_content = Some(JustifyContent::Center),
+        "space-between" => style.justify_content = Some(JustifyContent::SpaceBetween),
+        "space-around" => style.justify_content = Some(JustifyContent::SpaceAround),
+        "space-evenly" => style.justify_content = Some(JustifyContent::SpaceEvenly),
+        _ => {}
+    }
+
+    match &*computed.flex_wrap {
+        "wrap" => style.flex_wrap = FlexWrap::Wrap,
+        "wrap-reverse" => style.flex_wrap = FlexWrap::WrapReverse,
+        "nowrap" => style.flex_wrap = FlexWrap::NoWrap,
+        _ => {}
+    }
+
+    style.flex_grow = computed.flex_grow;
+    style.flex_shrink = computed.flex_shrink;
+
+    if let Some(dim) = parse_length_percentage(&computed.row_gap, vw, vh, font_size) {
+        style.gap.height = dim;
+    }
+    if let Some(dim) = parse_length_percentage(&computed.column_gap, vw, vh, font_size) {
+        style.gap.width = dim;
+    }
+
+    if let Some(dim) = parse_dimension(&computed.min_width, vw, vh, font_size) {
+        style.min_size.width = dim;
+    }
+    if let Some(dim) = parse_dimension(&computed.max_width, vw, vh, font_size) {
+        style.max_size.width = dim;
+    }
+    if let Some(dim) = parse_dimension(&computed.min_height, vw, vh, font_size) {
+        style.min_size.height = dim;
+    }
+    if let Some(dim) = parse_dimension(&computed.max_height, vw, vh, font_size) {
+        style.max_size.height = dim;
+    }
+
     if let Some(dim) = parse_dimension(&computed.width, vw, vh, font_size) {
         style.size.width = dim;
     }
@@ -276,6 +330,33 @@ fn build_taffy_node(
         Some(crate::dom::Node::Text(d)) => d.taffy_node,
         _ => None,
     };
+
+    let mut aspect_ratio = None;
+    if let Some(crate::dom::Node::Element(d)) = document.nodes.get(node_id) {
+        if &*d.tag_name == "img" {
+            let mut img_w = None;
+            let mut img_h = None;
+            for (k, v) in &d.attributes {
+                if k == "width" {
+                    if let Ok(w) = v.parse::<f32>() { img_w = Some(w); }
+                } else if k == "height" {
+                    if let Ok(h) = v.parse::<f32>() { img_h = Some(h); }
+                }
+            }
+            if let (Some(w), Some(h)) = (img_w, img_h) {
+                if h > 0.0 {
+                    aspect_ratio = Some(w / h);
+                }
+                if style.size.width == Dimension::auto() {
+                    style.size.width = Dimension::length(w);
+                }
+                if style.size.height == Dimension::auto() {
+                    style.size.height = Dimension::length(h);
+                }
+            }
+        }
+    }
+    style.aspect_ratio = aspect_ratio;
 
     let t_node = if let Some(existing_t_node) = exists {
         document

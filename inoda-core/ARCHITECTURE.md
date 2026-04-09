@@ -48,6 +48,7 @@ Document {
     dead_nodes: Vec<NodeId>,         // iterative deletion queue for remove_node
     dirty: bool,                     // set true by JS DOM mutations, cleared by host after re-render
     styles_dirty: bool,              // set true when <style> tags change, triggers rebuild
+    root_font_size: f32,             // configurable rem baseline, defaults to 16.0
 }
 
 Node = Element(ElementData) | Text(TextData) | Root(RootData)
@@ -102,10 +103,10 @@ ComputedStyle {
     margin:        [StyleValue; 4],    // top, right, bottom, left (Inline for cache locality)
     padding:       [StyleValue; 4],
     border_width:  [StyleValue; 4],
-    bg_color:      Option<(u8, u8, u8)>,
-    border_color:  Option<(u8, u8, u8)>,
+    bg_color:      Option<(u8, u8, u8, u8)>,
+    border_color:  Option<(u8, u8, u8, u8)>,
     font_size:     f32,                // absolute pixels, resolved during cascade
-    color:         (u8, u8, u8),
+    color:         (u8, u8, u8, u8),
 }
 ```
 
@@ -116,10 +117,10 @@ ComputedStyle {
 ```
 StyleValue = LengthPx(f32) | Percent(f32) | ViewportWidth(f32) | ViewportHeight(f32)
            | Em(f32) | Rem(f32) | Number(f32) | Keyword(DefaultAtom)
-           | Color(u8, u8, u8) | Auto | None
+           | Color(u8, u8, u8, u8) | Auto | None
 ```
 
-`Em` and `Rem` are stored as-is in most properties and resolved to absolute pixels in `layout/mod.rs` using the element's `font_size`. For `font-size` itself, `Em` is resolved during the cascade by multiplying against the parent element's `font_size`; `Rem` always uses 16px as the root baseline.
+`Em` and `Rem` are stored as-is in most properties and resolved to absolute pixels in `layout/mod.rs` using the element's `font_size`. For `font-size` itself, `Em` is resolved during the cascade by multiplying against the parent element's `font_size`; `Rem` resolves against `Document.root_font_size` (defaults to 16px, configurable by the host).
 
 ### StyleSheet (css/mod.rs)
 
@@ -134,11 +135,11 @@ StyleSheet {
 
 IndexedRule   { selector: ComplexSelector, declarations: Rc<Vec<Declaration>>, rule_index: usize }
 ComplexSelector { last: CompoundSelector, ancestors: Vec<(Combinator, CompoundSelector)>, specificity: (u32, u32, u32) }
-Combinator    = Descendant | Child
+Combinator    = Descendant | Child | NextSibling | SubsequentSibling
 Declaration   { name: PropertyName, value: StyleValue }
 ```
 
-`PropertyName` is a strongly-typed enum covering all CSS properties the engine recognizes (`Display`, `Width`, `MarginTop`, `Color`, `FontSize`, etc.). It replaces `DefaultAtom` as the key in `Declaration`, eliminating string-deref comparisons from the cascade hot path. Property matching during `compute_styles` is a direct integer comparison using pre-computed enum variants mapped to a fixed-size `[Option<StyleValue>; 25]` array.
+`PropertyName` is a strongly-typed enum covering all CSS properties the engine recognizes (`Display`, `Width`, `MarginTop`, `Color`, `FontSize`, `AlignItems`, `JustifyContent`, `FlexWrap`, `FlexGrow`, `FlexShrink`, `RowGap`, `ColumnGap`, `MinWidth`, `MaxWidth`, `MinHeight`, `MaxHeight`, etc.). It replaces `DefaultAtom` as the key in `Declaration`, eliminating string-deref comparisons from the cascade hot path. Property matching during `compute_styles` is a direct integer comparison using pre-computed enum variants mapped to a fixed-size `[Option<StyleValue>; 36]` array.
 
 Selectors are pre-parsed into ASTs at stylesheet creation time. Specificity is computed once. Rules are distributed into hash-map buckets based on their right-most simple selector. During style resolution, matching buckets are merged via a k-way pointer walk over pre-sorted slices.
 
@@ -165,11 +166,11 @@ Timers are stored in a `std::collections::BinaryHeap` ordered by `fire_at` (min-
 1. Looks up matching rules from `document.stylesheet` buckets (by ID, class, tag, universal).
 2. Merges matched rules using a k-way specificity-ordered pointer walk.
 3. Applies inline `style` attribute declarations last (highest priority).
-4. Resolves the final property set against a fixed-size `[Option<StyleValue>; 25]` array using property bitmasks.
+4. Resolves the final property set against a fixed-size `[Option<StyleValue>; 36]` array using property bitmasks.
 5. Assigns the resulting `ComputedStyle` directly to the node and marks `layout_dirty = true` if the style changed.
 6. Pushes children onto the traversal stack.
 
-Inheritable properties (`color`, `font-size`, etc.) are resolved during the cascade and stored in the `ComputedStyle`. Combinator evaluation (`>` child, space descendant) walks arena parent pointers rather than maintaining a separate ancestor stack.
+Inheritable properties (`color`, `font-size`, etc.) are resolved during the cascade and stored in the `ComputedStyle`. Combinator evaluation (`>` child, space descendant, `+` next-sibling, `~` subsequent-sibling) walks arena parent and sibling pointers rather than maintaining a separate ancestor stack. Attribute selectors (`[attr]`, `[attr=value]`) are matched against `ElementData::attributes`.
 
 ## JavaScript bridge
 

@@ -2,15 +2,17 @@
 //!
 //! Parses CSS text into a `StyleSheet` of rules with pre-parsed `ComplexSelector`
 //! ASTs. Matches selectors against DOM elements using pre-computed specificity
-//! and in-node parent pointers for complex combinators (`>`, ` `).
+//! and in-node parent/sibling pointers for complex combinators (`>`, ` `, `+`, `~`)
+//! and attribute selectors (`[attr]`, `[attr=value]`).
 //!
 //! Property values are parsed into typed `StyleValue` enums at cascade time.
 //! Property names are typed as `PropertyName` enums, which makes property
 //! matching during cascade a direct integer comparison rather than a string deref.
 //! Supports compound selectors, comma-separated lists, CSS inheritance for text
 //! properties, and shorthand expansion for `margin`, `padding`, and
-//! `background`. Inline `style` attributes are parsed via `cssparser`'s
-//! `DeclarationParser` trait.
+//! `background`. Color parsing supports named colors, hex (3/4/6/8-digit),
+//! `rgb()`, `rgba()`, `hsl()`, and `hsla()`. Inline `style` attributes are
+//! parsed via `cssparser`'s `DeclarationParser` trait.
 
 use cssparser::{
     AtRuleParser, DeclarationParser, ParserState, QualifiedRuleParser, RuleBodyItemParser,
@@ -28,6 +30,7 @@ pub enum SimpleSelector {
     Tag(String),
     Class(String),
     Id(String),
+    Attribute(String, Option<String>),
     PseudoClass(String),
     Universal,
 }
@@ -45,6 +48,8 @@ pub struct CompoundSelector {
 pub enum Combinator {
     Descendant,
     Child,
+    NextSibling,
+    SubsequentSibling,
 }
 
 #[derive(Debug, Clone)]
@@ -153,18 +158,99 @@ pub struct Declaration {
 }
 
 #[inline]
-fn parse_color(val: &str) -> Option<(u8, u8, u8)> {
+fn parse_color(val: &str) -> Option<(u8, u8, u8, u8)> {
     match val {
-        "red" => Some((255, 0, 0)),
-        "green" => Some((0, 255, 0)),
-        "blue" => Some((0, 0, 255)),
-        "black" => Some((0, 0, 0)),
-        "white" => Some((255, 255, 255)),
-        hex if hex.starts_with('#') && hex.len() == 7 => {
-            let r = u8::from_str_radix(&hex[1..3], 16).ok()?;
-            let g = u8::from_str_radix(&hex[3..5], 16).ok()?;
-            let b = u8::from_str_radix(&hex[5..7], 16).ok()?;
-            Some((r, g, b))
+        "red" => Some((255, 0, 0, 255)),
+        "green" => Some((0, 255, 0, 255)),
+        "blue" => Some((0, 0, 255, 255)),
+        "black" => Some((0, 0, 0, 255)),
+        "white" => Some((255, 255, 255, 255)),
+        "transparent" => Some((0, 0, 0, 0)),
+        _ if val.starts_with('#') => {
+            let hex = &val[1..];
+            match hex.len() {
+                3 => {
+                    let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
+                    let g = u8::from_str_radix(&hex[1..2], 16).ok()?;
+                    let b = u8::from_str_radix(&hex[2..3], 16).ok()?;
+                    Some((r * 17, g * 17, b * 17, 255))
+                }
+                4 => {
+                    let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
+                    let g = u8::from_str_radix(&hex[1..2], 16).ok()?;
+                    let b = u8::from_str_radix(&hex[2..3], 16).ok()?;
+                    let a = u8::from_str_radix(&hex[3..4], 16).ok()?;
+                    Some((r * 17, g * 17, b * 17, a * 17))
+                }
+                6 => {
+                    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                    Some((r, g, b, 255))
+                }
+                8 => {
+                    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                    let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
+                    Some((r, g, b, a))
+                }
+                _ => None,
+            }
+        }
+        _ if val.starts_with("rgb(") || val.starts_with("rgba(") => {
+            let start = val.find('(')?;
+            let end = val.find(')')?;
+            let parts: Vec<&str> = val[start + 1..end].split(',').map(|s| s.trim()).collect();
+            if parts.len() == 3 || parts.len() == 4 {
+                let r = parts[0].parse::<u8>().ok()?;
+                let g = parts[1].parse::<u8>().ok()?;
+                let b = parts[2].parse::<u8>().ok()?;
+                let a = if parts.len() == 4 {
+                    (parts[3].parse::<f32>().ok()? * 255.0) as u8
+                } else {
+                    255
+                };
+                Some((r, g, b, a))
+            } else {
+                None
+            }
+        }
+        _ if val.starts_with("hsl(") || val.starts_with("hsla(") => {
+            let start = val.find('(')?;
+            let end = val.find(')')?;
+            let parts: Vec<&str> = val[start + 1..end].split(',').map(|s| s.trim()).collect();
+            if parts.len() == 3 || parts.len() == 4 {
+                let h = parts[0].parse::<f32>().ok()?;
+                let s = parts[1].trim_end_matches('%').parse::<f32>().ok()? / 100.0;
+                let l = parts[2].trim_end_matches('%').parse::<f32>().ok()? / 100.0;
+                let a = if parts.len() == 4 {
+                    (parts[3].parse::<f32>().ok()? * 255.0) as u8
+                } else {
+                    255
+                };
+                
+                let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+                let h_prime = h / 60.0;
+                let x = c * (1.0 - (h_prime % 2.0 - 1.0).abs());
+                let m = l - c / 2.0;
+
+                let (r1, g1, b1) = if h_prime >= 0.0 && h_prime < 1.0 { (c, x, 0.0) }
+                else if h_prime >= 1.0 && h_prime < 2.0 { (x, c, 0.0) }
+                else if h_prime >= 2.0 && h_prime < 3.0 { (0.0, c, x) }
+                else if h_prime >= 3.0 && h_prime < 4.0 { (0.0, x, c) }
+                else if h_prime >= 4.0 && h_prime < 5.0 { (x, 0.0, c) }
+                else { (c, 0.0, x) };
+
+                Some((
+                    ((r1 + m) * 255.0).round() as u8,
+                    ((g1 + m) * 255.0).round() as u8,
+                    ((b1 + m) * 255.0).round() as u8,
+                    a,
+                ))
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -206,7 +292,7 @@ pub fn parse_style_value(val: &str) -> crate::dom::StyleValue {
         }
     }
     if let Some(color) = parse_color(trimmed) {
-        return crate::dom::StyleValue::Color(color.0, color.1, color.2);
+        return crate::dom::StyleValue::Color(color.0, color.1, color.2, color.3);
     }
     if let Ok(num) = trimmed.parse::<f32>() {
         return crate::dom::StyleValue::Number(num);
@@ -253,16 +339,39 @@ fn parse_complex_selector(raw: &str) -> ComplexSelector {
             }
         };
 
+    let mut in_attr = false;
+
     for ch in raw.trim().chars() {
+        if ch == '[' { in_attr = true; current.push(ch); continue; }
+        if ch == ']' { in_attr = false; current.push(ch); continue; }
+
+        if in_attr {
+            current.push(ch);
+            continue;
+        }
+
         if ch == '>' {
             push_current(&mut list, &mut current, next_combinator.clone());
             next_combinator = Combinator::Child;
             continue;
         }
+        if ch == '+' {
+            push_current(&mut list, &mut current, next_combinator.clone());
+            next_combinator = Combinator::NextSibling;
+            continue;
+        }
+        if ch == '~' {
+            push_current(&mut list, &mut current, next_combinator.clone());
+            next_combinator = Combinator::SubsequentSibling;
+            continue;
+        }
 
         if ch.is_whitespace() {
             push_current(&mut list, &mut current, next_combinator.clone());
-            if next_combinator != Combinator::Child {
+            if next_combinator != Combinator::Child 
+                && next_combinator != Combinator::NextSibling 
+                && next_combinator != Combinator::SubsequentSibling 
+            {
                 next_combinator = Combinator::Descendant;
             }
             continue;
@@ -360,6 +469,18 @@ fn parse_compound_selector(s: &str) -> CompoundSelector {
             parts.push(SimpleSelector::PseudoClass(remaining[..end].to_string()));
             spec.1 += 1; // pseudo-classes have class-level specificity
             remaining = &remaining[end..];
+        } else if remaining.starts_with('[') {
+            let end = remaining.find(']').map(|i| i + 1).unwrap_or(remaining.len());
+            let attr_str = &remaining[1..end - 1]; // strip []
+            if let Some(eq) = attr_str.find('=') {
+                let key = attr_str[..eq].trim().to_string();
+                let val = attr_str[eq + 1..].trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+                parts.push(SimpleSelector::Attribute(key, Some(val)));
+            } else {
+                parts.push(SimpleSelector::Attribute(attr_str.trim().to_string(), None));
+            }
+            spec.1 += 1;
+            remaining = &remaining[end..];
         } else {
             break;
         }
@@ -386,22 +507,46 @@ fn match_ancestors_recursive(
     }
 
     let (comb, compound) = &ancestors[ancestor_idx];
-    let mut check_id = document.parent_of(current_node_id);
-
-    while let Some(pid) = check_id {
-        if let Some(crate::dom::Node::Element(data)) = document.nodes.get(pid) {
-            if match_compound_selector(compound, &data.tag_name, &data.attributes, &data.classes, document) {
-                if match_ancestors_recursive(ancestors, ancestor_idx + 1, pid, document) {
-                    return true;
+    
+    match comb {
+        Combinator::Descendant | Combinator::Child => {
+            let mut check_id = document.parent_of(current_node_id);
+            while let Some(pid) = check_id {
+                if let Some(crate::dom::Node::Element(data)) = document.nodes.get(pid) {
+                    if match_compound_selector(compound, &data.tag_name, &data.attributes, &data.classes, document) {
+                        if match_ancestors_recursive(ancestors, ancestor_idx + 1, pid, document) {
+                            return true;
+                        }
+                    }
                 }
+                if *comb == Combinator::Child { break; }
+                check_id = document.parent_of(pid);
             }
         }
-
-        if *comb == Combinator::Child {
-            break;
+        Combinator::NextSibling | Combinator::SubsequentSibling => {
+            let mut check_id = document.nodes.get(current_node_id).and_then(|n| match n {
+                crate::dom::Node::Element(d) => d.prev_sibling,
+                crate::dom::Node::Text(d) => d.prev_sibling,
+                _ => None,
+            });
+            while let Some(sid) = check_id {
+                if let Some(crate::dom::Node::Element(data)) = document.nodes.get(sid) {
+                    if match_compound_selector(compound, &data.tag_name, &data.attributes, &data.classes, document) {
+                        if match_ancestors_recursive(ancestors, ancestor_idx + 1, sid, document) {
+                            return true;
+                        }
+                    }
+                }
+                if *comb == Combinator::NextSibling { break; }
+                check_id = document.nodes.get(sid).and_then(|n| match n {
+                    crate::dom::Node::Element(d) => d.prev_sibling,
+                    crate::dom::Node::Text(d) => d.prev_sibling,
+                    _ => None,
+                });
+            }
         }
-        check_id = document.parent_of(pid);
     }
+
     false
 }
 
@@ -459,7 +604,19 @@ fn match_compound_selector(
                 let mut found = false;
                 for (k, v) in attributes {
                     if k == "id" {
-                        if v == id {
+                        if v == id { found = true; }
+                        break;
+                    }
+                }
+                if !found { return false; }
+            }
+            SimpleSelector::Attribute(key, opt_val) => {
+                let mut found = false;
+                for (k, v) in attributes {
+                    if k == key {
+                        if let Some(expected_val) = opt_val {
+                            if v == expected_val { found = true; }
+                        } else {
                             found = true;
                         }
                         break;
@@ -496,7 +653,7 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
     let mut stack = vec![(document.root_id, None::<crate::dom::ComputedStyle>)];
 
     while let Some((node_id, parent_computed)) = stack.pop() {
-        let mut property_mask: u32 = 0;
+        let mut property_mask: u64 = 0;
         let mut property_array: [Option<crate::dom::StyleValue>; crate::dom::NUM_PROPERTIES] =
             core::array::from_fn(|_| None);
 
@@ -567,7 +724,7 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
                         for decl in rule.declarations.iter() {
                             let idx = decl.name.to_index();
                             property_array[idx] = Some(decl.value.clone());
-                            property_mask |= 1 << idx;
+                            property_mask |= 1_u64 << idx;
                         }
                     }
 
@@ -583,7 +740,7 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
                     for (name, value) in inline_decls {
                         let idx = name.to_index();
                         property_array[idx] = Some(value.clone());
-                        property_mask |= 1 << idx;
+                        property_mask |= 1_u64 << idx;
                     }
                 }
             }
@@ -601,7 +758,7 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
         let parent_font_size = parent_computed.as_ref().map(|pc| pc.font_size).unwrap_or(16.0);
         if property_mask != 0 {
             for i in 0..crate::dom::NUM_PROPERTIES {
-                if (property_mask & (1 << i)) != 0 {
+                if (property_mask & (1_u64 << i)) != 0 {
                     if let Some(val) = &property_array[i] {
                         match i {
                             0 => if let crate::dom::StyleValue::Keyword(v) = val { next_computed.display = v.clone(); },
@@ -620,18 +777,29 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
                             13 => next_computed.border_width[1] = val.clone(),
                             14 => next_computed.border_width[2] = val.clone(),
                             15 => next_computed.border_width[3] = val.clone(),
-                            16 => if let crate::dom::StyleValue::Color(r, g, b) = val { next_computed.bg_color = Some((*r, *g, *b)); },
-                            17 => if let crate::dom::StyleValue::Color(r, g, b) = val { next_computed.border_color = Some((*r, *g, *b)); },
-                            18 => if let crate::dom::StyleValue::Color(r, g, b) = val { next_computed.color = (*r, *g, *b); },
+                            16 => if let crate::dom::StyleValue::Color(r, g, b, a) = val { next_computed.bg_color = Some((*r, *g, *b, *a)); },
+                            17 => if let crate::dom::StyleValue::Color(r, g, b, a) = val { next_computed.border_color = Some((*r, *g, *b, *a)); },
+                            18 => if let crate::dom::StyleValue::Color(r, g, b, a) = val { next_computed.color = (*r, *g, *b, *a); },
                             19 => {
                                 match val {
                                     crate::dom::StyleValue::LengthPx(px) => next_computed.font_size = *px,
                                     crate::dom::StyleValue::Number(num) => next_computed.font_size = *num,
                                     crate::dom::StyleValue::Em(num) => next_computed.font_size = num * parent_font_size,
-                                    crate::dom::StyleValue::Rem(num) => next_computed.font_size = num * 16.0,
+                                    crate::dom::StyleValue::Rem(num) => next_computed.font_size = num * document.root_font_size,
                                     _ => {}
                                 }
                             }
+                            25 => if let crate::dom::StyleValue::Keyword(v) = val { next_computed.align_items = v.clone(); },
+                            26 => if let crate::dom::StyleValue::Keyword(v) = val { next_computed.justify_content = v.clone(); },
+                            27 => if let crate::dom::StyleValue::Keyword(v) = val { next_computed.flex_wrap = v.clone(); },
+                            28 => if let crate::dom::StyleValue::Number(v) = val { next_computed.flex_grow = *v; },
+                            29 => if let crate::dom::StyleValue::Number(v) = val { next_computed.flex_shrink = *v; },
+                            30 => next_computed.row_gap = val.clone(),
+                            31 => next_computed.column_gap = val.clone(),
+                            32 => next_computed.min_width = val.clone(),
+                            33 => next_computed.max_width = val.clone(),
+                            34 => next_computed.min_height = val.clone(),
+                            35 => next_computed.max_height = val.clone(),
                             _ => {}
                         }
                     }

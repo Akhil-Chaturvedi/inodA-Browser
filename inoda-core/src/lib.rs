@@ -249,4 +249,102 @@ mod tests {
             "Child combinator incorrectly matched descendant"
         );
     }
+
+    #[test]
+    fn test_attribute_value_length_cap() {
+        use crate::dom::MAX_ATTRIBUTE_VALUE_LEN;
+        
+        // 1. Test HTML parser truncation
+        let mut large_val = String::with_capacity(MAX_ATTRIBUTE_VALUE_LEN + 100);
+        for _ in 0..(MAX_ATTRIBUTE_VALUE_LEN + 100) { large_val.push('a'); }
+        
+        let html = format!("<div class='{}'></div>", large_val);
+        let doc = html::parse_html(&html);
+        let div_id = find_node(&doc, "div").unwrap();
+        if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(div_id) {
+            assert_eq!(data.classes.len(), MAX_ATTRIBUTE_VALUE_LEN);
+            assert!(data.classes.chars().all(|c| c == 'a'));
+        }
+
+        // 2. Test JS bridge truncation
+        let engine = js::JsEngine::new(doc);
+        engine.execute_script(&format!("
+            let div = document.querySelector('div');
+            let large = 'b'.repeat({}); 
+            div.setAttribute('data-test', large);
+        ", 20000));
+
+        let doc_final = engine.document.borrow();
+        if let Some(crate::dom::Node::Element(data)) = doc_final.nodes.get(div_id) {
+            for (k, v) in &data.attributes {
+                if k == "data-test" {
+                    assert_eq!(v.len(), MAX_ATTRIBUTE_VALUE_LEN);
+                    assert!(v.chars().all(|c| c == 'b'));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_js_infinite_loop_interruption() {
+        let doc = html::parse_html("<div></div>");
+        let engine = js::JsEngine::new(doc);
+        
+        // This should trigger the 500ms interrupt handler
+        let res = engine.execute_script("while(true) {}");
+        
+        assert!(
+            res.contains("interrupted") || res.contains("JS Error"), 
+            "Infinite loop should be interrupted. Got: {}", res
+        );
+    }
+
+    #[test]
+    fn test_unrecognized_property_discard() {
+        let mut doc = html::parse_html("<div style='width: 100px; position: absolute; margin: 10px;'></div>");
+        // Apply styles (including inline)
+        let stylesheet = css::StyleSheet::default();
+        css::compute_styles(&mut doc, &stylesheet);
+        
+        let node_id = doc.first_child_of(doc.root_id).unwrap();
+        
+        if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
+            // width should be 100px
+            assert_eq!(data.computed.width, crate::dom::StyleValue::LengthPx(100.0));
+            // margin should be 10px
+            assert_eq!(data.computed.margin[0], crate::dom::StyleValue::LengthPx(10.0));
+            
+            // Unrecognized 'position' should not be in cached_inline_styles
+            if let Some(inline) = &data.cached_inline_styles {
+                for (name, _) in inline {
+                    assert_ne!(format!("{:?}", name), "LineHeight", "Should not have collided with LineHeight fallback");
+                }
+            }
+        } else {
+            panic!("Node not found");
+        }
+    }
+
+    #[test]
+    fn test_inline_display_normalization() {
+        let mut doc = html::parse_html("<span style='display: inline'></span>");
+        let stylesheet = css::StyleSheet::default();
+        css::compute_styles(&mut doc, &stylesheet);
+        
+        let mut font_system = cosmic_text::FontSystem::new();
+        let mut buffer_cache = std::collections::HashMap::new();
+        
+        let (root_taffy_node, _) = layout::compute_layout(&mut doc, 800.0, 600.0, &mut font_system, &mut buffer_cache);
+        
+        println!("Taffy Tree for doc.root_id:");
+        taffy::print_tree(&doc.taffy_tree, root_taffy_node);
+        
+        let children = doc.taffy_tree.children(root_taffy_node).unwrap();
+        assert!(!children.is_empty(), "Root should have children in Taffy");
+        let span_taffy = children[0];
+        let style = doc.taffy_tree.style(span_taffy).unwrap();
+        
+        // Should be normalized to Block
+        assert_eq!(style.display, taffy::style::Display::Block);
+    }
 }

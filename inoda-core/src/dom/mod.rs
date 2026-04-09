@@ -18,6 +18,7 @@
 use generational_arena::{Arena, Index};
 
 pub const MAX_ATTRIBUTES: usize = 32;
+pub const MAX_ATTRIBUTE_VALUE_LEN: usize = 16384; // 16 KB per attribute
 
 #[derive(Debug, Clone, Copy)]
 pub struct TextMeasureContext {
@@ -286,8 +287,8 @@ impl PropertyName {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
-        match s {
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
             "display" => PropertyName::Display,
             "flex-direction" => PropertyName::FlexDirection,
             "width" => PropertyName::Width,
@@ -324,8 +325,8 @@ impl PropertyName {
             "max-width" => PropertyName::MaxWidth,
             "min-height" => PropertyName::MinHeight,
             "max-height" => PropertyName::MaxHeight,
-            _ => PropertyName::LineHeight, // Fallback for unrecognized properties
-        }
+            _ => return None,
+        })
     }
 
     /// Returns true if this property is CSS-inheritable.

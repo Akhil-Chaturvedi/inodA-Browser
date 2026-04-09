@@ -40,7 +40,11 @@ pub fn parse_html(html: &str) -> Document {
                         break;
                     }
                     let k_str = String::from_utf8_lossy(&key).into_owned();
-                    let v_str = String::from_utf8_lossy(&value).into_owned();
+                    let mut v_str = String::from_utf8_lossy(&value).into_owned();
+                    
+                    if v_str.len() > crate::dom::MAX_ATTRIBUTE_VALUE_LEN {
+                        v_str.truncate(crate::dom::MAX_ATTRIBUTE_VALUE_LEN);
+                    }
                     
                     if k_str == "class" {
                         classes = v_str.to_string();
@@ -144,5 +148,6 @@ pub fn parse_html(html: &str) -> Document {
         }
     }
 
+    doc.dirty = true;
     doc
 }

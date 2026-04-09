@@ -19,6 +19,7 @@ Early development. The engine can parse simple pages, apply stylesheets, lay out
 | `rquickjs`           | 0.11    | QuickJS JavaScript engine bindings             |
 | `generational-arena` | 0.2     | Generational index arena for the DOM           |
 | `string_cache`       | 0.9     | Atom string interning for HTML tag names       |
+| `once_cell`          | 1.19    | Static initialization for layout fallback data |
 
 ## Module overview
 
@@ -62,19 +63,23 @@ Content inside `<script>` and `<style>` is accumulated as raw text via an `insid
 
 - Parses CSS text into a `StyleSheet` containing pre-parsed `ComplexSelector` ASTs.
 - Property values are parsed into typed `StyleValue` enums (`LengthPx`, `Percent`, `ViewportWidth`, `ViewportHeight`, `Em`, `Rem`, `Color`, `Keyword`, `Number`, `Auto`, `None`) during the cascade. Layout and rendering operate on these enum variants, not strings.
-- Property names in `Declaration` use `PropertyName`, a strongly-typed enum (`Display`, `Width`, `MarginTop`, `FontSize`, etc.) with an `Other(u64)` fallback. This makes property matching during cascade an integer comparison rather than a string deref.
+- Property names in `Declaration` use `PropertyName`, a strongly-typed enum (`Display`, `Width`, `MarginTop`, `FontSize`, etc.). `PropertyName::from_str` returns `Option<PropertyName>`; unrecognized property names return `None` and are discarded during the cascade. This makes property matching an integer comparison rather than a string deref and prevents unrecognized properties from silently corrupting the style tree.
 - Specificity is computed as `(id_count, class_count, tag_count)` at parse time and stored on each `ComplexSelector`.
 - Rules are stored in `HashMap<String, Vec<IndexedRule>>` buckets keyed by class and ID (plain `String`), and `HashMap<DefaultAtom, Vec<IndexedRule>>` keyed by tag (bounded set of known tag names; interning is safe here). Class and ID keys are not interned because they are uncontrolled user input.
 - `compute_styles()` performs an iterative stack-based traversal of the arena DOM, evaluating combinators (`>`, space, `+`, `~`) by walking arena parent and sibling pointers. Attribute selectors (`[attr]`, `[attr=value]`) are matched against `ElementData::attributes`. It populates `ComputedStyle` on each node by matching against pre-parsed rules and resolving inheritance.
 - Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent. Values are copied directly from the parent's resolved style to avoid redundant allocations.
 - `font-size` expressed as `Em` multiplies against the parent's resolved `font_size`. `Rem` resolves against `Document.root_font_size` (defaults to 16px, configurable by the host). Both are resolved during the cascade; the result stored in `computed.font_size` is always absolute pixels.
 - Expands `margin`, `padding` shorthands (1/2/3/4-value) and maps `background` to `background-color`.
-- Inline `style=""` attributes are parsed via `cssparser`'s `DeclarationParser` trait and applied after stylesheet rules.
+- Inline `style=""` attributes are parsed via `cssparser`'s `DeclarationParser` trait (`InlineStyleParser`). `margin` and `padding` shorthands are expanded to their four longhand properties at parse time. `background` is mapped to `background-color`. Unrecognized properties are discarded. Inline declarations are applied after stylesheet rules (highest priority).
 - `document.stylesheet` is persistent; `append_stylesheet()` dynamically merges rules from new `<style>` tags into the existing AST without a full re-parse. Rebuilds only occur if nodes are removed or styles are explicitly cleared.
 
 ### layout
 
 Walks the arena DOM and builds a parallel `TaffyTree<TextMeasureContext>`. `prepare_text_buffers` performs HarfBuzz shaping in a pre-pass to calculate `max_intrinsic_width` and `min_intrinsic_width`. The buffer cache is caller-owned and persists across frames.
+
+To ensure high performance in embedded HMIs, the layout engine performs work conditionally:
+- **Structural Updates**: Taffy node children are only updated via `set_children` if a node is new or the `document.dirty` flag is set. This avoids expensive allocator thrashing in Taffy's edge arrays on every frame.
+- **Text Measurement**: Intrinsic width calculation and shaping are only re-run if a node is new or its `layout_dirty` flag is set (e.g. after a text content change via JS).
 
 The Taffy measure closure invokes `buffer.set_size()` and re-calculates the line count during the solver loop. This ensures accurate Flexbox/Grid height resolution across different width constraints while still benefiting from once-per-allocation HarfBuzz shaping in the pre-pass. Final shaping at resolved widths is performed by `finalize_text_measurements`.
 
@@ -149,7 +154,7 @@ cargo build
 cargo test
 ```
 
-Tests in `lib.rs` cover HTML parsing, CSS combinator matching, JS bridge round-trips, iterative DOM node deletion, and whitespace text node preservation.
+Tests in `lib.rs` cover HTML parsing, CSS combinator matching, inline style shorthand expansion, unrecognized property discarding, display normalization, JS bridge round-trips, iterative DOM node deletion, whitespace text node preservation, JS infinite loop interruption, and attribute value security limits.
 
 ## Limitations
 

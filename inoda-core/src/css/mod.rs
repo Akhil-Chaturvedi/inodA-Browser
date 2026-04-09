@@ -6,13 +6,15 @@
 //! and attribute selectors (`[attr]`, `[attr=value]`).
 //!
 //! Property values are parsed into typed `StyleValue` enums at cascade time.
-//! Property names are typed as `PropertyName` enums, which makes property
-//! matching during cascade a direct integer comparison rather than a string deref.
+//! Property names are typed as `PropertyName` enums. `PropertyName::from_str`
+//! returns `Option<PropertyName>`; unrecognized property names are discarded
+//! during the cascade rather than falling back to a catch-all variant.
 //! Supports compound selectors, comma-separated lists, CSS inheritance for text
 //! properties, and shorthand expansion for `margin`, `padding`, and
 //! `background`. Color parsing supports named colors, hex (3/4/6/8-digit),
 //! `rgb()`, `rgba()`, `hsl()`, and `hsla()`. Inline `style` attributes are
-//! parsed via `cssparser`'s `DeclarationParser` trait.
+//! parsed via `cssparser`'s `DeclarationParser` trait; `margin` and `padding`
+//! shorthands are expanded to longhands at parse time within `InlineStyleParser`.
 
 use cssparser::{
     AtRuleParser, DeclarationParser, ParserState, QualifiedRuleParser, RuleBodyItemParser,
@@ -942,43 +944,34 @@ fn parse_rule<'i, 't>(
                     };
                     match parts.len() {
                         1 => {
-                            declarations.push(Declaration {
-                                name: crate::dom::PropertyName::from_str(top),
-                                value: parse_style_value(parts[0]),
-                            });
-                            declarations.push(Declaration {
-                                name: crate::dom::PropertyName::from_str(right),
-                                value: parse_style_value(parts[0]),
-                            });
-                            declarations.push(Declaration {
-                                name: crate::dom::PropertyName::from_str(bottom),
-                                value: parse_style_value(parts[0]),
-                            });
-                            declarations.push(Declaration {
-                                name: crate::dom::PropertyName::from_str(left),
-                                value: parse_style_value(parts[0]),
-                            });
+                            if let Some(p) = crate::dom::PropertyName::from_str(top) {
+                                declarations.push(Declaration { name: p, value: parse_style_value(parts[0]) });
+                            }
+                            if let Some(p) = crate::dom::PropertyName::from_str(right) {
+                                declarations.push(Declaration { name: p, value: parse_style_value(parts[0]) });
+                            }
+                            if let Some(p) = crate::dom::PropertyName::from_str(bottom) {
+                                declarations.push(Declaration { name: p, value: parse_style_value(parts[0]) });
+                            }
+                            if let Some(p) = crate::dom::PropertyName::from_str(left) {
+                                declarations.push(Declaration { name: p, value: parse_style_value(parts[0]) });
+                            }
                         }
                         2 => {
-                            declarations.push(Declaration {
-                                name: crate::dom::PropertyName::from_str(top),
-                                value: parse_style_value(parts[0]),
-                            });
-                            declarations.push(Declaration {
-                                name: crate::dom::PropertyName::from_str(bottom),
-                                value: parse_style_value(parts[0]),
-                            });
-                            declarations.push(Declaration {
-                                name: crate::dom::PropertyName::from_str(left),
-                                value: parse_style_value(parts[1]),
-                            });
-                            declarations.push(Declaration {
-                                name: crate::dom::PropertyName::from_str(right),
-                                value: parse_style_value(parts[1]),
-                            });
+                            if let Some(p) = crate::dom::PropertyName::from_str(top) {
+                                declarations.push(Declaration { name: p, value: parse_style_value(parts[0]) });
+                            }
+                            if let Some(p) = crate::dom::PropertyName::from_str(bottom) {
+                                declarations.push(Declaration { name: p, value: parse_style_value(parts[0]) });
+                            }
+                            if let Some(p) = crate::dom::PropertyName::from_str(left) {
+                                declarations.push(Declaration { name: p, value: parse_style_value(parts[1]) });
+                            }
+                            if let Some(p) = crate::dom::PropertyName::from_str(right) {
+                                declarations.push(Declaration { name: p, value: parse_style_value(parts[1]) });
+                            }
                         }
                         3 => {
-                            // top, horizontal, bottom
                             let values = [
                                 parse_style_value(parts[0]), // top
                                 parse_style_value(parts[1]), // horizontal (right)
@@ -987,47 +980,50 @@ fn parse_rule<'i, 't>(
                             ];
                             let names = [top, right, bottom, left];
                             for i in 0..4 {
-                                declarations.push(Declaration {
-                                    name: crate::dom::PropertyName::from_str(names[i]),
-                                    value: values[i].clone(),
-                                });
+                                if let Some(p) = crate::dom::PropertyName::from_str(names[i]) {
+                                    declarations.push(Declaration {
+                                        name: p,
+                                        value: values[i].clone(),
+                                    });
+                                }
                             }
                         }
                         4 => {
-                            declarations.push(Declaration {
-                                name: crate::dom::PropertyName::from_str(top),
-                                value: parse_style_value(parts[0]),
-                            });
-                            declarations.push(Declaration {
-                                name: crate::dom::PropertyName::from_str(right),
-                                value: parse_style_value(parts[1]),
-                            });
-                            declarations.push(Declaration {
-                                name: crate::dom::PropertyName::from_str(bottom),
-                                value: parse_style_value(parts[2]),
-                            });
-                            declarations.push(Declaration {
-                                name: crate::dom::PropertyName::from_str(left),
-                                value: parse_style_value(parts[3]),
-                            });
+                            if let Some(p) = crate::dom::PropertyName::from_str(top) {
+                                declarations.push(Declaration { name: p, value: parse_style_value(parts[0]) });
+                            }
+                            if let Some(p) = crate::dom::PropertyName::from_str(right) {
+                                declarations.push(Declaration { name: p, value: parse_style_value(parts[1]) });
+                            }
+                            if let Some(p) = crate::dom::PropertyName::from_str(bottom) {
+                                declarations.push(Declaration { name: p, value: parse_style_value(parts[2]) });
+                            }
+                            if let Some(p) = crate::dom::PropertyName::from_str(left) {
+                                declarations.push(Declaration { name: p, value: parse_style_value(parts[3]) });
+                            }
                         }
                         _ => {
-                            declarations.push(Declaration {
-                                name: crate::dom::PropertyName::from_str(&name_str),
-                                value: parse_style_value(&value),
-                            });
+                            if let Some(p) = crate::dom::PropertyName::from_str(&name_str) {
+                                declarations.push(Declaration {
+                                    name: p,
+                                    value: parse_style_value(&value),
+                                });
+                            }
                         }
                     }
-                } else if name_str == "background" {
-                    declarations.push(Declaration {
-                        name: crate::dom::PropertyName::from_str("background-color"),
-                        value: parse_style_value(&value),
-                    });
+                    if let Some(p) = crate::dom::PropertyName::from_str("background-color") {
+                        declarations.push(Declaration {
+                            name: p,
+                            value: parse_style_value(&value),
+                        });
+                    }
                 } else {
-                    declarations.push(Declaration {
-                        name: crate::dom::PropertyName::from_str(&name_str),
-                        value: parse_style_value(&value),
-                    });
+                    if let Some(p) = crate::dom::PropertyName::from_str(&name_str) {
+                        declarations.push(Declaration {
+                            name: p,
+                            value: parse_style_value(&value),
+                        });
+                    }
                 }
             } else {
                 let _ = p.next();
@@ -1053,7 +1049,7 @@ fn parse_rule<'i, 't>(
 struct InlineStyleParser;
 
 impl<'i> DeclarationParser<'i> for InlineStyleParser {
-    type Declaration = Declaration;
+    type Declaration = Vec<Declaration>;
     type Error = ();
 
     fn parse_value<'t>(
@@ -1061,7 +1057,7 @@ impl<'i> DeclarationParser<'i> for InlineStyleParser {
         name: cssparser::CowRcStr<'i>,
         input: &mut Parser<'i, 't>,
         _start: &ParserState,
-    ) -> Result<Declaration, cssparser::ParseError<'i, ()>> {
+    ) -> Result<Vec<Declaration>, cssparser::ParseError<'i, ()>> {
         let mut value = String::new();
         while let Ok(token) = input.next() {
             match token {
@@ -1086,26 +1082,90 @@ impl<'i> DeclarationParser<'i> for InlineStyleParser {
                 _ => {}
             }
         }
-        Ok(Declaration {
-            name: crate::dom::PropertyName::from_str(name.as_ref()),
-            value: parse_style_value(&value),
-        })
+
+        let name_str = name.as_ref();
+        let value_trimmed = value.trim();
+        let mut declarations = Vec::new();
+
+        if name_str == "margin" || name_str == "padding" {
+            let parts: Vec<&str> = value_trimmed.split_whitespace().collect();
+            let (top, right, bottom, left) = if name_str == "margin" {
+                ("margin-top", "margin-right", "margin-bottom", "margin-left")
+            } else {
+                ("padding-top", "padding-right", "padding-bottom", "padding-left")
+            };
+
+            match parts.len() {
+                1 => {
+                    for n in [top, right, bottom, left] {
+                        if let Some(p) = crate::dom::PropertyName::from_str(n) {
+                            declarations.push(Declaration { name: p, value: parse_style_value(parts[0]) });
+                        }
+                    }
+                }
+                2 => {
+                    let v = [parts[0], parts[1], parts[0], parts[1]]; // T, R, B, L
+                    let n = [top, right, bottom, left];
+                    for i in 0..4 {
+                        if let Some(p) = crate::dom::PropertyName::from_str(n[i]) {
+                            declarations.push(Declaration { name: p, value: parse_style_value(v[i]) });
+                        }
+                    }
+                }
+                3 => {
+                    let v = [parts[0], parts[1], parts[2], parts[1]]; // T, R, B, L
+                    let n = [top, right, bottom, left];
+                    for i in 0..4 {
+                        if let Some(p) = crate::dom::PropertyName::from_str(n[i]) {
+                            declarations.push(Declaration { name: p, value: parse_style_value(v[i]) });
+                        }
+                    }
+                }
+                4 => {
+                    let n = [top, right, bottom, left];
+                    for i in 0..4 {
+                        if let Some(p) = crate::dom::PropertyName::from_str(n[i]) {
+                            declarations.push(Declaration { name: p, value: parse_style_value(parts[i]) });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if name_str == "background" {
+            if let Some(p) = crate::dom::PropertyName::from_str("background-color") {
+                declarations.push(Declaration { name: p, value: parse_style_value(value_trimmed) });
+            }
+        } else {
+            if let Some(prop_name) = crate::dom::PropertyName::from_str(name_str) {
+                declarations.push(Declaration {
+                    name: prop_name,
+                    value: parse_style_value(value_trimmed),
+                });
+            } else {
+                return Err(cssparser::ParseError {
+                    kind: cssparser::ParseErrorKind::Custom(()),
+                    location: input.state().source_location(),
+                });
+            }
+        }
+
+        Ok(declarations)
     }
 }
 
 impl<'i> AtRuleParser<'i> for InlineStyleParser {
     type Prelude = ();
-    type AtRule = Declaration;
+    type AtRule = Vec<Declaration>;
     type Error = ();
 }
 
 impl<'i> QualifiedRuleParser<'i> for InlineStyleParser {
     type Prelude = ();
-    type QualifiedRule = Declaration;
+    type QualifiedRule = Vec<Declaration>;
     type Error = ();
 }
 
-impl<'i> RuleBodyItemParser<'i, Declaration, ()> for InlineStyleParser {
+impl<'i> RuleBodyItemParser<'i, Vec<Declaration>, ()> for InlineStyleParser {
     fn parse_declarations(&self) -> bool {
         true
     }
@@ -1124,8 +1184,8 @@ pub fn parse_inline_declarations(style_text: &str) -> Vec<Declaration> {
     let iter = RuleBodyParser::new(&mut parser, &mut style_parser);
     let mut declarations = Vec::new();
     for result in iter {
-        if let Ok(decl) = result {
-            declarations.push(decl);
+        if let Ok(mut decl_list) = result {
+            declarations.append(&mut decl_list);
         }
     }
     declarations

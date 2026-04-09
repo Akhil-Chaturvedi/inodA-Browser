@@ -8,17 +8,20 @@
 //!
 //! The Taffy measure closure calls `buffer.set_size()` to adjust the width
 //! constraint, then `buffer.shape_until_scroll()` to re-wrap text. Layout
-//! properties (`width`, `height`, `margin`, `padding`, `border-width`, `display`,
-//! `flex-direction`, `align-items`, `justify-content`, `flex-wrap`, `flex-grow`,
-//! `flex-shrink`, `row-gap`, `column-gap`, `min-width`, `max-width`, `min-height`,
-//! `max-height`) are read directly from `node.computed` (a `ComputedStyle`
-//! embedded in each arena `ElementData` or `TextData`).
+//! properties are read directly from `node.computed`.
+//!
+//! To ensure high per-frame performance, `build_taffy_node` performs work
+//! conditionally:
+//! - **Structural Updates**: Taffy node children are only updated via
+//!   `set_children` if a node is new or the `document.dirty` flag is set.
+//! - **Text Measurement**: Intrinsic width calculation and shaping are
+//!   only re-run if a node is new or its `layout_dirty` flag is set.
 //!
 //! `<img>` elements use intrinsic sizing from HTML `width`/`height` attributes
 //! and Taffy's `aspect_ratio` property.
 //!
 //! Supported dimension units: px, %, vw, vh, em, rem, auto.
-//! Supported display modes: flex, grid, block, none.
+//! Supported display modes: flex, grid, block, none. Note: inline and inline-block are normalized to block.
 //! Box model properties mapped: margin-*, padding-*, border-*-width.
 
 use std::{cell::RefCell, collections::HashMap};
@@ -180,39 +183,48 @@ fn build_taffy_node(
     buffer_cache: &HashMap<crate::dom::NodeId, Buffer>,
     scratchpad: &mut Vec<taffy::NodeId>,
 ) -> taffy::NodeId {
-    let mut style = Style::DEFAULT;
-
-    let (computed, is_text) = match document.nodes.get(node_id) {
-        Some(crate::dom::Node::Element(data)) => (&data.computed, false),
-        Some(crate::dom::Node::Text(data)) => (&data.computed, true),
-        _ => {
-            // Root node or fallback
-            let exists = if let Some(crate::dom::Node::Root(d)) = document.nodes.get(node_id) {
-                d.taffy_node
-            } else {
-                None
-            };
-
-            return if let Some(t_node) = exists {
-                document.taffy_tree.set_style(t_node, style).unwrap();
-                t_node
-            } else {
-                let t_node = document.taffy_tree.new_leaf(style).unwrap();
-                if let Some(crate::dom::Node::Root(d)) = document.nodes.get_mut(node_id) {
-                    d.taffy_node = Some(t_node);
-                }
-                t_node
-            };
+    // 1. Get or create the Taffy node and determine if this is a text node.
+    let (t_node, is_text, is_new_taffy_node) = {
+        let entry = document.nodes.get(node_id).expect("Invalid node_id");
+        match entry {
+            crate::dom::Node::Element(d) => (d.taffy_node, false, d.taffy_node.is_none()),
+            crate::dom::Node::Text(d) => (d.taffy_node, true, d.taffy_node.is_none()),
+            crate::dom::Node::Root(d) => (d.taffy_node, false, d.taffy_node.is_none()),
         }
     };
 
+    let t_node = if let Some(t) = t_node {
+        t
+    } else {
+        let t = document.taffy_tree.new_leaf(Style::DEFAULT).unwrap();
+        if let Some(node) = document.nodes.get_mut(node_id) {
+            match node {
+                crate::dom::Node::Element(d) => d.taffy_node = Some(t),
+                crate::dom::Node::Text(d) => d.taffy_node = Some(t),
+                crate::dom::Node::Root(d) => d.taffy_node = Some(t),
+            }
+        }
+        t
+    };
+
+    // 2. Now that we have the Taffy node ID, define the style.
+    // We fetch computed styles in a separate scope to avoid long-lived borrows of document.nodes.
+    let mut style = Style::default();
+    let computed_fallback = crate::dom::ComputedStyle::default();
+    
+    let computed = match document.nodes.get(node_id) {
+        Some(crate::dom::Node::Element(d)) => &d.computed,
+        Some(crate::dom::Node::Text(d)) => &d.computed,
+        _ => &computed_fallback,
+    };
+    
     let font_size = computed.font_size;
 
     match &*computed.display {
         "flex" => style.display = Display::Flex,
         "grid" => style.display = Display::Grid,
         "none" => style.display = Display::None,
-        "block" => style.display = Display::Block,
+        "block" | "inline" | "inline-block" | "list-item" => style.display = Display::Block,
         _ => {}
     }
 
@@ -325,12 +337,6 @@ fn build_taffy_node(
         style.border.left = dim;
     }
 
-    let exists = match document.nodes.get(node_id) {
-        Some(crate::dom::Node::Element(d)) => d.taffy_node,
-        Some(crate::dom::Node::Text(d)) => d.taffy_node,
-        _ => None,
-    };
-
     let mut aspect_ratio = None;
     if let Some(crate::dom::Node::Element(d)) = document.nodes.get(node_id) {
         if &*d.tag_name == "img" {
@@ -358,14 +364,16 @@ fn build_taffy_node(
     }
     style.aspect_ratio = aspect_ratio;
 
-    let t_node = if let Some(existing_t_node) = exists {
-        document
-            .taffy_tree
-            .set_style(existing_t_node, style)
-            .unwrap();
-        existing_t_node
-    } else {
-        let new_t_node = if is_text {
+    document.taffy_tree.set_style(t_node, style).unwrap();
+
+    // is_text specific shaping:
+    if is_text {
+        let needs_measure = is_new_taffy_node || match document.nodes.get(node_id) {
+            Some(crate::dom::Node::Text(t)) => t.layout_dirty,
+            _ => false,
+        };
+
+        if needs_measure {
             let mut max_intrinsic_width: f32 = 0.0;
             let mut min_intrinsic_width: f32 = 0.0;
             
@@ -376,12 +384,9 @@ fn build_taffy_node(
                         
                         let mut current_word_width = 0.0;
                         for glyph in run.glyphs {
-                            // Extract the character slice safely from the original text to identify whitespace boundaries.
-                            // Uses .get() to avoid panicking on unaligned UTF-8 char boundaries.
                             let is_whitespace = text_node.text.get(glyph.start..glyph.end)
                                 .map(|s| s.chars().any(|c| c.is_whitespace()))
                                 .unwrap_or(false);
-
                             if is_whitespace {
                                 min_intrinsic_width = min_intrinsic_width.max(current_word_width);
                                 current_word_width = 0.0;
@@ -393,28 +398,17 @@ fn build_taffy_node(
                     }
                 }
             }
-
             document
                 .taffy_tree
-                .new_leaf_with_context(style, crate::dom::TextMeasureContext { 
+                .set_node_context(t_node, Some(crate::dom::TextMeasureContext { 
                     node_id, 
                     font_size,
                     max_intrinsic_width,
                     min_intrinsic_width,
-                })
-                .unwrap()
-        } else {
-            document.taffy_tree.new_leaf(style).unwrap()
-        };
-        if let Some(node) = document.nodes.get_mut(node_id) {
-            match node {
-                crate::dom::Node::Element(d) => d.taffy_node = Some(new_t_node),
-                crate::dom::Node::Text(d) => d.taffy_node = Some(new_t_node),
-                _ => {}
-            }
+                }))
+                .unwrap();
         }
-        new_t_node
-    };
+    }
 
     if !is_text {
         let start_idx = scratchpad.len();
@@ -425,18 +419,16 @@ fn build_taffy_node(
             child_id = document.next_sibling_of(c);
         }
         
-        let children_slice = &scratchpad[start_idx..];
-        
-        // Only update children if the document is structurally dirty.
+        // Only update children if the node is new or the document is structurally dirty.
         // This avoids violent allocator thrashing inside Taffy's edge arrays on every frame.
-        if document.dirty {
+        if is_new_taffy_node || document.dirty {
+            let children_slice = &scratchpad[start_idx..];
             document
                 .taffy_tree
                 .set_children(t_node, children_slice)
                 .unwrap();
         }
         
-        // Truncate back to preserve the scratchpad for sibling branches
         scratchpad.truncate(start_idx);
     }
 

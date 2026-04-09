@@ -141,6 +141,8 @@ pub struct JsEngine {
     active_timers: Rc<RefCell<std::collections::HashSet<u32>>>,
     /// Track iterations for deterministic QuickJS garbage collection.
     pump_ticks: Rc<Cell<u32>>,
+    /// Track start time of the current JS execution block to prevent infinite loops.
+    last_start_time: Rc<Cell<Option<Instant>>>,
 }
 
 impl JsEngine {
@@ -150,6 +152,7 @@ impl JsEngine {
             doc.hit_test(x, y)
         };
         if let Some(node_id) = hit {
+            self.last_start_time.set(Some(Instant::now()));
             let event_type_str = event_type.to_string();
             let _ = self.context.with(|ctx| {
                 let globals = ctx.globals();
@@ -163,11 +166,25 @@ impl JsEngine {
                     }
                 }
             });
+            self.last_start_time.set(None);
         }
     }
     pub fn new(document: Document) -> Self {
         let runtime = Runtime::new().unwrap();
         let context = Context::full(&runtime).unwrap();
+
+        let last_start_time: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
+        {
+            let last_start = last_start_time.clone();
+            runtime.set_interrupt_handler(Some(Box::new(move || {
+                if let Some(start) = last_start.get() {
+                    if start.elapsed().as_millis() >= 500 {
+                        return true; // Interrupt!
+                    }
+                }
+                false
+            })));
+        }
 
         let engine = JsEngine {
             runtime,
@@ -177,6 +194,7 @@ impl JsEngine {
             pending_timers: Rc::new(RefCell::new(std::collections::BinaryHeap::new())),
             active_timers: Rc::new(RefCell::new(std::collections::HashSet::new())),
             pump_ticks: Rc::new(Cell::new(0)),
+            last_start_time,
         };
 
         engine.init_web_api();
@@ -237,7 +255,10 @@ impl JsEngine {
                 let doc_ref = doc_ref.clone();
                 move |This(this): This<rquickjs::Class<'_, NodeHandle>>,
                       key: String,
-                      value: String| {
+                      mut value: String| {
+                    if value.len() > crate::dom::MAX_ATTRIBUTE_VALUE_LEN {
+                        value.truncate(crate::dom::MAX_ATTRIBUTE_VALUE_LEN);
+                    }
                     let mut doc = doc_ref.borrow_mut();
                     let node_id = this.borrow().to_node_id();
                     let mut old_id = None;
@@ -775,19 +796,25 @@ impl JsEngine {
                     break;
                 }
             }
-
-            for t in rescheduled {
-                timers.push(t);
-            }
         }
 
         let count = expired.len() as u32;
         for persistent_cb in expired {
+            self.last_start_time.set(Some(Instant::now()));
             self.context.with(|ctx| {
                 if let Ok(func) = persistent_cb.restore(&ctx) {
                     let _: Result<(), _> = func.call::<(), ()>(());
                 }
             });
+            self.last_start_time.set(None);
+        }
+
+        // Re-queue intervals
+        if !rescheduled.is_empty() {
+            let mut timers = self.pending_timers.borrow_mut();
+            for t in rescheduled {
+                timers.push(t);
+            }
         }
 
         // Only sweep every 60 ticks to avoid blocking the event loop
@@ -799,7 +826,9 @@ impl JsEngine {
             self.pump_ticks.set(0);
         }
 
+        self.last_start_time.set(Some(Instant::now()));
         while let Ok(true) = self.runtime.execute_pending_job() {}
+        self.last_start_time.set(None);
 
         count
     }
@@ -812,7 +841,8 @@ impl JsEngine {
 
     /// Evaluates a JavaScript string and returns any string result or errors
     pub fn execute_script(&self, script: &str) -> String {
-        self.context
+        self.last_start_time.set(Some(Instant::now()));
+        let res = self.context
             .with(|ctx| match ctx.eval::<rquickjs::Value, _>(script) {
                 Ok(result) => {
                     if let Ok(s) = result.get::<rquickjs::String>() {
@@ -833,6 +863,8 @@ impl JsEngine {
                     }
                 }
                 Err(e) => format!("JS Error: {:?}", e),
-            })
+            });
+        self.last_start_time.set(None);
+        res
     }
 }

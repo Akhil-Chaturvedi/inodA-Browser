@@ -16,10 +16,11 @@ css::compute_styles()       -- iterative stack-based traversal (no recursion),
   |                            evaluates combinators by walking parent pointers,
   |                            assigns ComputedStyle inline to each ElementData/TextData
   |
-v
+  v
 layout::compute_layout()    -- prepares text buffers in a pre-pass,
-  |                            calculates max/min intrinsic widths,
-  |                            builds a TaffyTree from the arena DOM,
+  |                            calculates max/min intrinsic widths (only if new or layout_dirty),
+  |                            builds/synchronizes a TaffyTree from the arena DOM,
+  |                            only updates children (set_children) if new or document.dirty,
   |                            performs accurate re-wrapping via buffer.set_size(),
   |                            resolves dimensions (px, %, vw, vh, em, rem, auto),
   |                            runs Taffy flexbox/grid solver -> positioned Layout tree
@@ -83,6 +84,7 @@ RootData {
     first_child: Option<NodeId>,
     last_child:  Option<NodeId>,
     js_handles:  usize,
+    taffy_node:  Option<taffy::NodeId>,  // cached Taffy node ID, same as Element/Text
 }
 ```
 
@@ -139,7 +141,7 @@ Combinator    = Descendant | Child | NextSibling | SubsequentSibling
 Declaration   { name: PropertyName, value: StyleValue }
 ```
 
-`PropertyName` is a strongly-typed enum covering all CSS properties the engine recognizes (`Display`, `Width`, `MarginTop`, `Color`, `FontSize`, `AlignItems`, `JustifyContent`, `FlexWrap`, `FlexGrow`, `FlexShrink`, `RowGap`, `ColumnGap`, `MinWidth`, `MaxWidth`, `MinHeight`, `MaxHeight`, etc.). It replaces `DefaultAtom` as the key in `Declaration`, eliminating string-deref comparisons from the cascade hot path. Property matching during `compute_styles` is a direct integer comparison using pre-computed enum variants mapped to a fixed-size `[Option<StyleValue>; 36]` array.
+`PropertyName` is a strongly-typed enum covering all CSS properties the engine recognizes (`Display`, `Width`, `MarginTop`, `Color`, `FontSize`, `AlignItems`, `JustifyContent`, `FlexWrap`, `FlexGrow`, `FlexShrink`, `RowGap`, `ColumnGap`, `MinWidth`, `MaxWidth`, `MinHeight`, `MaxHeight`, etc.). `PropertyName::from_str` returns `Option<Self>`; unknown property names return `None` and are discarded during cascade. There is no catch-all fallback variant -- previously, unrecognized names silently aliased to `LineHeight`, corrupting the style tree. Property matching during `compute_styles` is a direct integer comparison using pre-computed enum variants mapped to a fixed-size `[Option<StyleValue>; 36]` array.
 
 Selectors are pre-parsed into ASTs at stylesheet creation time. Specificity is computed once. Rules are distributed into hash-map buckets based on their right-most simple selector. During style resolution, matching buckets are merged via a k-way pointer walk over pre-sorted slices.
 
@@ -190,7 +192,7 @@ During `compute_layout_with_measure`, the measure closure calls `buffer.set_size
 
 ## HTML parsing
 
-The HTML module iterates `html5gum` tokens in a loop. `StartTag` tokens create `ElementData` nodes and append them under `current_parent`. `EndTag` tokens walk `current_parent` back up to the matching ancestor to reconcile the tree state if nesting is malformed. Byte slices are validated as UTF-8 directly without allocating through `String::from_utf8_lossy`.
+The HTML module iterates `html5gum` tokens in a loop. `StartTag` tokens create `ElementData` nodes and append them under `current_parent`. `EndTag` tokens walk `current_parent` back up to the matching ancestor to reconcile the tree state if nesting is malformed. Byte slices are validated as UTF-8 directly without allocating through `String::from_utf8_lossy`. After parsing completes, `doc.dirty` is set to `true` to ensure the caller-driven pipeline re-runs layout on the first frame.
 
 Content inside `<script>` and `<style>` is accumulated as raw text. The matching closing tag exits the raw state. `<style>` content is parsed immediately into `document.stylesheet` via `css::append_stylesheet()`.
 

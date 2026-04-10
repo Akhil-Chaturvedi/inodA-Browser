@@ -270,6 +270,7 @@ dependencies = [
  "html5gum",
  "once_cell",
  "rquickjs",
+ "smallvec",
  "string_cache",
  "taffy",
 ]

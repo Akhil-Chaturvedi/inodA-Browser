@@ -517,7 +517,7 @@ fn match_ancestors_recursive(
             let mut check_id = document.parent_of(current_node_id);
             while let Some(pid) = check_id {
                 if let Some(crate::dom::Node::Element(data)) = document.nodes.get(pid) {
-                    if match_compound_selector(compound, &data.tag_name, &data.attributes, &data.parsed_classes, document) {
+                    if match_compound_selector(compound, &data.tag_name, &data.attributes, &data.classes, document) {
                         if match_ancestors_recursive(ancestors, ancestor_idx + 1, pid, document) {
                             return true;
                         }
@@ -535,7 +535,7 @@ fn match_ancestors_recursive(
             });
             while let Some(sid) = check_id {
                 if let Some(crate::dom::Node::Element(data)) = document.nodes.get(sid) {
-                    if match_compound_selector(compound, &data.tag_name, &data.attributes, &data.parsed_classes, document) {
+                    if match_compound_selector(compound, &data.tag_name, &data.attributes, &data.classes, document) {
                         if match_ancestors_recursive(ancestors, ancestor_idx + 1, sid, document) {
                             return true;
                         }
@@ -554,21 +554,22 @@ fn match_ancestors_recursive(
     false
 }
 
-fn has_class(parsed_classes: &[String], target: &str) -> bool {
-    parsed_classes.iter().any(|c| c == target)
+fn has_class(classes_str: &str, target: &str) -> bool {
+    classes_str.split_whitespace().any(|c| c == target)
 }
 
 fn match_complex_selector(
     complex: &ComplexSelector,
     node_id: crate::dom::NodeId,
     document: &crate::dom::Document,
+    classes_str: &str,
 ) -> bool {
     if let Some(crate::dom::Node::Element(data)) = document.nodes.get(node_id) {
         if !match_compound_selector(
             &complex.last,
             &data.tag_name,
             &data.attributes,
-            &data.parsed_classes,
+            classes_str,
             document,
         ) {
             return false;
@@ -584,7 +585,7 @@ fn match_compound_selector(
     compound: &CompoundSelector,
     tag_name: &crate::dom::LocalName,
     attributes: &[(String, String)],
-    parsed_classes: &[String],
+    classes_str: &str,
     _document: &crate::dom::Document,
 ) -> bool {
     if compound.parts.is_empty() {
@@ -599,7 +600,7 @@ fn match_compound_selector(
                 }
             }
             SimpleSelector::Class(c) => {
-                if !has_class(parsed_classes, c) {
+                if !has_class(classes_str, c) {
                     return false;
                 }
             }
@@ -652,11 +653,9 @@ pub fn parse_stylesheet(css: &str) -> StyleSheet {
 }
 
 pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &StyleSheet) {
-    document.styles_dirty = false;
+    let mut stack = vec![(document.root_id, None::<crate::dom::ComputedStyle>, true, true)];
 
-    let mut stack = vec![(document.root_id, None::<crate::dom::ComputedStyle>)];
-
-    while let Some((node_id, parent_computed)) = stack.pop() {
+    while let Some((node_id, parent_computed, parent_inheritable_changed, ancestor_attr_changed)) = stack.pop() {
         let mut property_mask: u64 = 0;
         let mut property_array: [Option<crate::dom::StyleValue>; crate::dom::NUM_PROPERTIES] =
             core::array::from_fn(|_| None);
@@ -666,15 +665,29 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
             None => continue,
         };
 
+        let mut data_styles_dirty = false;
         match node {
-            crate::dom::Node::Element(data) => {
+            crate::dom::Node::Element(data) => data_styles_dirty = data.styles_dirty,
+            crate::dom::Node::Text(data) => data_styles_dirty = data.styles_dirty,
+            _ => {}
+        }
+
+        let must_rematch = document.styles_dirty || ancestor_attr_changed || data_styles_dirty;
+        let mut next_ancestor_attr_changed = ancestor_attr_changed;
+
+        if must_rematch {
+            if let crate::dom::Node::Element(data) = node {
+                if data.styles_dirty {
+                    next_ancestor_attr_changed = true;
+                }
+
                 let id_attr = data
                     .attributes
                     .iter()
                     .find(|(k, _)| k == "id")
                     .map(|(_, v)| v.as_str());
 
-                let mut lists: Vec<&[IndexedRule]> = Vec::new();
+                let mut lists: smallvec::SmallVec<[&[IndexedRule]; 8]> = smallvec::SmallVec::new();
                 let doc_sheet = &document.stylesheet;
                 let sheets = [base_stylesheet, doc_sheet];
 
@@ -684,7 +697,7 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
                             lists.push(rules.as_slice());
                         }
                     }
-                    for class in &data.parsed_classes {
+                    for class in data.classes.split_whitespace() {
                         if let Some(rules) = stylesheet.by_class.get(class) {
                             lists.push(rules.as_slice());
                         }
@@ -724,7 +737,7 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
                     }
 
                     let rule = &lists[min_idx][0];
-                    if match_complex_selector(&rule.selector, node_id, document) {
+                    if match_complex_selector(&rule.selector, node_id, document, &data.classes) {
                         for decl in rule.declarations.iter() {
                             let idx = decl.name.to_index();
                             property_array[idx] = Some(decl.value.clone());
@@ -748,19 +761,28 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
                     }
                 }
             }
-            crate::dom::Node::Root(_) | crate::dom::Node::Text(_) => {}
         }
 
         let mut next_computed = crate::dom::ComputedStyle::default();
-
-        // Default to inheriting from parent if possible
-        if let Some(pc) = &parent_computed {
-            next_computed.font_size = pc.font_size;
-            next_computed.color = pc.color;
+        if !must_rematch {
+            match node {
+                crate::dom::Node::Element(data) => next_computed = data.computed.clone(),
+                crate::dom::Node::Text(data) => next_computed = data.computed.clone(),
+                _ => {}
+            }
         }
 
-        let parent_font_size = parent_computed.as_ref().map(|pc| pc.font_size).unwrap_or(16.0);
-        if property_mask != 0 {
+        // Default to inheriting from parent if possible
+        if must_rematch || parent_inheritable_changed {
+            if let Some(pc) = &parent_computed {
+                next_computed.font_size = pc.font_size;
+                next_computed.color = pc.color;
+            }
+        }
+
+        if must_rematch {
+            let parent_font_size = parent_computed.as_ref().map(|pc| pc.font_size).unwrap_or(16.0);
+            if property_mask != 0 {
             for i in 0..crate::dom::NUM_PROPERTIES {
                 if (property_mask & (1_u64 << i)) != 0 {
                     if let Some(val) = &property_array[i] {
@@ -847,24 +869,35 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
                 }
             }
         }
-        
-        if next_computed.font_size == 0.0 {
-            next_computed.font_size = 16.0;
+            
+            if next_computed.font_size == 0.0 {
+                next_computed.font_size = 16.0;
+            }
         }
 
-        if let Some(node) = document.nodes.get_mut(node_id) {
-            match node {
+        let mut next_inheritable_changed = false;
+
+        if let Some(node_mut) = document.nodes.get_mut(node_id) {
+            match node_mut {
                 crate::dom::Node::Element(data) => {
                     if data.computed != next_computed {
+                        if data.computed.font_size != next_computed.font_size || data.computed.color != next_computed.color {
+                            next_inheritable_changed = true;
+                        }
                         data.computed = next_computed.clone();
                         data.layout_dirty = true;
                     }
+                    data.styles_dirty = false;
                 }
                 crate::dom::Node::Text(data) => {
                     if data.computed != next_computed {
+                        if data.computed.font_size != next_computed.font_size || data.computed.color != next_computed.color {
+                            next_inheritable_changed = true;
+                        }
                         data.computed = next_computed.clone();
                         data.layout_dirty = true;
                     }
+                    data.styles_dirty = false;
                 }
                 crate::dom::Node::Root(_) => {}
             }
@@ -880,7 +913,7 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
             child = document.next_sibling_of(c);
         }
         for c in children.into_iter().rev() {
-            stack.push((c, Some(shared_style.clone())));
+            stack.push((c, Some(shared_style.clone()), next_inheritable_changed, next_ancestor_attr_changed));
         }
     }
 }

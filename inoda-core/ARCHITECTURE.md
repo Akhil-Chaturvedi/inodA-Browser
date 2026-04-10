@@ -59,7 +59,6 @@ ElementData {
     tag_name: LocalName,                             // Standard(DefaultAtom) for HTML tags, Custom(String) for custom elements
     attributes: Vec<(String, String)>,
     classes: String,                                 // flat space-separated String; never interned to avoid global atom pool growth
-    parsed_classes: Vec<String>,                     // O(1) class lookup cache for cascade performance
     cached_inline_styles: Option<Vec<(PropertyName, StyleValue)>>, // O(1) style lookup
     parent:       Option<NodeId>,
     first_child:  Option<NodeId>,
@@ -69,6 +68,7 @@ ElementData {
     computed: ComputedStyle,           // stored inline for cache locality
     js_handles: usize,                // reference count for JS engine
     layout_dirty: bool,               // triggers text buffer re-shaping
+    styles_dirty: bool,               // triggers subtree style invalidation in the cascade
 }
 
 TextData {
@@ -79,6 +79,7 @@ TextData {
     computed: ComputedStyle,           // stored inline
     js_handles: usize,
     layout_dirty: bool,
+    styles_dirty: bool,
 }
 
 RootData {
@@ -99,11 +100,11 @@ Generational indices prevent ABA problems. The DOM tree is wired as an intrusive
 
 ```
 ComputedStyle {
-    display:       DisplayKeyword,     // enum: Block, Flex, Grid, None, etc.
-    flex_direction: FlexDirectionKeyword, // enum: Row, Column
-    align_items:    AlignItemsKeyword,   // enum: Stretch, Center, FlexEnd, etc.
-    justify_content: JustifyContentKeyword, // enum: Center, FlexEnd, SpaceBetween, etc.
-    flex_wrap:      FlexWrapKeyword,     // enum: Wrap, NoWrap
+    display:       taffy::style::Display,       // native Taffy enum: Block, Flex, Grid, None
+    flex_direction: taffy::style::FlexDirection, // native Taffy enum: Row, Column, etc.
+    align_items:    Option<taffy::style::AlignItems>, // native Taffy enum: Stretch, Center, etc.
+    justify_content: Option<taffy::style::JustifyContent>, // native Taffy enum: Center, SpaceBetween, etc.
+    flex_wrap:      taffy::style::FlexWrap,     // native Taffy enum: Wrap, NoWrap
     width:         StyleValue,
     height:        StyleValue,
     margin:        [StyleValue; 4],    // top, right, bottom, left (Inline for cache locality)
@@ -145,7 +146,7 @@ Combinator    = Descendant | Child | NextSibling | SubsequentSibling
 Declaration   { name: PropertyName, value: StyleValue }
 ```
 
-`PropertyName` is a strongly-typed enum covering all CSS properties the engine recognizes (`Display`, `Width`, `MarginTop`, `Color`, `FontSize`, `AlignItems`, `JustifyContent`, `FlexWrap`, `FlexGrow`, `FlexShrink`, `RowGap`, `ColumnGap`, `MinWidth`, `MaxWidth`, `MinHeight`, `MaxHeight`, etc.). `PropertyName::from_str` returns `Option<Self>`; unknown property names return `None` and are discarded during cascade. There is no catch-all fallback variant -- previously, unrecognized names silently aliased to `LineHeight`, corrupting the style tree. Property matching during `compute_styles` is a direct integer comparison using pre-computed enum variants mapped to a fixed-size `[Option<StyleValue>; 36]` array. Layout-defining keywords resolve to specific enums (e.g. `DisplayKeyword`) during the cascade to eliminate string comparisons in `build_taffy_node`.
+`PropertyName` is a strongly-typed enum covering all CSS properties the engine recognizes (`Display`, `Width`, `MarginTop`, `Color`, `FontSize`, `AlignItems`, `JustifyContent`, `FlexWrap`, `FlexGrow`, `FlexShrink`, `RowGap`, `ColumnGap`, `MinWidth`, `MaxWidth`, `MinHeight`, `MaxHeight`, etc.). `PropertyName::from_str` returns `Option<Self>`; unknown property names return `None` and are discarded during cascade. There is no catch-all fallback variant -- previously, unrecognized names silently aliased to `LineHeight`, corrupting the style tree. Property matching during `compute_styles` is a direct integer comparison using pre-computed enum variants mapped to a fixed-size `[Option<StyleValue>; 36]` array. Layout-defining keywords resolve to native Taffy enums (e.g. `taffy::style::Display`) during the cascade to eliminate string comparisons in `build_taffy_node`.
 
 Selectors are pre-parsed into ASTs at stylesheet creation time. Specificity is computed once. Rules are distributed into hash-map buckets based on their right-most simple selector. During style resolution, matching buckets are merged via a k-way pointer walk over pre-sorted slices.
 
@@ -167,14 +168,14 @@ Timers are stored in a `std::collections::BinaryHeap` ordered by `fire_at` (min-
 
 ## Cascade and inheritance
 
-`css::compute_styles()` performs an iterative stack-based traversal of the arena DOM. For each element node it:
+`css::compute_styles()` performs an iterative stack-based traversal of the arena DOM. Instead of recalculating properties indiscriminately, it implements Incremental Subtree Invalidation by propagating an `ancestor_attr_changed` flag. It checks this flag along with `node.styles_dirty` to bypass matching checks via a `must_rematch` short-circuit on structurally clean nodes. For mutated elements it:
 
-1. Looks up matching rules from `document.stylesheet` buckets (by ID, class, tag, universal). Class lookup iterates the pre-parsed `data.parsed_classes` cache to avoid per-match string splitting.
+1. Looks up matching rules from `document.stylesheet` buckets (by ID, class, tag, universal). The `lists` collection is scoped as `SmallVec<[&[IndexedRule]; 8]>` to eliminate heap allocations per element while gathering static `stylesheet` bucket slices arrays. It maps classes by directly splitting `data.classes.split_whitespace()`.
 2. Merges matched rules using a k-way specificity-ordered pointer walk.
 3. Applies inline `style` attribute declarations last (highest priority).
 4. Resolves the final property set against a fixed-size `[Option<StyleValue>; 36]` array using property bitmasks.
-5. Assigns the resulting `ComputedStyle` directly to the node and marks `layout_dirty = true` if the style changed.
-6. Pushes children onto the traversal stack.
+5. Assigns the resulting `ComputedStyle` directly to the node and marks `layout_dirty = true` if the style mathematically differed from its prior state.
+6. Pushes children onto the traversal stack alongside property heredity vectors.
 
 Inheritable properties (`color`, `font-size`, etc.) are resolved during the cascade and stored in the `ComputedStyle`. Combinator evaluation (`>` child, space descendant, `+` next-sibling, `~` subsequent-sibling) walks arena parent and sibling pointers rather than maintaining a separate ancestor stack. Attribute selectors (`[attr]`, `[attr=value]`) are matched against `ElementData::attributes`.
 

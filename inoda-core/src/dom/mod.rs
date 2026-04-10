@@ -350,8 +350,6 @@ pub struct ElementData {
     pub attributes: Vec<(String, String)>,
     /// Space-separated class list. Stored as a flat string to minimize heap fragments.
     pub classes: String,
-    /// Pre-parsed class tokens to optimize O(N) tuple lookups in the CSS cascade.
-    pub parsed_classes: Vec<String>,
     /// Pre-parsed inline styles to bypass re-parsing during the CSS cascade.
     pub cached_inline_styles: Option<Vec<(PropertyName, StyleValue)>>,
     pub parent: Option<NodeId>,
@@ -364,6 +362,8 @@ pub struct ElementData {
     pub js_handles: usize,
     /// Set true when styles or content change, triggering a text re-shape.
     pub layout_dirty: bool,
+    /// Set true when attributes or classes mutate, demanding a CSS cascade recompute.
+    pub styles_dirty: bool,
 }
 
 impl ElementData {
@@ -372,7 +372,6 @@ impl ElementData {
             tag_name,
             attributes: Vec::with_capacity(4),
             classes: String::new(),
-            parsed_classes: Vec::new(),
             cached_inline_styles: None,
             parent: None,
             first_child: None,
@@ -383,6 +382,7 @@ impl ElementData {
             taffy_node: None,
             js_handles: 0,
             layout_dirty: false,
+            styles_dirty: true,
         }
     }
 }
@@ -398,6 +398,8 @@ pub struct TextData {
     pub js_handles: usize,
     /// Set true when text content changes, triggering a re-shape.
     pub layout_dirty: bool,
+    /// Triggers inheritable CSS recompute
+    pub styles_dirty: bool,
 }
 
 impl TextData {
@@ -411,6 +413,7 @@ impl TextData {
             taffy_node: None,
             js_handles: 0,
             layout_dirty: false,
+            styles_dirty: true,
         }
     }
 }
@@ -439,6 +442,8 @@ pub enum StyleValue {
 }
 
 impl Eq for StyleValue {}
+
+
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DisplayKeyword { Block, Inline, InlineBlock, Flex, Grid, None, ListItem }

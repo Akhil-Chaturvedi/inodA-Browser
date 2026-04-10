@@ -362,7 +362,7 @@ mod tests {
         
         let div_id = doc.first_child_of(doc.root_id).unwrap();
         if let crate::dom::Node::Element(data) = doc.nodes.get(div_id).unwrap() {
-            assert_eq!(data.parsed_classes.len(), 3);
+            assert_eq!(data.classes.split_whitespace().count(), 3);
             assert_eq!(data.computed.display, crate::dom::DisplayKeyword::Flex);
             assert_eq!(data.computed.flex_direction, crate::dom::FlexDirectionKeyword::Column);
             assert_eq!(data.computed.justify_content, crate::dom::JustifyContentKeyword::Center);

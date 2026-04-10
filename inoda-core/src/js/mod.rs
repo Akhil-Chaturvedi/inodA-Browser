@@ -282,6 +282,7 @@ impl JsEngine {
                     if is_class {
                         if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
                             data.classes = value.clone();
+                            data.parsed_classes = value.split_whitespace().map(|s| s.to_string()).collect();
                             needs_style_recompute = true;
                             
                             // Also update attributes vector for consistency with getAttribute

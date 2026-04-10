@@ -61,6 +61,7 @@ pub fn parse_html(html: &str) -> Document {
 
                 let mut data = ElementData::new(tag_name.clone());
                 data.attributes = attributes;
+                data.parsed_classes = classes.split_whitespace().map(|s| s.to_string()).collect();
                 data.classes = classes;
                 data.cached_inline_styles = cached_inline_styles;
 

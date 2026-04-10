@@ -350,6 +350,8 @@ pub struct ElementData {
     pub attributes: Vec<(String, String)>,
     /// Space-separated class list. Stored as a flat string to minimize heap fragments.
     pub classes: String,
+    /// Pre-parsed class tokens to optimize O(N) tuple lookups in the CSS cascade.
+    pub parsed_classes: Vec<String>,
     /// Pre-parsed inline styles to bypass re-parsing during the CSS cascade.
     pub cached_inline_styles: Option<Vec<(PropertyName, StyleValue)>>,
     pub parent: Option<NodeId>,
@@ -370,6 +372,7 @@ impl ElementData {
             tag_name,
             attributes: Vec::with_capacity(4),
             classes: String::new(),
+            parsed_classes: Vec::new(),
             cached_inline_styles: None,
             parent: None,
             first_child: None,
@@ -437,14 +440,29 @@ pub enum StyleValue {
 
 impl Eq for StyleValue {}
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum DisplayKeyword { Block, Inline, InlineBlock, Flex, Grid, None, ListItem }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FlexDirectionKeyword { Row, Column }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlignItemsKeyword { FlexStart, FlexEnd, Center, Baseline, Stretch }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum JustifyContentKeyword { FlexStart, FlexEnd, Center, SpaceBetween, SpaceAround, SpaceEvenly }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FlexWrapKeyword { Wrap, WrapReverse, NoWrap }
+
 /// Pre-calculated native CSS properties to eliminate O(N) tuple lookups during Layout and Rendering loops.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComputedStyle {
-    pub display: string_cache::DefaultAtom,
-    pub flex_direction: string_cache::DefaultAtom,
-    pub align_items: string_cache::DefaultAtom,
-    pub justify_content: string_cache::DefaultAtom,
-    pub flex_wrap: string_cache::DefaultAtom,
+    pub display: DisplayKeyword,
+    pub flex_direction: FlexDirectionKeyword,
+    pub align_items: AlignItemsKeyword,
+    pub justify_content: JustifyContentKeyword,
+    pub flex_wrap: FlexWrapKeyword,
     pub width: StyleValue,
     pub height: StyleValue,
     pub min_width: StyleValue,
@@ -470,11 +488,11 @@ impl Eq for ComputedStyle {}
 impl Default for ComputedStyle {
     fn default() -> Self {
         ComputedStyle {
-            display: string_cache::DefaultAtom::from("block"),
-            flex_direction: string_cache::DefaultAtom::from("row"),
-            align_items: string_cache::DefaultAtom::from("stretch"),
-            justify_content: string_cache::DefaultAtom::from("flex-start"),
-            flex_wrap: string_cache::DefaultAtom::from("nowrap"),
+            display: DisplayKeyword::Block,
+            flex_direction: FlexDirectionKeyword::Row,
+            align_items: AlignItemsKeyword::Stretch,
+            justify_content: JustifyContentKeyword::FlexStart,
+            flex_wrap: FlexWrapKeyword::NoWrap,
             width: StyleValue::Auto,
             height: StyleValue::Auto,
             min_width: StyleValue::Auto,

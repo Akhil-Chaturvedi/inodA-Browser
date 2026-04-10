@@ -59,6 +59,7 @@ ElementData {
     tag_name: LocalName,                             // Standard(DefaultAtom) for HTML tags, Custom(String) for custom elements
     attributes: Vec<(String, String)>,
     classes: String,                                 // flat space-separated String; never interned to avoid global atom pool growth
+    parsed_classes: Vec<String>,                     // O(1) class lookup cache for cascade performance
     cached_inline_styles: Option<Vec<(PropertyName, StyleValue)>>, // O(1) style lookup
     parent:       Option<NodeId>,
     first_child:  Option<NodeId>,
@@ -98,8 +99,11 @@ Generational indices prevent ABA problems. The DOM tree is wired as an intrusive
 
 ```
 ComputedStyle {
-    display:       DefaultAtom,        // "block", "flex", "grid", "none"
-    flex_direction: DefaultAtom,       // "row", "column"
+    display:       DisplayKeyword,     // enum: Block, Flex, Grid, None, etc.
+    flex_direction: FlexDirectionKeyword, // enum: Row, Column
+    align_items:    AlignItemsKeyword,   // enum: Stretch, Center, FlexEnd, etc.
+    justify_content: JustifyContentKeyword, // enum: Center, FlexEnd, SpaceBetween, etc.
+    flex_wrap:      FlexWrapKeyword,     // enum: Wrap, NoWrap
     width:         StyleValue,
     height:        StyleValue,
     margin:        [StyleValue; 4],    // top, right, bottom, left (Inline for cache locality)
@@ -141,7 +145,7 @@ Combinator    = Descendant | Child | NextSibling | SubsequentSibling
 Declaration   { name: PropertyName, value: StyleValue }
 ```
 
-`PropertyName` is a strongly-typed enum covering all CSS properties the engine recognizes (`Display`, `Width`, `MarginTop`, `Color`, `FontSize`, `AlignItems`, `JustifyContent`, `FlexWrap`, `FlexGrow`, `FlexShrink`, `RowGap`, `ColumnGap`, `MinWidth`, `MaxWidth`, `MinHeight`, `MaxHeight`, etc.). `PropertyName::from_str` returns `Option<Self>`; unknown property names return `None` and are discarded during cascade. There is no catch-all fallback variant -- previously, unrecognized names silently aliased to `LineHeight`, corrupting the style tree. Property matching during `compute_styles` is a direct integer comparison using pre-computed enum variants mapped to a fixed-size `[Option<StyleValue>; 36]` array.
+`PropertyName` is a strongly-typed enum covering all CSS properties the engine recognizes (`Display`, `Width`, `MarginTop`, `Color`, `FontSize`, `AlignItems`, `JustifyContent`, `FlexWrap`, `FlexGrow`, `FlexShrink`, `RowGap`, `ColumnGap`, `MinWidth`, `MaxWidth`, `MinHeight`, `MaxHeight`, etc.). `PropertyName::from_str` returns `Option<Self>`; unknown property names return `None` and are discarded during cascade. There is no catch-all fallback variant -- previously, unrecognized names silently aliased to `LineHeight`, corrupting the style tree. Property matching during `compute_styles` is a direct integer comparison using pre-computed enum variants mapped to a fixed-size `[Option<StyleValue>; 36]` array. Layout-defining keywords resolve to specific enums (e.g. `DisplayKeyword`) during the cascade to eliminate string comparisons in `build_taffy_node`.
 
 Selectors are pre-parsed into ASTs at stylesheet creation time. Specificity is computed once. Rules are distributed into hash-map buckets based on their right-most simple selector. During style resolution, matching buckets are merged via a k-way pointer walk over pre-sorted slices.
 
@@ -165,7 +169,7 @@ Timers are stored in a `std::collections::BinaryHeap` ordered by `fire_at` (min-
 
 `css::compute_styles()` performs an iterative stack-based traversal of the arena DOM. For each element node it:
 
-1. Looks up matching rules from `document.stylesheet` buckets (by ID, class, tag, universal).
+1. Looks up matching rules from `document.stylesheet` buckets (by ID, class, tag, universal). Class lookup iterates the pre-parsed `data.parsed_classes` cache to avoid per-match string splitting.
 2. Merges matched rules using a k-way specificity-ordered pointer walk.
 3. Applies inline `style` attribute declarations last (highest priority).
 4. Resolves the final property set against a fixed-size `[Option<StyleValue>; 36]` array using property bitmasks.

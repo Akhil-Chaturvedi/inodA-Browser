@@ -42,13 +42,13 @@ pub fn compute_layout(
     viewport_height: f32,
     font_system: &mut FontSystem,
     buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
-) -> (taffy::NodeId, HashMap<crate::dom::NodeId, Buffer>) {
+) -> taffy::NodeId {
     // Evict cached text buffers for nodes that have been removed from the DOM
     buffer_cache.retain(|node_id, _| document.nodes.contains(*node_id));
 
     prepare_text_buffers(document, document.root_id, font_system, buffer_cache);
 
-    let mut scratchpad = Vec::with_capacity(128);
+    let mut scratchpad = Vec::new();
     let root_taffy_node =
         build_taffy_node(document, document.root_id, viewport_width, viewport_height, buffer_cache, &mut scratchpad);
 
@@ -111,7 +111,7 @@ pub fn compute_layout(
         buffer_cache,
     );
 
-    (root_taffy_node, std::mem::take(buffer_cache))
+    root_taffy_node
 }
 
 fn prepare_text_buffers(
@@ -220,51 +220,46 @@ fn build_taffy_node(
     
     let font_size = computed.font_size;
 
-    match &*computed.display {
-        "flex" => style.display = Display::Flex,
-        "grid" => style.display = Display::Grid,
-        "none" => style.display = Display::None,
-        "block" | "inline" | "inline-block" | "list-item" => style.display = Display::Block,
-        _ => {}
+    match computed.display {
+        crate::dom::DisplayKeyword::Flex => style.display = Display::Flex,
+        crate::dom::DisplayKeyword::Grid => style.display = Display::Grid,
+        crate::dom::DisplayKeyword::None => style.display = Display::None,
+        crate::dom::DisplayKeyword::Block | crate::dom::DisplayKeyword::Inline | crate::dom::DisplayKeyword::InlineBlock | crate::dom::DisplayKeyword::ListItem => style.display = Display::Block,
     }
 
-    match &*computed.flex_direction {
-        "row" => style.flex_direction = FlexDirection::Row,
-        "column" => style.flex_direction = FlexDirection::Column,
-        _ => {}
+    match computed.flex_direction {
+        crate::dom::FlexDirectionKeyword::Row => style.flex_direction = FlexDirection::Row,
+        crate::dom::FlexDirectionKeyword::Column => style.flex_direction = FlexDirection::Column,
     }
 
-    let is_flex = &*computed.display == "flex";
-    let has_flex_dir = &*computed.flex_direction == "row" || &*computed.flex_direction == "column";
+    let is_flex = computed.display == crate::dom::DisplayKeyword::Flex;
+    let has_flex_dir = computed.flex_direction == crate::dom::FlexDirectionKeyword::Row || computed.flex_direction == crate::dom::FlexDirectionKeyword::Column;
 
     if !is_flex && !has_flex_dir {
         style.flex_direction = FlexDirection::Column;
     }
 
-    match &*computed.align_items {
-        "flex-start" | "start" => style.align_items = Some(AlignItems::FlexStart),
-        "flex-end" | "end" => style.align_items = Some(AlignItems::FlexEnd),
-        "center" => style.align_items = Some(AlignItems::Center),
-        "baseline" => style.align_items = Some(AlignItems::Baseline),
-        "stretch" => style.align_items = Some(AlignItems::Stretch),
-        _ => {}
+    match computed.align_items {
+        crate::dom::AlignItemsKeyword::FlexStart => style.align_items = Some(AlignItems::FlexStart),
+        crate::dom::AlignItemsKeyword::FlexEnd => style.align_items = Some(AlignItems::FlexEnd),
+        crate::dom::AlignItemsKeyword::Center => style.align_items = Some(AlignItems::Center),
+        crate::dom::AlignItemsKeyword::Baseline => style.align_items = Some(AlignItems::Baseline),
+        crate::dom::AlignItemsKeyword::Stretch => style.align_items = Some(AlignItems::Stretch),
     }
 
-    match &*computed.justify_content {
-        "flex-start" | "start" => style.justify_content = Some(JustifyContent::FlexStart),
-        "flex-end" | "end" => style.justify_content = Some(JustifyContent::FlexEnd),
-        "center" => style.justify_content = Some(JustifyContent::Center),
-        "space-between" => style.justify_content = Some(JustifyContent::SpaceBetween),
-        "space-around" => style.justify_content = Some(JustifyContent::SpaceAround),
-        "space-evenly" => style.justify_content = Some(JustifyContent::SpaceEvenly),
-        _ => {}
+    match computed.justify_content {
+        crate::dom::JustifyContentKeyword::FlexStart => style.justify_content = Some(JustifyContent::FlexStart),
+        crate::dom::JustifyContentKeyword::FlexEnd => style.justify_content = Some(JustifyContent::FlexEnd),
+        crate::dom::JustifyContentKeyword::Center => style.justify_content = Some(JustifyContent::Center),
+        crate::dom::JustifyContentKeyword::SpaceBetween => style.justify_content = Some(JustifyContent::SpaceBetween),
+        crate::dom::JustifyContentKeyword::SpaceAround => style.justify_content = Some(JustifyContent::SpaceAround),
+        crate::dom::JustifyContentKeyword::SpaceEvenly => style.justify_content = Some(JustifyContent::SpaceEvenly),
     }
 
-    match &*computed.flex_wrap {
-        "wrap" => style.flex_wrap = FlexWrap::Wrap,
-        "wrap-reverse" => style.flex_wrap = FlexWrap::WrapReverse,
-        "nowrap" => style.flex_wrap = FlexWrap::NoWrap,
-        _ => {}
+    match computed.flex_wrap {
+        crate::dom::FlexWrapKeyword::Wrap => style.flex_wrap = FlexWrap::Wrap,
+        crate::dom::FlexWrapKeyword::WrapReverse => style.flex_wrap = FlexWrap::WrapReverse,
+        crate::dom::FlexWrapKeyword::NoWrap => style.flex_wrap = FlexWrap::NoWrap,
     }
 
     style.flex_grow = computed.flex_grow;

@@ -42,7 +42,7 @@ mod tests {
 
         let mut font_system = cosmic_text::FontSystem::new();
         let mut buffer_cache = std::collections::HashMap::new();
-        let (root_node, _text_cache) =
+        let root_node =
             layout::compute_layout(&mut doc, 320.0, 240.0, &mut font_system, &mut buffer_cache);
         taffy::print_tree(&doc.taffy_tree, root_node);
 
@@ -334,7 +334,7 @@ mod tests {
         let mut font_system = cosmic_text::FontSystem::new();
         let mut buffer_cache = std::collections::HashMap::new();
         
-        let (root_taffy_node, _) = layout::compute_layout(&mut doc, 800.0, 600.0, &mut font_system, &mut buffer_cache);
+        let root_taffy_node = layout::compute_layout(&mut doc, 800.0, 600.0, &mut font_system, &mut buffer_cache);
         
         println!("Taffy Tree for doc.root_id:");
         taffy::print_tree(&doc.taffy_tree, root_taffy_node);
@@ -346,5 +346,29 @@ mod tests {
         
         // Should be normalized to Block
         assert_eq!(style.display, taffy::style::Display::Block);
+    }
+
+    #[test]
+    fn test_class_cascade_hot_path() {
+        let mut doc = html::parse_html("<div class='btn primary active'></div>");
+        let mut stylesheet = css::StyleSheet::default();
+        css::append_stylesheet("
+            .btn { display: flex; flex-direction: column; }
+            .primary { justify-content: center; }
+            .active { align-items: flex-end; }
+        ", &mut stylesheet);
+        
+        css::compute_styles(&mut doc, &stylesheet);
+        
+        let div_id = doc.first_child_of(doc.root_id).unwrap();
+        if let crate::dom::Node::Element(data) = doc.nodes.get(div_id).unwrap() {
+            assert_eq!(data.parsed_classes.len(), 3);
+            assert_eq!(data.computed.display, crate::dom::DisplayKeyword::Flex);
+            assert_eq!(data.computed.flex_direction, crate::dom::FlexDirectionKeyword::Column);
+            assert_eq!(data.computed.justify_content, crate::dom::JustifyContentKeyword::Center);
+            assert_eq!(data.computed.align_items, crate::dom::AlignItemsKeyword::FlexEnd);
+        } else {
+            panic!("Expected Element");
+        }
     }
 }

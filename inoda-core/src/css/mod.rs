@@ -301,11 +301,13 @@ pub fn parse_style_value(val: &str) -> crate::dom::StyleValue {
     }
 
     let known_keywords = [
-        "auto", "none", "block", "inline", "flex", "grid",
+        "auto", "none", "block", "inline", "inline-block", "list-item", "flex", "grid",
         "row", "column", "inherit",
         "absolute", "relative", "fixed", "sticky",
         "hidden", "visible", "scroll", "clip",
-        "center", "start", "end", "stretch", "space-between", "space-around"
+        "center", "start", "end", "flex-start", "flex-end", "baseline", "stretch", 
+        "space-between", "space-around", "space-evenly",
+        "wrap", "nowrap", "wrap-reverse"
     ];
 
     if known_keywords.contains(&trimmed) {
@@ -515,7 +517,7 @@ fn match_ancestors_recursive(
             let mut check_id = document.parent_of(current_node_id);
             while let Some(pid) = check_id {
                 if let Some(crate::dom::Node::Element(data)) = document.nodes.get(pid) {
-                    if match_compound_selector(compound, &data.tag_name, &data.attributes, &data.classes, document) {
+                    if match_compound_selector(compound, &data.tag_name, &data.attributes, &data.parsed_classes, document) {
                         if match_ancestors_recursive(ancestors, ancestor_idx + 1, pid, document) {
                             return true;
                         }
@@ -533,7 +535,7 @@ fn match_ancestors_recursive(
             });
             while let Some(sid) = check_id {
                 if let Some(crate::dom::Node::Element(data)) = document.nodes.get(sid) {
-                    if match_compound_selector(compound, &data.tag_name, &data.attributes, &data.classes, document) {
+                    if match_compound_selector(compound, &data.tag_name, &data.attributes, &data.parsed_classes, document) {
                         if match_ancestors_recursive(ancestors, ancestor_idx + 1, sid, document) {
                             return true;
                         }
@@ -552,8 +554,8 @@ fn match_ancestors_recursive(
     false
 }
 
-fn has_class(classes: &str, target: &str) -> bool {
-    classes.split_whitespace().any(|c| c == target)
+fn has_class(parsed_classes: &[String], target: &str) -> bool {
+    parsed_classes.iter().any(|c| c == target)
 }
 
 fn match_complex_selector(
@@ -566,7 +568,7 @@ fn match_complex_selector(
             &complex.last,
             &data.tag_name,
             &data.attributes,
-            &data.classes,
+            &data.parsed_classes,
             document,
         ) {
             return false;
@@ -582,7 +584,7 @@ fn match_compound_selector(
     compound: &CompoundSelector,
     tag_name: &crate::dom::LocalName,
     attributes: &[(String, String)],
-    classes: &str,
+    parsed_classes: &[String],
     _document: &crate::dom::Document,
 ) -> bool {
     if compound.parts.is_empty() {
@@ -597,7 +599,7 @@ fn match_compound_selector(
                 }
             }
             SimpleSelector::Class(c) => {
-                if !has_class(classes, c) {
+                if !has_class(parsed_classes, c) {
                     return false;
                 }
             }
@@ -682,7 +684,7 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
                             lists.push(rules.as_slice());
                         }
                     }
-                    for class in data.classes.split_whitespace() {
+                    for class in &data.parsed_classes {
                         if let Some(rules) = stylesheet.by_class.get(class) {
                             lists.push(rules.as_slice());
                         }
@@ -763,8 +765,22 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
                 if (property_mask & (1_u64 << i)) != 0 {
                     if let Some(val) = &property_array[i] {
                         match i {
-                            0 => if let crate::dom::StyleValue::Keyword(v) = val { next_computed.display = v.clone(); },
-                            1 => if let crate::dom::StyleValue::Keyword(v) = val { next_computed.flex_direction = v.clone(); },
+                            0 => if let crate::dom::StyleValue::Keyword(v) = val {
+                                next_computed.display = match &**v {
+                                    "flex" => crate::dom::DisplayKeyword::Flex,
+                                    "grid" => crate::dom::DisplayKeyword::Grid,
+                                    "none" => crate::dom::DisplayKeyword::None,
+                                    "inline" | "inline-block" => crate::dom::DisplayKeyword::InlineBlock,
+                                    "list-item" => crate::dom::DisplayKeyword::ListItem,
+                                    _ => crate::dom::DisplayKeyword::Block,
+                                };
+                            },
+                            1 => if let crate::dom::StyleValue::Keyword(v) = val {
+                                next_computed.flex_direction = match &**v {
+                                    "column" => crate::dom::FlexDirectionKeyword::Column,
+                                    _ => crate::dom::FlexDirectionKeyword::Row,
+                                };
+                            },
                             2 => next_computed.width = val.clone(),
                             3 => next_computed.height = val.clone(),
                             4 => next_computed.margin[0] = val.clone(),
@@ -791,9 +807,32 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
                                     _ => {}
                                 }
                             }
-                            25 => if let crate::dom::StyleValue::Keyword(v) = val { next_computed.align_items = v.clone(); },
-                            26 => if let crate::dom::StyleValue::Keyword(v) = val { next_computed.justify_content = v.clone(); },
-                            27 => if let crate::dom::StyleValue::Keyword(v) = val { next_computed.flex_wrap = v.clone(); },
+                            25 => if let crate::dom::StyleValue::Keyword(v) = val {
+                                next_computed.align_items = match &**v {
+                                    "flex-end" | "end" => crate::dom::AlignItemsKeyword::FlexEnd,
+                                    "center" => crate::dom::AlignItemsKeyword::Center,
+                                    "baseline" => crate::dom::AlignItemsKeyword::Baseline,
+                                    "flex-start" | "start" => crate::dom::AlignItemsKeyword::FlexStart,
+                                    _ => crate::dom::AlignItemsKeyword::Stretch,
+                                };
+                            },
+                            26 => if let crate::dom::StyleValue::Keyword(v) = val {
+                                next_computed.justify_content = match &**v {
+                                    "flex-end" | "end" => crate::dom::JustifyContentKeyword::FlexEnd,
+                                    "center" => crate::dom::JustifyContentKeyword::Center,
+                                    "space-between" => crate::dom::JustifyContentKeyword::SpaceBetween,
+                                    "space-around" => crate::dom::JustifyContentKeyword::SpaceAround,
+                                    "space-evenly" => crate::dom::JustifyContentKeyword::SpaceEvenly,
+                                    _ => crate::dom::JustifyContentKeyword::FlexStart,
+                                };
+                            },
+                            27 => if let crate::dom::StyleValue::Keyword(v) = val {
+                                next_computed.flex_wrap = match &**v {
+                                    "wrap" => crate::dom::FlexWrapKeyword::Wrap,
+                                    "wrap-reverse" => crate::dom::FlexWrapKeyword::WrapReverse,
+                                    _ => crate::dom::FlexWrapKeyword::NoWrap,
+                                };
+                            },
                             28 => if let crate::dom::StyleValue::Number(v) = val { next_computed.flex_grow = *v; },
                             29 => if let crate::dom::StyleValue::Number(v) = val { next_computed.flex_shrink = *v; },
                             30 => next_computed.row_gap = val.clone(),

@@ -4,9 +4,10 @@
 //! index invalidation. Nodes can be safely removed and their indices
 //! will not be reused until the generation wraps.
 //!
-//! Tag names are interned using `string_cache::DefaultAtom`
-//! to minimize memory usage, while attribute keys and values are stored
-//! directly as `String` to prevent unbounded memory growth in the global pool.
+//! Standard HTML tag names are interned as `string_cache::DefaultAtom`
+//! for pointer-equality comparison. Custom element names and all attribute
+//! keys and values are stored as `String` to prevent unbounded growth of
+//! the global intern pool.
 //!
 //! Parent pointers are stored directly on nodes to keep parent traversal
 //! cache-friendly and avoid hashmap overhead in embedded environments.
@@ -17,6 +18,8 @@
 
 use generational_arena::{Arena, Index};
 
+mod tags;
+
 pub const MAX_ATTRIBUTES: usize = 32;
 pub const MAX_ATTRIBUTE_VALUE_LEN: usize = 16384; // 16 KB per attribute
 
@@ -26,6 +29,9 @@ pub struct TextMeasureContext {
     pub font_size: f32,
     pub max_intrinsic_width: f32,
     pub min_intrinsic_width: f32,
+    /// Last definite width from Taffy's measure callback (cache when unchanged between probes).
+    pub last_measure_width: Option<f32>,
+    pub last_line_count: f32,
 }
 
 /// A DOM document backed by a generational arena.
@@ -63,118 +69,9 @@ pub enum LocalName {
 }
 
 impl LocalName {
+    /// `tag` must be ASCII-lowercase (HTML tokenizer and `createElement` enforce this).
     pub fn new(tag: &str) -> Self {
-        if matches!(
-            tag,
-            "a" | "abbr"
-                | "address"
-                | "area"
-                | "article"
-                | "aside"
-                | "audio"
-                | "b"
-                | "base"
-                | "bdi"
-                | "bdo"
-                | "blockquote"
-                | "body"
-                | "br"
-                | "button"
-                | "canvas"
-                | "caption"
-                | "cite"
-                | "code"
-                | "col"
-                | "colgroup"
-                | "data"
-                | "datalist"
-                | "dd"
-                | "del"
-                | "details"
-                | "dfn"
-                | "dialog"
-                | "div"
-                | "dl"
-                | "dt"
-                | "em"
-                | "embed"
-                | "fieldset"
-                | "figcaption"
-                | "figure"
-                | "footer"
-                | "form"
-                | "h1"
-                | "h2"
-                | "h3"
-                | "h4"
-                | "h5"
-                | "h6"
-                | "head"
-                | "header"
-                | "hr"
-                | "html"
-                | "i"
-                | "iframe"
-                | "img"
-                | "input"
-                | "ins"
-                | "kbd"
-                | "label"
-                | "legend"
-                | "li"
-                | "link"
-                | "main"
-                | "map"
-                | "mark"
-                | "meta"
-                | "meter"
-                | "nav"
-                | "noscript"
-                | "object"
-                | "ol"
-                | "optgroup"
-                | "option"
-                | "output"
-                | "p"
-                | "param"
-                | "picture"
-                | "pre"
-                | "progress"
-                | "q"
-                | "rp"
-                | "rt"
-                | "ruby"
-                | "s"
-                | "samp"
-                | "script"
-                | "section"
-                | "select"
-                | "small"
-                | "source"
-                | "span"
-                | "strong"
-                | "style"
-                | "sub"
-                | "summary"
-                | "sup"
-                | "table"
-                | "tbody"
-                | "td"
-                | "template"
-                | "textarea"
-                | "tfoot"
-                | "th"
-                | "thead"
-                | "time"
-                | "title"
-                | "tr"
-                | "track"
-                | "u"
-                | "ul"
-                | "var"
-                | "video"
-                | "wbr"
-        ) {
+        if tags::HTML_TAGS.contains(tag) {
             LocalName::Standard(string_cache::DefaultAtom::from(tag))
         } else {
             LocalName::Custom(tag.to_string())

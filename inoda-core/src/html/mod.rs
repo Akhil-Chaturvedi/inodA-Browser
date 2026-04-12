@@ -1,5 +1,11 @@
 //! HTML parsing module.
 //!
+//! This is **not** a WHATWG HTML tree-construction algorithm. `html5gum` is used
+//! as a streaming tokenizer; `parse_html` applies small, local insertion and
+//! end-tag reconciliation rules on top to build an arena `Document`. Behavior
+//! will diverge from full browsers where the specification’s tree builder would
+//! apply foster parenting, implied elements, adoption agency steps, etc.
+//!
 //! Uses `html5gum` to stream tokens into the `generational_arena`-backed
 //! `Document` in a single pass. Implicit tag auto-closing walks up the
 //! ancestor chain to find the matching tag before block-level boundaries.

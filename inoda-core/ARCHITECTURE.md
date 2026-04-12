@@ -8,7 +8,7 @@ This document describes the data flow and module boundaries inside `inoda-core`.
 HTML string
   |
   v
-html::parse_html()          -- html5gum token loop -> arena DOM (Document)
+html::parse_html()          -- html5gum tokenizer + local DOM rules (not WHATWG tree builder)
   |                            <style> tag mutations set document.styles_dirty = true
   v
 css::compute_styles()       -- iterative stack-based traversal (no recursion),
@@ -34,7 +34,7 @@ render::draw_layout_tree()  -- iterative stack-based traversal (no recursion),
 
 JavaScript execution is separate from this pipeline. DOM nodes exposed to JS carry a `js_handles` reference count. QuickJS wrapper objects are tracked by a `FinalizationRegistry`; when GC'd, they decrement the `js_handles` count for the corresponding Rust arena node. Detached nodes are only wiped from the arena when no JS handles remain.
 
-JS mutations set `document.dirty = true`. The host application is responsible for checking `dirty` and re-running `compute_styles`, `compute_layout`, and `draw_layout_tree` after JS mutations. Timer callbacks registered via `setTimeout` or `setInterval` fire only when the host calls `JsEngine::pump()`. `pump()` executes pending JavaScript jobs (microtasks/promises) asynchronously to sweep `FinalizationRegistry` callbacks. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue and reclaim memory from detached, unreferenced nodes.
+JS mutations set `document.dirty = true`. The host application is responsible for checking `dirty` and re-running `compute_styles`, `compute_layout`, and `draw_layout_tree` after JS mutations. Timer callbacks registered via `setTimeout` or `setInterval` fire only when the host calls `JsEngine::pump()`. `pump()` runs the QuickJS job queue synchronously until empty. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue and reclaim memory from detached, unreferenced nodes.
 
 ## Data structures
 
@@ -148,7 +148,7 @@ Declaration   { name: PropertyName, value: StyleValue }
 
 `PropertyName` is a strongly-typed enum covering all CSS properties the engine recognizes (`Display`, `Width`, `MarginTop`, `Color`, `FontSize`, `AlignItems`, `JustifyContent`, `FlexWrap`, `FlexGrow`, `FlexShrink`, `RowGap`, `ColumnGap`, `MinWidth`, `MaxWidth`, `MinHeight`, `MaxHeight`, etc.). `PropertyName::from_str` returns `Option<Self>`; unknown property names return `None` and are discarded during cascade. There is no catch-all fallback variant -- previously, unrecognized names silently aliased to `LineHeight`, corrupting the style tree. Property matching during `compute_styles` is a direct integer comparison using pre-computed enum variants mapped to a fixed-size `[Option<StyleValue>; 36]` array. Layout-defining keywords resolve to native Taffy enums (e.g. `taffy::style::Display`) during the cascade to eliminate string comparisons in `build_taffy_node`.
 
-Selectors are pre-parsed into ASTs at stylesheet creation time. Specificity is computed once. Rules are distributed into hash-map buckets based on their right-most simple selector. During style resolution, matching buckets are merged via a k-way pointer walk over pre-sorted slices.
+Selectors are pre-parsed into ASTs at stylesheet creation time. Specificity is computed once. Each rule is placed in a **single** hash-map bucket chosen from the subject compound: ID if present, else the **first** class simple selector in `parts`, else tag, else `universal` — not duplicated per class. During style resolution, the cascade collects slices for the element’s id, **each** class token, tag, and universal rules, then merges them via a k-way pointer walk over pre-sorted slices. Changing `add_rule` without aligning this with `compute_styles` can introduce missed matches (false negatives) for multi-class subject compounds.
 
 `StyleSheet` is stored persistently on `Document`. When HTML parsing encounters a `<style>` tag, `css::append_stylesheet()` merges the new rules into `document.stylesheet` in-place. This replaces the previous approach of collecting raw CSS text strings for batch parsing.
 
@@ -183,9 +183,9 @@ Inheritable properties (`color`, `font-size`, etc.) are resolved during the casc
 
 `JsEngine` holds the `Document` inside `Rc<RefCell<Document>>`. DOM-mutating JS functions call `doc.dirty = true` after making changes.
 
-JavaScript object identity (`===`) is enforced via a `_wrapNode` WeakRef cache. Rust traversals (e.g. `parentNode`, `firstChild`) and properties like `tagName` are patched onto the `NodeHandle` prototype as getters using closures that proxy through this cache and the arena. A `FinalizationRegistry` receives the raw `[u32 index, u64 generation]` integer array when QuickJS garbage-collects a wrapper; it invokes `_garbageCollectNodeRaw` (mapped to `try_cleanup_node` in Rust) to decrement the handle count. To prevent the "Fat Node" memory leak, `_wrapNode` manually triggers `_garbageCollectNodeRaw` when a duplicate handle is received but discarded in favor of a cached wrapper. `NodeHandle` itself contains no heap-allocated strings, only raw arena identifiers.
+JavaScript object identity (`===`) is enforced via a `_wrapNode` WeakRef cache. Rust traversals (e.g. `parentNode`, `firstChild`) and properties like `tagName` are patched onto the `NodeHandle` prototype as getters using closures that proxy through this cache and the arena. `__nodeRegistry` and `__ephemeralRegistry` are both `FinalizationRegistry` instances keyed by the raw `[u32 index, u64 generation]` array: canonical wrappers use the former (delete WeakRef map entry, then `_garbageCollectNodeRaw`); ephemeral duplicate raw wrappers created on cache hits use the latter (only `_garbageCollectNodeRaw`), pairing each `js_handles += 1` from raw getters with exactly one GC callback. `NodeHandle` itself contains no heap-allocated strings, only raw arena identifiers.
 
-`JsEngine::pump()` executes pending JavaScript jobs (microtasks/promises) asynchronously to sweep `FinalizationRegistry` callbacks. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue and process the `FinalizationRegistry`. This ensures deterministic memory reclamation without blocking the main thread for expensive GC synchronous sweeps.
+`JsEngine::pump()` executes pending JavaScript jobs (microtasks/promises) until the queue is empty. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue.
 
 `NodeHandle` does not implement `Drop`. Nodes created by JavaScript persist in the arena until explicitly removed via `removeChild()`. This prevents QuickJS garbage collection from triggering arena mutations on nodes that are still part of the tree.
 
@@ -193,7 +193,7 @@ JavaScript object identity (`===`) is enforced via a `_wrapNode` WeakRef cache. 
 
 The text render loop calls `buffer.layout_runs()` and invokes `draw_glyphs` once per `LayoutRun`, passing `run.glyphs` (a `&[LayoutGlyph]` slice borrowed directly from the buffer) and `run.line_y` as the vertical offset. `draw_layout_tree` does not pass the `FontSystem` to the `RendererBackend` trait. This architectural decoupling ensures that hosts employing hardware-accelerated GPU rasterization (e.g. wgpu atlas rendering) are not forced to maintain a dependency on the CPU-side `cosmic_text::FontSystem` that shaped the layout. No intermediate `Vec` is allocated during the render pass.
 
-During `compute_layout_with_measure`, the measure closure calls `buffer.set_size()` and re-wraps text at the available width constraint. Accurate height resolution is achieved by querying the resulting layout runs. After the layout solver finishes, `finalize_text_measurements` reshapes each buffer at its final resolved width if necessary. The renderer reads `LayoutGlyph` iterators directly from `buffer.layout_runs()`.
+During `compute_layout_with_measure`, the measure closure calls `buffer.set_size()` and counts layout runs at the available width constraint. `TextMeasureContext` caches the last definite width and line count so repeated probes at the same width skip redundant work. After the layout solver finishes, `finalize_text_measurements` reshapes each buffer at its final resolved width if necessary. The renderer reads `LayoutGlyph` iterators directly from `buffer.layout_runs()`.
 
 ## Future Optimizations
 The current architecture is tailored for embedded Linux / HMI devices with 64+ MB RAM. Future micro-optimizations may include:

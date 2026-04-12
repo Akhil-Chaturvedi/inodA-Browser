@@ -1,5 +1,6 @@
 //! inoda-core: a minimal browser engine library.
 //!
+//! Parses HTML into a generational arena DOM with intrusive linked-list
 //! pointers for O(1) traversal. Applies CSS with specificity-based matching
 //! and combinator support, computes Flexbox/Grid layout via Taffy, renders
 //! through an abstract backend trait, and exposes a DOM API through an
@@ -13,6 +14,8 @@
 //!
 //! This crate is a library. The host application must provide a window,
 //! event loop, and graphics backend.
+//!
+//! QuickJS initialization is fallible: use [`js::JsEngine::try_new`] and handle [`JsEngineError`].
 
 pub mod css;
 pub mod dom;
@@ -20,6 +23,8 @@ pub mod html;
 pub mod js;
 pub mod layout;
 pub mod render;
+
+pub use js::JsEngineError;
 
 pub trait ResourceLoader {
     fn fetch(&self, url: &str) -> Vec<u8>;
@@ -60,26 +65,33 @@ mod tests {
         let doc = html::parse_html(text);
 
         // Initialize engine and transfer document ownership
-        let engine = js::JsEngine::new(doc);
+        let engine = js::JsEngine::try_new(doc).expect("JsEngine::try_new");
 
         // Test standard JS
-        let result = engine.execute_script("1 + 1");
+        let result = engine.execute_script("1 + 1").unwrap();
         assert_eq!(result, "2");
 
         // Test exposed Rust DOM API -- getElementById returns a NodeHandle with tagName
-        let result2 = engine.execute_script("document.getElementById('test-id').tagName");
+        let result2 = engine
+            .execute_script("document.getElementById('test-id').tagName")
+            .unwrap();
         assert_eq!(result2, "p");
 
         // Test querySelector -- also returns a NodeHandle with tagName
-        let result3 = engine.execute_script("document.querySelector('#test-id').tagName");
+        let result3 = engine
+            .execute_script("document.querySelector('#test-id').tagName")
+            .unwrap();
         assert_eq!(result3, "p");
 
         // Test NodeHandle getAttribute / setAttribute
-        let _ = engine.execute_script(
-            "var p = document.getElementById('test-id'); p.setAttribute('class', 'greeting');",
-        );
-        let result4 =
-            engine.execute_script("document.getElementById('test-id').getAttribute('class')");
+        let _ = engine
+            .execute_script(
+                "var p = document.getElementById('test-id'); p.setAttribute('class', 'greeting');",
+            )
+            .unwrap();
+        let result4 = engine
+            .execute_script("document.getElementById('test-id').getAttribute('class')")
+            .unwrap();
         assert_eq!(result4, "greeting");
 
         // Test NodeHandle removeChild -- verify detachment from parent
@@ -108,7 +120,9 @@ mod tests {
                 .unwrap_or(0);
             drop(doc);
 
-            let _ = engine.execute_script("var body2 = document.querySelector('body'); var p2 = document.getElementById('test-id'); body2.removeChild(p2);");
+            let _ = engine
+                .execute_script("var body2 = document.querySelector('body'); var p2 = document.getElementById('test-id'); body2.removeChild(p2);")
+                .unwrap();
 
             let doc = engine.document.borrow();
             let body_children_after = doc
@@ -139,10 +153,52 @@ mod tests {
             );
         }
 
-        let result6 = engine.execute_script("console.log('Logging works!')");
+        let result6 = engine
+            .execute_script("console.log('Logging works!')")
+            .unwrap();
         assert_eq!(result6, "undefined"); // console.log returns undefined
 
         println!("Javascript execution completed successfully.");
+    }
+
+    #[test]
+    fn test_wrap_node_identity_and_js_handles_after_gc() {
+        let doc = html::parse_html("<html><body><p id=\"t\">x</p></body></html>");
+        let nid = *doc.id_map.get("t").expect("id t");
+        let engine = js::JsEngine::try_new(doc).expect("try_new");
+        let same = engine
+            .execute_script("document.getElementById('t') === document.getElementById('t')")
+            .unwrap();
+        assert_eq!(same, "true");
+        // Hold one canonical wrapper; extra raw-get hits use __ephemeralRegistry (not manual GC).
+        let _ = engine
+            .execute_script(
+                "var __inoda_hold = document.getElementById('t'); document.getElementById('t'); document.getElementById('t');",
+            )
+            .unwrap();
+        for _ in 0..120 {
+            let _ = engine.pump();
+        }
+        let handles = match engine.document.borrow().nodes.get(nid).unwrap() {
+            dom::Node::Element(e) => e.js_handles,
+            _ => panic!("expected element"),
+        };
+        assert_eq!(
+            handles, 1,
+            "one live JS reference (__inoda_hold); ephemeral raw-get bumps must be paired via FinalizationRegistry"
+        );
+    }
+
+    #[test]
+    fn test_local_name_phf_tags() {
+        assert!(matches!(
+            dom::LocalName::new("div"),
+            dom::LocalName::Standard(_)
+        ));
+        assert!(matches!(
+            dom::LocalName::new("my-widget"),
+            dom::LocalName::Custom(_)
+        ));
     }
 
     fn find_node(doc: &crate::dom::Document, name: &str) -> Option<crate::dom::NodeId> {
@@ -267,12 +323,17 @@ mod tests {
         }
 
         // 2. Test JS bridge truncation
-        let engine = js::JsEngine::new(doc);
-        engine.execute_script(&format!("
+        let engine = js::JsEngine::try_new(doc).expect("try_new");
+        engine
+            .execute_script(&format!(
+                "
             let div = document.querySelector('div');
             let large = 'b'.repeat({}); 
             div.setAttribute('data-test', large);
-        ", 20000));
+        ",
+                20000
+            ))
+            .unwrap();
 
         let doc_final = engine.document.borrow();
         if let Some(crate::dom::Node::Element(data)) = doc_final.nodes.get(div_id) {
@@ -288,14 +349,14 @@ mod tests {
     #[test]
     fn test_js_infinite_loop_interruption() {
         let doc = html::parse_html("<div></div>");
-        let engine = js::JsEngine::new(doc);
-        
-        // This should trigger the 500ms interrupt handler
+        let engine = js::JsEngine::try_new(doc).expect("try_new");
+
+        // Interrupt path surfaces as script evaluation failure (QuickJS exception).
         let res = engine.execute_script("while(true) {}");
-        
         assert!(
-            res.contains("interrupted") || res.contains("JS Error"), 
-            "Infinite loop should be interrupted. Got: {}", res
+            res.is_err(),
+            "Infinite loop should fail script eval, got: {:?}",
+            res
         );
     }
 

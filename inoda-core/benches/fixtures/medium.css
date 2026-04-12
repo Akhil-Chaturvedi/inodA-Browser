@@ -1,0 +1,9 @@
+.container { display: flex; flex-direction: column; width: 100%; }
+.hdr { display: flex; flex-direction: row; justify-content: space-between; }
+.nav { display: flex; gap: 8px; }
+.main { display: flex; flex: 1; }
+.art { display: flex; flex-direction: column; padding: 10px; }
+.p { color: #222; font-size: 14px; }
+.box { width: 30%; height: 40px; margin: 4px; background-color: #eee; }
+.sec { display: flex; flex-wrap: wrap; }
+.ftr { height: 24px; }

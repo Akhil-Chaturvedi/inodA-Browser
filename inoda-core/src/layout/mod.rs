@@ -7,8 +7,9 @@
 //! HarfBuzz shaping once per node.
 //!
 //! The Taffy measure closure calls `buffer.set_size()` to adjust the width
-//! constraint, then `buffer.shape_until_scroll()` to re-wrap text. Layout
-//! properties are read directly from `node.computed`.
+//! constraint, then counts `layout_runs()` for height. Repeated measure probes
+//! at the same definite width reuse `TextMeasureContext::last_line_count` to
+//! skip redundant work. Layout properties are read directly from `node.computed`.
 //!
 //! To ensure high per-frame performance, `build_taffy_node` performs work
 //! conditionally:
@@ -32,6 +33,9 @@ use taffy::{
     prelude::*,
     style::{Dimension, Style},
 };
+
+/// Width tolerance for treating two Taffy measure probes as identical.
+const MEASURE_WIDTH_EPSILON: f32 = 1e-3;
 
 // TextMeasureContext moved to crate::dom
 
@@ -83,11 +87,21 @@ pub fn compute_layout(
                 let mut bc = buffer_cache_cell.borrow_mut();
 
                 if let Some(buffer) = bc.get_mut(&ctx.node_id) {
-                    // Adjust width and trigger re-wrap (not full re-shape)
+                    let line_height = (ctx.font_size * 1.2).max(1.0);
+                    if let Some(last_w) = ctx.last_measure_width {
+                        if (last_w - width_constraint).abs() <= MEASURE_WIDTH_EPSILON {
+                            let width = ctx.max_intrinsic_width.min(width_constraint);
+                            let height =
+                                (ctx.last_line_count * line_height).max(line_height);
+                            return taffy::geometry::Size { width, height };
+                        }
+                    }
+
                     buffer.set_size(&mut fs, Some(width_constraint), None);
                     let line_count = buffer.layout_runs().count() as f32;
-                    let line_height = (ctx.font_size * 1.2).max(1.0);
-                    
+                    ctx.last_measure_width = Some(width_constraint);
+                    ctx.last_line_count = line_count;
+
                     let width = ctx.max_intrinsic_width.min(width_constraint);
                     let height = (line_count * line_height).max(line_height);
 
@@ -396,6 +410,8 @@ fn build_taffy_node(
                     font_size,
                     max_intrinsic_width,
                     min_intrinsic_width,
+                    last_measure_width: None,
+                    last_line_count: 0.0,
                 }))
                 .unwrap();
         }

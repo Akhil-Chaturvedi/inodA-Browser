@@ -1,2 +1,6 @@
-inodA Browser For Embedded Devices.txt
 rustup-init.exe
+.aider*
+.brain/phases.yaml
+.gitignore
+Hardening_Inoda_Engine_Architecture.txt
+InodA_Browser.txt

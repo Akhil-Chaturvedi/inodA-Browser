@@ -68,6 +68,18 @@ pub struct IndexedRule {
     pub rule_index: usize,
 }
 
+/// Stylesheet with selector rules placed in lookup buckets for the cascade.
+///
+/// **Single-bucket indexing (fragility):** each rule is stored in **at most one**
+/// of `by_id`, `by_class`, `by_tag`, or `universal` — see [`StyleSheet::add_rule`].
+/// Priority is ID, else first class seen in the subject compound, else tag, else
+/// universal. Rules are **not** duplicated across multiple class keys. A compound
+/// such as `.a.b` is indexed only under the first class taken from `parts`, so an
+/// element that matches only via the other class token never pulls that rule into
+/// the cascade merge. Matching still rejects non-matching candidates from buckets
+/// that were consulted; it cannot apply rules that were never indexed under any key
+/// gathered for the element. Any change to `add_rule` must stay consistent with
+/// how `compute_styles` collects bucket slices.
 #[derive(Debug, Default, Clone)]
 pub struct StyleSheet {
     pub by_id: std::collections::HashMap<String, Vec<IndexedRule>>,
@@ -78,6 +90,9 @@ pub struct StyleSheet {
 }
 
 impl StyleSheet {
+    /// Inserts each selector rule into exactly one bucket (ID > first class >
+    /// tag > universal). Do not assume multi-class selectors appear under every
+    /// class key — see [`StyleSheet`].
     pub fn add_rule(&mut self, rule: StyleRule) {
         let decls = std::rc::Rc::new(rule.declarations);
         for selector in rule.selectors {

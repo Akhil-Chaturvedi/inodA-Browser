@@ -20,6 +20,8 @@ Early development. The engine can parse simple pages, apply stylesheets, lay out
 | `generational-arena` | 0.2     | Generational index arena for the DOM           |
 | `string_cache`       | 0.9     | Atom string interning for HTML tag names       |
 | `once_cell`          | 1.19    | Static initialization for layout fallback data |
+| `phf`                | 0.11    | Compile-time HTML tag-name set for `LocalName` |
+| `criterion`          | 0.5     | (dev) Benchmark harness for cascade / layout / JS |
 
 ## Module overview
 
@@ -38,7 +40,7 @@ src/
 
 `generational_arena::Arena<Node>` indexed by `generational_arena::Index` (aliased as `NodeId`). Nodes are `Element(ElementData)`, `Text(TextData)`, or `Root(RootData)`. The tree is wired as an intrusive linked list: each node stores `first_child`, `last_child`, `next_sibling`, `prev_sibling`, and `parent` pointers directly, giving O(1) traversal and mutation without allocating child vectors.
 
-Tag names are stored as `LocalName`, which is either `Standard(DefaultAtom)` for known HTML elements (interned, pointer-equality comparison) or `Custom(String)` for custom element names. This prevents unbounded growth of the global intern pool from arbitrary names passed through `document.createElement`.
+Tag names are stored as `LocalName`, which is either `Standard(DefaultAtom)` for known HTML elements (interned, pointer-equality comparison) or `Custom(String)` for custom element names. Known tags are resolved with a compile-time `phf` set (callers must pass ASCII-lowercase names, as the tokenizer and `createElement` already do). This prevents unbounded growth of the global intern pool from arbitrary names passed through `document.createElement`.
 
 Attribute keys and values are stored as `String`. To prevent OOM attacks from unbounded attribute names, interning into the global `DefaultAtom` pool is intentionally avoided for attributes. For security, a limit of `MAX_ATTRIBUTES` (32) is enforced during both HTML parsing and JS `setAttribute` calls. This ensures that memory consumption scales linearly with the DOM size and is fully reclaimed upon node destruction. IDs are also stored as `String` and indexed in an $O(1)$ `id_map`.
 
@@ -55,7 +57,7 @@ Node deletion is iterative (queue-based) to avoid stack overflow on deeply neste
 
 ### html
 
-Streams `html5gum` tokens into the arena in a single pass. Byte slices are validated with `std::str::from_utf8` directly, avoiding intermediate `String` allocations.
+Streams `html5gum` tokens into the arena in a single pass. This is a tokenizer-driven builder with local tag-closing rules — it is **not** a WHATWG HTML tree builder, so complex parsing edge cases will not match full browsers. Byte slices are validated with `std::str::from_utf8` directly, avoiding intermediate `String` allocations.
 
 Content inside `<script>` and `<style>` is accumulated as raw text via an `inside_raw_tag` state variable. The matching closing tag exits this state. Text from `<style>` elements is parsed immediately into `document.stylesheet` via `css::append_stylesheet()`. If an `EndTag` does not match the `current_parent`, the parser walks up the ancestor chain to find a match and reconciles the tree state.
 
@@ -65,7 +67,7 @@ Content inside `<script>` and `<style>` is accumulated as raw text via an `insid
 - Property values are parsed into typed `StyleValue` enums (`LengthPx`, `Percent`, `ViewportWidth`, `ViewportHeight`, `Em`, `Rem`, `Color`, `Keyword`, `Number`, `Auto`, `None`) during the cascade. Layout and rendering operate on these enum variants, not strings.
 - Property names in `Declaration` use `PropertyName`, a strongly-typed enum (`Display`, `Width`, `MarginTop`, `FontSize`, etc.). `PropertyName::from_str` returns `Option<PropertyName>`; unrecognized property names return `None` and are discarded during the cascade. Layout-critical keyword values (e.g. `flex`, `column`, `stretch`) resolve to native Taffy enums in `ComputedStyle` during cascade, eliminating string matching in the layout engine. This makes property matching and application an integer comparison rather than a string deref and prevents unrecognized properties from silently corrupting the style tree.
 - Specificity is computed as `(id_count, class_count, tag_count)` at parse time and stored on each `ComplexSelector`.
-- Rules are stored in `HashMap<String, Vec<IndexedRule>>` buckets keyed by class and ID (plain `String`), and `HashMap<DefaultAtom, Vec<IndexedRule>>` keyed by tag (bounded set of known tag names; interning is safe here). Class and ID keys are not interned because they are uncontrolled user input.
+- Rules are stored in `HashMap<String, Vec<IndexedRule>>` buckets keyed by class and ID (plain `String`), and `HashMap<DefaultAtom, Vec<IndexedRule>>` keyed by tag (bounded set of known tag names; interning is safe here). Class and ID keys are not interned because they are uncontrolled user input. Each rule is indexed in **one** bucket only (ID, else first class on the subject compound, else tag, else universal); see the `StyleSheet` doc comment in `css/mod.rs` for why multi-class selectors are fragile at index time.
 - `compute_styles()` performs an iterative stack-based traversal of the arena DOM, evaluating combinators (`>`, space, `+`, `~`) by walking arena parent and sibling pointers. Attribute selectors (`[attr]`, `[attr=value]`) are matched against `ElementData::attributes`. The cascade uses `data.classes.split_whitespace()` iteration alongside a stack-allocated rule bucket gathering via `SmallVec<[&[IndexedRule]; 8]>`. The traversal utilizes short-circuit optimizations via `ancestor_attr_changed` flags to leapfrog un-mutated DOM nodes (Incremental Rendering). It populates `ComputedStyle` on each node by matching against pre-parsed rules and resolving inheritance.
 - Inherits `color`, `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`, `visibility` from parent. Values are copied directly from the parent's resolved style to avoid redundant allocations.
 - `font-size` expressed as `Em` multiplies against the parent's resolved `font_size`. `Rem` resolves against `Document.root_font_size` (defaults to 16px, configurable by the host). Both are resolved during the cascade; the result stored in `computed.font_size` is always absolute pixels.
@@ -81,7 +83,7 @@ To ensure high performance in embedded HMIs, the layout engine performs work con
 - **Structural Updates**: Taffy node children are only updated via `set_children` if a node is new or the `document.dirty` flag is set. This avoids expensive allocator thrashing in Taffy's edge arrays on every frame.
 - **Text Measurement**: Intrinsic width calculation and shaping are only re-run if a node is new or its `layout_dirty` flag is set (e.g. after a text content change via JS).
 
-The Taffy measure closure invokes `buffer.set_size()` and re-calculates the line count during the solver loop. This ensures accurate Flexbox/Grid height resolution across different width constraints while still benefiting from once-per-allocation HarfBuzz shaping in the pre-pass. Final shaping at resolved widths is performed by `finalize_text_measurements`.
+The Taffy measure closure invokes `buffer.set_size()` and counts `layout_runs()` during the solver loop. `TextMeasureContext` stores the last definite width and line count so repeated measure probes at the same width skip redundant `set_size` and counting. Final shaping at resolved widths is performed by `finalize_text_measurements`.
 
 Layout properties are read from `computed` fields on each arena node.
 
@@ -116,6 +118,8 @@ Color values use RGBA 4-channel tuples `(u8, u8, u8, u8)`. Parsing supports name
 
 Embeds QuickJS via `rquickjs`. `JsEngine` holds `Document` behind `Rc<RefCell<Document>>`. QuickJS is single-threaded; all DOM access is serialized through the `RefCell`.
 
+Use `JsEngine::try_new(document) -> Result<JsEngine, JsEngineError>` so runtime/context/Web API registration failures return to the host instead of panicking. `execute_script` and `dispatch_event` return `Result` for evaluation and dispatch errors.
+
 Exposed globals:
 - `console.log(msg)`, `console.warn(msg)`, `console.error(msg)` -- print to stdout
 - `document.getElementById(id)` -- returns a cached `NodeHandle` or null
@@ -134,19 +138,30 @@ Exposed globals:
 - `handle.setAttribute(key, value)` -- updates or inserts attribute, sets `document.dirty = true`
 - `handle.removeChild(child)` -- detaches child from parent, sets `document.dirty = true`
 
-JavaScript object identity (`===`) is enforced via a `_wrapNode` WeakRef cache in the JS environment. Rust getters for traversals (e.g. `parentNode`, `firstChild`) are patched onto the `NodeHandle` prototype using closures that proxy through this cache. A `FinalizationRegistry` receives the raw `[index, generation]` integer array when QuickJS GC collects a wrapper; it invokes `_garbageCollectNodeRaw` (mapped to `try_cleanup_node` in Rust) to decrement the node's handle count. Nodes are queued in `dead_nodes` and permanently removed from the arena by `collect_garbage()` once they are both detached and unreferenced.
+JavaScript object identity (`===`) is enforced via a `_wrapNode` WeakRef cache in the JS environment. Rust getters for traversals (e.g. `parentNode`, `firstChild`) are patched onto the `NodeHandle` prototype using closures that proxy through this cache. `__nodeRegistry` and `__ephemeralRegistry` are both `FinalizationRegistry` instances: the former removes the WeakRef map entry and calls `_garbageCollectNodeRaw` when a canonical wrapper is collected; the latter only calls `_garbageCollectNodeRaw` when an ephemeral duplicate raw wrapper from a cache hit is collected, so each `js_handles += 1` from raw getters is paired with exactly one GC-side decrement. `_garbageCollectNodeRaw` maps to `try_cleanup_node` in Rust. Nodes are queued in `dead_nodes` and permanently removed from the arena by `collect_garbage()` once they are both detached and unreferenced.
 
 `NodeHandle` does not implement `Drop`. Nodes created via JavaScript persist in the arena until explicitly removed via `removeChild()`. This prevents QuickJS GC from invalidating arena slots for nodes that are still attached to the tree.
 
 Timer callbacks are stored as `rquickjs::Persistent<Function>`. Pending timers are in a `BinaryHeap` sorted by `fire_at`. To prevent memory drift from cancelled timers, the heap is compacted when it expands beyond 128 items. Cancelled timer IDs are tracked in a `HashSet<u32>`; `pump()` skips popped timers whose IDs appear in the set. When an interval timer fires, a new `PendingTimer` is pushed with the next scheduled time. Rescheduled interval timers are collected into a separate local `Vec` before being pushed back to the heap; this prevents `setInterval(cb, 0)` from re-appearing at the top of the heap within the same `pump()` call and locking the loop.
 
-`JsEngine::pump()` executes pending JavaScript jobs (microtasks/promises) until the queue is empty before returning control to the host event loop. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue and process the `FinalizationRegistry`. This ensures deterministic memory reclamation without blocking the main thread for expensive GC synchronous sweeps. The `_wrapNode` bridge also handles manual refcount correction when QuickJS merges new handles into its identity cache.
+`JsEngine::pump()` executes pending JavaScript jobs (microtasks/promises) until the queue is empty before returning control to the host event loop. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue.
 
 ## Building
 
 ```
 cargo build
 ```
+
+## Benchmarking (Criterion)
+
+```
+cargo bench
+cargo bench --bench cascade
+cargo bench --bench layout_measure
+cargo bench --bench js_roundtrip
+```
+
+Reports are written under `target/criterion/`. CI can use `cargo bench --no-run` to ensure bench targets compile without executing them.
 
 ## Testing
 

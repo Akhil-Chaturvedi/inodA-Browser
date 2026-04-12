@@ -16,13 +16,21 @@
 //!
 //! Each `NodeHandle` carries a `__nodeKey` property: a two-element JS array
 //! `[u32 index, u64 generation]`. JavaScript object identity (`===`) is enforced
-//! via a `_wrapNode` WeakRef cache in the JS environment. A `FinalizationRegistry`
-//! receives this raw integer array when a wrapper is GC'd and calls the native
-//! Rust `_garbageCollectNodeRaw`, which decrements the handle count. Detached
-//! nodes are cleared from the arena by the batched `collect_garbage()` sweep.
+//! via a `_wrapNode` WeakRef cache in the JS environment. Two `FinalizationRegistry`
+//! instances pair every `js_handles += 1` with a GC callback: `__nodeRegistry`
+//! clears the WeakRef map entry for canonical wrappers; `__ephemeralRegistry`
+//! handles duplicate raw wrappers discarded on cache hits. Both call
+//! `_garbageCollectNodeRaw` (mapped to `try_cleanup_node` in Rust) to decrement
+//! the handle count. Detached nodes are cleared from the arena by the batched
+//! `collect_garbage()` sweep.
 //!
 //! The Document is held behind `Rc<RefCell<Document>>` for single-threaded access.
 //! All JS operations are synchronous and serialized through this lock.
+//!
+//! Initialization is fallible: use [`JsEngine::try_new`] and handle [`JsEngineError`].
+//! Every `js_handles += 1` from a raw DOM getter must be paired with exactly one
+//! `FinalizationRegistry` callback (`__nodeRegistry` for canonical wrappers,
+//! `__ephemeralRegistry` for discarded duplicate wrappers on `_wrapNode` cache hits).
 
 use crate::dom::{Document, NodeId};
 use rquickjs::class::{Trace, Tracer};
@@ -31,6 +39,35 @@ use rquickjs::{Context, Persistent, Runtime};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Instant;
+
+/// Errors from QuickJS runtime setup, Web API registration, dispatch, or script evaluation.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum JsEngineError {
+    RuntimeInit(String),
+    ContextInit(String),
+    WebApiInit(String),
+    DispatchFailed(String),
+    ScriptEval(String),
+}
+
+impl std::fmt::Display for JsEngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JsEngineError::RuntimeInit(s) => write!(f, "QuickJS runtime init failed: {s}"),
+            JsEngineError::ContextInit(s) => write!(f, "QuickJS context init failed: {s}"),
+            JsEngineError::WebApiInit(s) => write!(f, "Web API registration failed: {s}"),
+            JsEngineError::DispatchFailed(s) => write!(f, "Event dispatch failed: {s}"),
+            JsEngineError::ScriptEval(s) => write!(f, "Script evaluation failed: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for JsEngineError {}
+
+fn js_try<T>(r: rquickjs::Result<T>, ctx: &'static str) -> Result<T, JsEngineError> {
+    r.map_err(|e| JsEngineError::WebApiInit(format!("{ctx}: {e:?}")))
+}
 
 // ---------------------------------------------------------------------------
 // NodeHandle: an opaque JS class wrapping a generational_arena::Index.
@@ -146,7 +183,9 @@ pub struct JsEngine {
 }
 
 impl JsEngine {
-    pub fn dispatch_event(&self, x: f32, y: f32, event_type: &str) {
+    /// Dispatches a DOM event to listeners registered on the hit node. Failures are
+    /// returned so the host can log or ignore them; they are non-fatal for the engine.
+    pub fn dispatch_event(&self, x: f32, y: f32, event_type: &str) -> Result<(), JsEngineError> {
         let hit = {
             let doc = self.document.borrow();
             doc.hit_test(x, y)
@@ -154,24 +193,33 @@ impl JsEngine {
         if let Some(node_id) = hit {
             self.last_start_time.set(Some(Instant::now()));
             let event_type_str = event_type.to_string();
-            let _ = self.context.with(|ctx| {
+            let res = self.context.with(|ctx| -> Result<(), JsEngineError> {
                 let globals = ctx.globals();
-                if let Ok(doc_obj) = globals.get::<_, rquickjs::Object>("document") {
-                    if let Ok(dispatch_func) = doc_obj.get::<_, rquickjs::Function>("_triggerEvent") {
-                        let (idx, generation) = node_id.into_raw_parts();
-                        let arr = rquickjs::Array::new(ctx.clone()).unwrap();
-                        arr.set(0, idx as u64).unwrap();
-                        arr.set(1, generation).unwrap();
-                        let _ = dispatch_func.call::<_, ()>((arr, event_type_str));
-                    }
-                }
+                let doc_obj = js_try(globals.get::<_, rquickjs::Object>("document"), "document")?;
+                let dispatch_func =
+                    js_try(doc_obj.get::<_, rquickjs::Function>("_triggerEvent"), "_triggerEvent")?;
+                let (idx, generation) = node_id.into_raw_parts();
+                let arr = js_try(rquickjs::Array::new(ctx.clone()), "Array::new")?;
+                js_try(arr.set(0, idx as u64), "event key idx")?;
+                js_try(arr.set(1, generation), "event key gen")?;
+                js_try(
+                    dispatch_func.call::<_, ()>((arr, event_type_str)),
+                    "_triggerEvent call",
+                )?;
+                Ok(())
             });
             self.last_start_time.set(None);
+            res?;
         }
+        Ok(())
     }
-    pub fn new(document: Document) -> Self {
-        let runtime = Runtime::new().unwrap();
-        let context = Context::full(&runtime).unwrap();
+
+    /// Fallible constructor. Prefer this in production so OOM / init failures surface to the host.
+    pub fn try_new(document: Document) -> Result<Self, JsEngineError> {
+        let runtime = Runtime::new()
+            .map_err(|e| JsEngineError::RuntimeInit(format!("{e:?}")))?;
+        let context = Context::full(&runtime)
+            .map_err(|e| JsEngineError::ContextInit(format!("{e:?}")))?;
 
         let last_start_time: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
         {
@@ -197,65 +245,80 @@ impl JsEngine {
             last_start_time,
         };
 
-        engine.init_web_api();
-        engine
+        engine.init_web_api()?;
+        Ok(engine)
     }
 
     /// Exposes Rust functions to the JavaScript global object
-    fn init_web_api(&self) {
+    fn init_web_api(&self) -> Result<(), JsEngineError> {
         let doc_ref = self.document.clone();
         let timer_id_counter = self.next_timer_id.clone();
         let pending_timers = self.pending_timers.clone();
         let active_timers = self.active_timers.clone();
 
-        self.context.with(|ctx| {
+        self.context.with(|ctx| -> Result<(), JsEngineError> {
             let globals = ctx.globals();
 
             // Register the NodeHandle class prototype
-            rquickjs::Class::<NodeHandle>::define(&globals).unwrap();
-            let proto = rquickjs::Class::<NodeHandle>::prototype(&ctx)
-                .unwrap()
-                .unwrap();
+            js_try(rquickjs::Class::<NodeHandle>::define(&globals), "Class::define NodeHandle")?;
+            let proto = js_try(
+                rquickjs::Class::<NodeHandle>::prototype(&ctx),
+                "Class::prototype NodeHandle",
+            )?
+            .ok_or_else(|| {
+                JsEngineError::WebApiInit("Class::prototype NodeHandle returned None".into())
+            })?;
 
-            let tag_name_func = rquickjs::Function::new(ctx.clone(), {
-                let doc_ref = doc_ref.clone();
-                move |This(this): This<rquickjs::Class<'_, NodeHandle>>| -> String {
-                    let doc = doc_ref.borrow();
-                    let node_id = this.borrow().to_node_id();
-                    match doc.nodes.get(node_id) {
-                        Some(crate::dom::Node::Element(data)) => data.tag_name.to_string(),
-                        _ => String::new(),
-                    }
-                }
-            })
-            .unwrap();
-            proto.set("_tagNameRaw", tag_name_func).unwrap();
-
-            let get_attr_func = rquickjs::Function::new(ctx.clone(), {
-                let doc_ref = doc_ref.clone();
-                move |This(this): This<rquickjs::Class<'_, NodeHandle>>,
-                      attr: String|
-                      -> Option<String> {
-                    let doc = doc_ref.borrow();
-                    let node_id = this.borrow().to_node_id();
-                    if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
-                        for (k, v) in &data.attributes {
-                            if k == &attr {
-                                return Some(v.clone());
-                            }
+            let tag_name_func = js_try(
+                rquickjs::Function::new(ctx.clone(), {
+                    let doc_ref = doc_ref.clone();
+                    move |This(this): This<rquickjs::Class<'_, NodeHandle>>| -> String {
+                        let doc = doc_ref.borrow();
+                        let node_id = this.borrow().to_node_id();
+                        match doc.nodes.get(node_id) {
+                            Some(crate::dom::Node::Element(data)) => data.tag_name.to_string(),
+                            _ => String::new(),
                         }
                     }
-                    None
-                }
-            })
-            .unwrap();
-            proto.set("getAttribute", get_attr_func).unwrap();
+                }),
+                "Function _tagNameRaw",
+            )?;
+            js_try(
+                proto.set("_tagNameRaw", tag_name_func),
+                "proto _tagNameRaw",
+            )?;
 
-            let set_attr_func = rquickjs::Function::new(ctx.clone(), {
-                let doc_ref = doc_ref.clone();
-                move |This(this): This<rquickjs::Class<'_, NodeHandle>>,
-                      key: String,
-                      mut value: String| {
+            let get_attr_func = js_try(
+                rquickjs::Function::new(ctx.clone(), {
+                    let doc_ref = doc_ref.clone();
+                    move |This(this): This<rquickjs::Class<'_, NodeHandle>>,
+                          attr: String|
+                          -> Option<String> {
+                        let doc = doc_ref.borrow();
+                        let node_id = this.borrow().to_node_id();
+                        if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
+                            for (k, v) in &data.attributes {
+                                if k == &attr {
+                                    return Some(v.clone());
+                                }
+                            }
+                        }
+                        None
+                    }
+                }),
+                "Function getAttribute",
+            )?;
+            js_try(
+                proto.set("getAttribute", get_attr_func),
+                "proto getAttribute",
+            )?;
+
+            let set_attr_func = js_try(
+                rquickjs::Function::new(ctx.clone(), {
+                    let doc_ref = doc_ref.clone();
+                    move |This(this): This<rquickjs::Class<'_, NodeHandle>>,
+                          key: String,
+                          mut value: String| {
                     if value.len() > crate::dom::MAX_ATTRIBUTE_VALUE_LEN {
                         value.truncate(crate::dom::MAX_ATTRIBUTE_VALUE_LEN);
                     }
@@ -278,12 +341,10 @@ impl JsEngine {
                         }
                     }
 
-                    let mut needs_style_recompute = false;
                     if is_class {
                         if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
                             data.classes = value.clone();
-                            needs_style_recompute = true;
-                            
+
                             // Also update attributes vector for consistency with getAttribute
                             let mut found = false;
                             for (k, v) in data.attributes.iter_mut() {
@@ -301,7 +362,6 @@ impl JsEngine {
                         let decls = crate::css::parse_inline_declarations(&value);
                         if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
                             data.cached_inline_styles = Some(decls.into_iter().map(|d| (d.name, d.value)).collect());
-                            needs_style_recompute = true;
 
                             // Also update attributes vector
                             let mut found = false;
@@ -345,24 +405,34 @@ impl JsEngine {
 
                     doc.dirty = true;
                 }
-            })
-            .unwrap();
-            proto.set("setAttribute", set_attr_func).unwrap();
+                }),
+                "Function setAttribute",
+            )?;
+            js_try(
+                proto.set("setAttribute", set_attr_func),
+                "proto setAttribute",
+            )?;
 
-            let remove_child_func = rquickjs::Function::new(ctx.clone(), {
-                let doc_ref = doc_ref.clone();
-                move |This(this): This<rquickjs::Class<'_, NodeHandle>>,
-                      child: rquickjs::Class<'_, NodeHandle>| {
-                    let mut doc = doc_ref.borrow_mut();
-                    let parent_id = this.borrow().to_node_id();
-                    let child_id = child.borrow().to_node_id();
-                    doc.remove_child(parent_id, child_id);
-                }
-            })
-            .unwrap();
-            proto.set("removeChild", remove_child_func).unwrap();
+            let remove_child_func = js_try(
+                rquickjs::Function::new(ctx.clone(), {
+                    let doc_ref = doc_ref.clone();
+                    move |This(this): This<rquickjs::Class<'_, NodeHandle>>,
+                          child: rquickjs::Class<'_, NodeHandle>| {
+                        let mut doc = doc_ref.borrow_mut();
+                        let parent_id = this.borrow().to_node_id();
+                        let child_id = child.borrow().to_node_id();
+                        doc.remove_child(parent_id, child_id);
+                    }
+                }),
+                "Function removeChild",
+            )?;
+            js_try(
+                proto.set("removeChild", remove_child_func),
+                "proto removeChild",
+            )?;
 
-            let parent_node_func = rquickjs::Function::new(ctx.clone(), {
+            let parent_node_func = js_try(
+                rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
                 move |This(this): This<rquickjs::Class<'_, NodeHandle>>| -> Option<NodeHandle> {
                     let mut doc = doc_ref.borrow_mut();
@@ -379,11 +449,16 @@ impl JsEngine {
                     }
                     None
                 }
-            })
-            .unwrap();
-            proto.set("_parentNodeRaw", parent_node_func).unwrap();
+                }),
+                "Function _parentNodeRaw",
+            )?;
+            js_try(
+                proto.set("_parentNodeRaw", parent_node_func),
+                "proto _parentNodeRaw",
+            )?;
 
-            let first_child_func = rquickjs::Function::new(ctx.clone(), {
+            let first_child_func = js_try(
+                rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
                 move |This(this): This<rquickjs::Class<'_, NodeHandle>>| -> Option<NodeHandle> {
                     let mut doc = doc_ref.borrow_mut();
@@ -400,11 +475,16 @@ impl JsEngine {
                     }
                     None
                 }
-            })
-            .unwrap();
-            proto.set("_firstChildRaw", first_child_func).unwrap();
+                }),
+                "Function _firstChildRaw",
+            )?;
+            js_try(
+                proto.set("_firstChildRaw", first_child_func),
+                "proto _firstChildRaw",
+            )?;
 
-            let next_sibling_func = rquickjs::Function::new(ctx.clone(), {
+            let next_sibling_func = js_try(
+                rquickjs::Function::new(ctx.clone(), {
                 let doc_ref = doc_ref.clone();
                 move |This(this): This<rquickjs::Class<'_, NodeHandle>>| -> Option<NodeHandle> {
                     let mut doc = doc_ref.borrow_mut();
@@ -421,60 +501,75 @@ impl JsEngine {
                     }
                     None
                 }
-            })
-            .unwrap();
-            proto.set("_nextSiblingRaw", next_sibling_func).unwrap();
+                }),
+                "Function _nextSiblingRaw",
+            )?;
+            js_try(
+                proto.set("_nextSiblingRaw", next_sibling_func),
+                "proto _nextSiblingRaw",
+            )?;
 
             // --- console object ---
-            let console_obj = rquickjs::Object::new(ctx.clone()).unwrap();
+            let console_obj = js_try(rquickjs::Object::new(ctx.clone()), "console Object::new")?;
 
-            let log_func = rquickjs::Function::new(ctx.clone(), |msg: String| {
-                println!("[JS console.log] {}", msg);
-            })
-            .unwrap();
-            console_obj.set("log", log_func).unwrap();
+            let log_func = js_try(
+                rquickjs::Function::new(ctx.clone(), |msg: String| {
+                    println!("[JS console.log] {}", msg);
+                }),
+                "console.log",
+            )?;
+            js_try(console_obj.set("log", log_func), "console set log")?;
 
-            let warn_func = rquickjs::Function::new(ctx.clone(), |msg: String| {
-                println!("[JS console.warn] {}", msg);
-            })
-            .unwrap();
-            console_obj.set("warn", warn_func).unwrap();
+            let warn_func = js_try(
+                rquickjs::Function::new(ctx.clone(), |msg: String| {
+                    println!("[JS console.warn] {}", msg);
+                }),
+                "console.warn",
+            )?;
+            js_try(console_obj.set("warn", warn_func), "console set warn")?;
 
-            let error_func = rquickjs::Function::new(ctx.clone(), |msg: String| {
-                println!("[JS console.error] {}", msg);
-            })
-            .unwrap();
-            console_obj.set("error", error_func).unwrap();
+            let error_func = js_try(
+                rquickjs::Function::new(ctx.clone(), |msg: String| {
+                    println!("[JS console.error] {}", msg);
+                }),
+                "console.error",
+            )?;
+            js_try(console_obj.set("error", error_func), "console set error")?;
 
-            globals.set("console", console_obj).unwrap();
+            js_try(globals.set("console", console_obj), "globals console")?;
 
             // --- document object ---
-            let document_obj = rquickjs::Object::new(ctx.clone()).unwrap();
+            let document_obj =
+                js_try(rquickjs::Object::new(ctx.clone()), "document Object::new")?;
 
             // Native lookup helpers; wrapped below with JS-side identity cache
-            let get_by_id_func = rquickjs::Function::new(ctx.clone(), {
-                let doc_ref = doc_ref.clone();
-                move |id: String| -> Option<NodeHandle> {
-                    let mut doc = doc_ref.borrow_mut();
-                    if let Some(&node_id) = doc.id_map.get(&id) {
-                        if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
-                            data.js_handles += 1;
-                            return Some(NodeHandle::from_node_id(node_id));
+            let get_by_id_func = js_try(
+                rquickjs::Function::new(ctx.clone(), {
+                    let doc_ref = doc_ref.clone();
+                    move |id: String| -> Option<NodeHandle> {
+                        let mut doc = doc_ref.borrow_mut();
+                        if let Some(&node_id) = doc.id_map.get(&id) {
+                            if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
+                                data.js_handles += 1;
+                                return Some(NodeHandle::from_node_id(node_id));
+                            }
                         }
+                        None
                     }
-                    None
-                }
-            })
-            .unwrap();
+                }),
+                "Function _getElementByIdRaw",
+            )?;
 
-            document_obj
-                .set("_getElementByIdRaw", get_by_id_func)
-                .unwrap();
+            js_try(
+                document_obj.set("_getElementByIdRaw", get_by_id_func),
+                "document _getElementByIdRaw",
+            )?;
 
             // querySelector: returns a NodeHandle JS object or null
-            let query_selector_func = rquickjs::Function::new(ctx.clone(), {
-                let doc_ref = doc_ref.clone();
-                move |selector: String| -> Option<NodeHandle> {
+            let query_selector_func = js_try(
+                rquickjs::Function::new(ctx.clone(), {
+                    let doc_ref = doc_ref.clone();
+                    move |selector: String| -> Option<NodeHandle> {
                     let mut doc = doc_ref.borrow_mut();
                     let root_id = doc.root_id;
 
@@ -549,74 +644,93 @@ impl JsEngine {
                     }
                     None
                 }
-            })
-            .unwrap();
+                }),
+                "Function _querySelectorRaw",
+            )?;
 
-            document_obj
-                .set("_querySelectorRaw", query_selector_func)
-                .unwrap();
+            js_try(
+                document_obj.set("_querySelectorRaw", query_selector_func),
+                "document _querySelectorRaw",
+            )?;
 
             // addEventListener is implemented via JS polyfill on the Prototype now
 
             // createElement: creates an unattached node, returns a NodeHandle JS object
-            let create_element_func = rquickjs::Function::new(ctx.clone(), {
-                let doc_ref = doc_ref.clone();
-                move |tag_name: String| -> NodeHandle {
-                    let mut doc = doc_ref.borrow_mut();
-                    let safe_tag = tag_name.to_lowercase();
-                    let local_name = crate::dom::LocalName::new(&safe_tag);
+            let create_element_func = js_try(
+                rquickjs::Function::new(ctx.clone(), {
+                    let doc_ref = doc_ref.clone();
+                    move |tag_name: String| -> NodeHandle {
+                        let mut doc = doc_ref.borrow_mut();
+                        let safe_tag = tag_name.to_lowercase();
+                        let local_name = crate::dom::LocalName::new(&safe_tag);
 
-                    let mut data = crate::dom::ElementData::new(local_name.clone());
-                    data.js_handles = 1; // Start with 1 as we return it to JS
-                    let index = doc.add_node(crate::dom::Node::Element(data));
-                    drop(doc);
+                        let mut data = crate::dom::ElementData::new(local_name.clone());
+                        data.js_handles = 1; // Start with 1 as we return it to JS
+                        let index = doc.add_node(crate::dom::Node::Element(data));
+                        drop(doc);
 
-                    NodeHandle::from_node_id(index)
-                }
-            })
-            .unwrap();
-            document_obj
-                .set("_createElementRaw", create_element_func)
-                .unwrap();
+                        NodeHandle::from_node_id(index)
+                    }
+                }),
+                "Function _createElementRaw",
+            )?;
+            js_try(
+                document_obj.set("_createElementRaw", create_element_func),
+                "document _createElementRaw",
+            )?;
 
             // appendChild: accepts two NodeHandle objects (no string parsing)
-            let append_child_func = rquickjs::Function::new(ctx.clone(), {
-                let doc_ref = doc_ref.clone();
-                move |parent_cls: rquickjs::Class<'_, NodeHandle>,
-                      child_cls: rquickjs::Class<'_, NodeHandle>| {
-                    let parent_id = parent_cls.borrow().to_node_id();
-                    let child_id = child_cls.borrow().to_node_id();
-                    let mut doc = doc_ref.borrow_mut();
-                    doc.append_child(parent_id, child_id);
-                }
-            })
-            .unwrap();
-            document_obj.set("appendChild", append_child_func).unwrap();
+            let append_child_func = js_try(
+                rquickjs::Function::new(ctx.clone(), {
+                    let doc_ref = doc_ref.clone();
+                    move |parent_cls: rquickjs::Class<'_, NodeHandle>,
+                          child_cls: rquickjs::Class<'_, NodeHandle>| {
+                        let parent_id = parent_cls.borrow().to_node_id();
+                        let child_id = child_cls.borrow().to_node_id();
+                        let mut doc = doc_ref.borrow_mut();
+                        doc.append_child(parent_id, child_id);
+                    }
+                }),
+                "Function appendChild",
+            )?;
+            js_try(
+                document_obj.set("appendChild", append_child_func),
+                "document appendChild",
+            )?;
 
             // _garbageCollectNodeRaw: invoked natively by JS FinalizationRegistry
-            let gc_func = rquickjs::Function::new(ctx.clone(), {
-                let doc_ref = doc_ref.clone();
-                move |node_key: rquickjs::Array<'_>| {
-                    if let (Ok(idx), Ok(gen_val)) = (node_key.get::<u32>(0), node_key.get::<u64>(1))
-                    {
-                        let node_id = NodeId::from_raw_parts(idx as usize, gen_val);
-                        let mut doc = doc_ref.borrow_mut();
-                        doc.try_cleanup_node(node_id);
+            let gc_func = js_try(
+                rquickjs::Function::new(ctx.clone(), {
+                    let doc_ref = doc_ref.clone();
+                    move |node_key: rquickjs::Array<'_>| {
+                        if let (Ok(idx), Ok(gen_val)) =
+                            (node_key.get::<u32>(0), node_key.get::<u64>(1))
+                        {
+                            let node_id = NodeId::from_raw_parts(idx as usize, gen_val);
+                            let mut doc = doc_ref.borrow_mut();
+                            doc.try_cleanup_node(node_id);
+                        }
                     }
-                }
-            })
-            .unwrap();
-            document_obj.set("_garbageCollectNodeRaw", gc_func).unwrap();
+                }),
+                "Function _garbageCollectNodeRaw",
+            )?;
+            js_try(
+                document_obj.set("_garbageCollectNodeRaw", gc_func),
+                "document _garbageCollectNodeRaw",
+            )?;
 
-            globals.set("document", document_obj).unwrap();
+            js_try(globals.set("document", document_obj), "globals document")?;
 
-            let _: () = ctx
-                .eval(
+            let _: () = js_try(
+                ctx.eval(
                     r#"
                 document.__nodeCache = new Map();
                 document.__nodeRegistry = new FinalizationRegistry(key => {
                     let mapKey = BigInt(key[0]) | (BigInt(key[1]) << 32n);
                     document.__nodeCache.delete(mapKey);
+                    document._garbageCollectNodeRaw(key);
+                });
+                document.__ephemeralRegistry = new FinalizationRegistry(key => {
                     document._garbageCollectNodeRaw(key);
                 });
 
@@ -628,8 +742,7 @@ impl JsEngine {
                     if (cachedRef) {
                         let cachedObj = cachedRef.deref();
                         if (cachedObj) {
-                            // Leak fix: manually decrement Rust refcount for the discarded new handle
-                            document._garbageCollectNodeRaw(keyPair);
+                            document.__ephemeralRegistry.register(rawNode, keyPair);
                             return cachedObj;
                         }
                     }
@@ -664,11 +777,13 @@ impl JsEngine {
                     }
                 };
             "#,
-                )
-                .unwrap();
+                ),
+                "ctx.eval bootstrap",
+            )?;
 
-            let patch_func: rquickjs::Function = ctx.eval(
-                r#"
+            let patch_func: rquickjs::Function = js_try(
+                ctx.eval(
+                    r#"
                 (function(proto) {
                     Object.defineProperty(proto, "parentNode", { get() { return document._wrapNode(this._parentNodeRaw()); } });
                     Object.defineProperty(proto, "firstChild", { get() { return document._wrapNode(this._firstChildRaw()); } });
@@ -681,11 +796,17 @@ impl JsEngine {
                     };
                 })
                 "#,
-            ).unwrap();
-            let _: () = patch_func.call((proto.clone(),)).unwrap();
+                ),
+                "ctx.eval prototype patch",
+            )?;
+            js_try(
+                patch_func.call::<_, ()>((proto.clone(),)),
+                "patch_func.call",
+            )?;
 
             // --- setTimeout with Persistent<Function> storage ---
-            let set_timeout_func = rquickjs::Function::new(ctx.clone(), {
+            let set_timeout_func = js_try(
+                rquickjs::Function::new(ctx.clone(), {
                 let timer_id_counter = timer_id_counter.clone();
                 let pending_timers = pending_timers.clone();
                 let active_timers = active_timers.clone();
@@ -708,10 +829,12 @@ impl JsEngine {
 
                     timer_id
                 }
-            })
-            .unwrap();
+                }),
+                "setTimeout",
+            )?;
 
-            let set_interval_func = rquickjs::Function::new(ctx.clone(), {
+            let set_interval_func = js_try(
+                rquickjs::Function::new(ctx.clone(), {
                 let timer_id_counter = timer_id_counter.clone();
                 let pending_timers = pending_timers.clone();
                 let active_timers = active_timers.clone();
@@ -734,24 +857,38 @@ impl JsEngine {
 
                     timer_id
                 }
-            })
-            .unwrap();
+                }),
+                "setInterval",
+            )?;
 
-            let clear_timer_func = rquickjs::Function::new(ctx.clone(), {
-                let active_timers = active_timers.clone();
-                move |id: u32| {
-                    active_timers.borrow_mut().remove(&id);
-                }
-            })
-            .unwrap();
+            let clear_timer_func = js_try(
+                rquickjs::Function::new(ctx.clone(), {
+                    let active_timers = active_timers.clone();
+                    move |id: u32| {
+                        active_timers.borrow_mut().remove(&id);
+                    }
+                }),
+                "clearTimer",
+            )?;
 
-            globals.set("setTimeout", set_timeout_func).unwrap();
-            globals.set("setInterval", set_interval_func).unwrap();
-            globals
-                .set("clearTimeout", clear_timer_func.clone())
-                .unwrap();
-            globals.set("clearInterval", clear_timer_func).unwrap();
-        });
+            js_try(
+                globals.set("setTimeout", set_timeout_func),
+                "globals setTimeout",
+            )?;
+            js_try(
+                globals.set("setInterval", set_interval_func),
+                "globals setInterval",
+            )?;
+            js_try(
+                globals.set("clearTimeout", clear_timer_func.clone()),
+                "globals clearTimeout",
+            )?;
+            js_try(
+                globals.set("clearInterval", clear_timer_func),
+                "globals clearInterval",
+            )?;
+            Ok(())
+        })
     }
 
     /// Pump the timer queue. Fires all expired timers whose delay has elapsed.
@@ -841,31 +978,30 @@ impl JsEngine {
         !timers.is_empty()
     }
 
-    /// Evaluates a JavaScript string and returns any string result or errors
-    pub fn execute_script(&self, script: &str) -> String {
+    /// Evaluates a JavaScript string. After successful [`JsEngine::try_new`], this is the
+    /// primary API for running scripts; failures surface as [`JsEngineError::ScriptEval`].
+    pub fn execute_script(&self, script: &str) -> Result<String, JsEngineError> {
         self.last_start_time.set(Some(Instant::now()));
-        let res = self.context
-            .with(|ctx| match ctx.eval::<rquickjs::Value, _>(script) {
-                Ok(result) => {
-                    if let Ok(s) = result.get::<rquickjs::String>() {
-                        s.to_string()
-                            .unwrap_or_else(|_| "Error formatting string".to_string())
-                    } else if let Ok(i) = result.get::<i32>() {
-                        i.to_string()
-                    } else if let Ok(f) = result.get::<f64>() {
-                        f.to_string()
-                    } else if let Ok(b) = result.get::<bool>() {
-                        b.to_string()
-                    } else if result.is_undefined() {
-                        "undefined".to_string()
-                    } else if result.is_null() {
-                        "null".to_string()
-                    } else {
-                        "[Object/Unsupported]".to_string()
-                    }
-                }
-                Err(e) => format!("JS Error: {:?}", e),
-            });
+        let res = self.context.with(|ctx| {
+            let result = ctx
+                .eval::<rquickjs::Value, _>(script)
+                .map_err(|e| JsEngineError::ScriptEval(format!("{e:?}")))?;
+            if let Ok(s) = result.get::<rquickjs::String>() {
+                Ok(s.to_string().unwrap_or_else(|_| "Error formatting string".to_string()))
+            } else if let Ok(i) = result.get::<i32>() {
+                Ok(i.to_string())
+            } else if let Ok(f) = result.get::<f64>() {
+                Ok(f.to_string())
+            } else if let Ok(b) = result.get::<bool>() {
+                Ok(b.to_string())
+            } else if result.is_undefined() {
+                Ok("undefined".into())
+            } else if result.is_null() {
+                Ok("null".into())
+            } else {
+                Ok("[Object/Unsupported]".into())
+            }
+        });
         self.last_start_time.set(None);
         res
     }

@@ -98,26 +98,28 @@ Generational indices prevent ABA problems. The DOM tree is wired as an intrusive
 
 ### ComputedStyle (dom/mod.rs)
 
-```
+```rust
 ComputedStyle {
-    display:       taffy::style::Display,       // native Taffy enum: Block, Flex, Grid, None
-    flex_direction: taffy::style::FlexDirection, // native Taffy enum: Row, Column, etc.
-    align_items:    Option<taffy::style::AlignItems>, // native Taffy enum: Stretch, Center, etc.
-    justify_content: Option<taffy::style::JustifyContent>, // native Taffy enum: Center, SpaceBetween, etc.
-    flex_wrap:      taffy::style::FlexWrap,     // native Taffy enum: Wrap, NoWrap
-    width:         StyleValue,
-    height:        StyleValue,
-    margin:        [StyleValue; 4],    // top, right, bottom, left (Inline for cache locality)
-    padding:       [StyleValue; 4],
-    border_width:  [StyleValue; 4],
-    bg_color:      Option<(u8, u8, u8, u8)>,
-    border_color:  Option<(u8, u8, u8, u8)>,
-    font_size:     f32,                // absolute pixels, resolved during cascade
-    color:         (u8, u8, u8, u8),
+    display: DisplayKeyword, // local enum: Block, Inline, InlineBlock, Flex, Grid, None, ListItem
+    flex_direction: FlexDirectionKeyword, // local enum: Row, Column
+    align_items: AlignItemsKeyword, // local enum: FlexStart, FlexEnd, Center, Baseline, Stretch
+    justify_content: JustifyContentKeyword, // local enum: FlexStart, FlexEnd, Center, SpaceBetween, SpaceAround, SpaceEvenly
+    flex_wrap: FlexWrapKeyword, // local enum: Wrap, WrapReverse, NoWrap
+    width: StyleValue,
+    height: StyleValue,
+    margin: [StyleValue; 4], // top, right, bottom, left (Inline for cache locality)
+    padding: [StyleValue; 4],
+    border_width: [StyleValue; 4],
+    bg_color: Option<(u8, u8, u8, u8)>,
+    border_color: Option<(u8, u8, u8, u8)>,
+    font_size: f32, // absolute pixels, resolved during cascade
+    color: (u8, u8, u8, u8),
 }
 ```
 
-`ComputedStyle` is stored directly inside `ElementData` and `TextData`. It is populated once during `css::compute_styles()` and read by both `layout::compute_layout()` and `render::draw_layout_tree()`. Storage is inline to prioritize L1 cache locality and avoid the CPU overhead of deep-hashing styles for deduplication. There is no intermediate styled-node tree built per frame.
+`TextData` uses a lightweight `TextComputedStyle` struct (only `font_size` and `color`) instead of the full `ComputedStyle`, since text nodes do not have box layout properties.
+
+`ComputedStyle` is stored directly inside `ElementData`. It is populated once during `css::compute_styles()` and read by both `layout::compute_layout()` and `render::draw_layout_tree()`. Storage is inline to prioritize L1 cache locality and avoid the CPU overhead of deep-hashing styles for deduplication. There is no intermediate styled-node tree built per frame.
 
 `StyleValue` is:
 
@@ -127,7 +129,7 @@ StyleValue = LengthPx(f32) | Percent(f32) | ViewportWidth(f32) | ViewportHeight(
            | Color(u8, u8, u8, u8) | Auto | None
 ```
 
-`Em` and `Rem` are stored as-is in most properties and resolved to absolute pixels in `layout/mod.rs` using the element's `font_size`. For `font-size` itself, `Em` is resolved during the cascade by multiplying against the parent element's `font_size`; `Rem` resolves against `Document.root_font_size` (defaults to 16px, configurable by the host).
+`Em` is stored as-is in most properties and resolved to absolute pixels during the cascade using the element's `font_size`. `Rem` is also stored as-is but resolves against `Document.root_font_size` (defaults to 16px, configurable by the host) rather than the element's font_size. For `font-size` itself, `Em` is resolved during the cascade by multiplying against the parent element's `font_size`; `Rem` resolves against `Document.root_font_size`.
 
 ### StyleSheet (css/mod.rs)
 

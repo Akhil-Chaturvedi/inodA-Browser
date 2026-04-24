@@ -231,13 +231,57 @@ impl PropertyName {
         matches!(
             self,
             PropertyName::Color
-                | PropertyName::FontFamily
-                | PropertyName::FontSize
-                | PropertyName::FontWeight
-                | PropertyName::LineHeight
-                | PropertyName::TextAlign
-                | PropertyName::Visibility
+            | PropertyName::FontFamily
+            | PropertyName::FontSize
+            | PropertyName::FontWeight
+            | PropertyName::LineHeight
+            | PropertyName::TextAlign
+            | PropertyName::Visibility
         )
+    }
+
+    /// Returns the CSS property name string (kebab-case) for this variant.
+    /// Used by `getAttribute("style")` to reconstruct inline style text.
+    pub fn to_string(self) -> String {
+        match self {
+            PropertyName::Display => "display",
+            PropertyName::FlexDirection => "flex-direction",
+            PropertyName::Width => "width",
+            PropertyName::Height => "height",
+            PropertyName::MarginTop => "margin-top",
+            PropertyName::MarginRight => "margin-right",
+            PropertyName::MarginBottom => "margin-bottom",
+            PropertyName::MarginLeft => "margin-left",
+            PropertyName::PaddingTop => "padding-top",
+            PropertyName::PaddingRight => "padding-right",
+            PropertyName::PaddingBottom => "padding-bottom",
+            PropertyName::PaddingLeft => "padding-left",
+            PropertyName::BorderTopWidth => "border-top-width",
+            PropertyName::BorderRightWidth => "border-right-width",
+            PropertyName::BorderBottomWidth => "border-bottom-width",
+            PropertyName::BorderLeftWidth => "border-left-width",
+            PropertyName::BackgroundColor => "background-color",
+            PropertyName::BorderColor => "border-color",
+            PropertyName::Color => "color",
+            PropertyName::FontSize => "font-size",
+            PropertyName::FontFamily => "font-family",
+            PropertyName::FontWeight => "font-weight",
+            PropertyName::LineHeight => "line-height",
+            PropertyName::TextAlign => "text-align",
+            PropertyName::Visibility => "visibility",
+            PropertyName::AlignItems => "align-items",
+            PropertyName::JustifyContent => "justify-content",
+            PropertyName::FlexWrap => "flex-wrap",
+            PropertyName::FlexGrow => "flex-grow",
+            PropertyName::FlexShrink => "flex-shrink",
+            PropertyName::RowGap => "row-gap",
+            PropertyName::ColumnGap => "column-gap",
+            PropertyName::MinWidth => "min-width",
+            PropertyName::MaxWidth => "max-width",
+            PropertyName::MinHeight => "min-height",
+            PropertyName::MaxHeight => "max-height",
+        }
+        .to_string()
     }
 }
 
@@ -290,7 +334,11 @@ pub struct TextData {
     pub parent: Option<NodeId>,
     pub prev_sibling: Option<NodeId>,
     pub next_sibling: Option<NodeId>,
-    pub computed: ComputedStyle,
+    /// Lightweight computed style for text nodes — only carries the two
+    /// inheritable properties that layout and rendering actually read
+    /// (`font_size`, `color`).  Avoids allocating the full 36-field
+    /// `ComputedStyle` struct for every text node in the document.
+    pub computed: TextComputedStyle,
     pub taffy_node: Option<taffy::NodeId>,
     pub js_handles: usize,
     /// Set true when text content changes, triggering a re-shape.
@@ -306,7 +354,7 @@ impl TextData {
             parent: None,
             prev_sibling: None,
             next_sibling: None,
-            computed: ComputedStyle::default(),
+            computed: TextComputedStyle::default(),
             taffy_node: None,
             js_handles: 0,
             layout_dirty: false,
@@ -427,6 +475,38 @@ impl Default for ComputedStyle {
             color: (0, 0, 0, 255),
             flex_grow: 0.0,
             flex_shrink: 1.0,
+        }
+    }
+}
+
+/// Lightweight computed style for text nodes.  Text nodes only carry the two
+/// inheritable properties that layout and rendering actually read (`font_size`
+/// and `color`), avoiding the 36-field `ComputedStyle` overhead for every text
+/// node in the document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextComputedStyle {
+    pub font_size: f32,
+    pub color: (u8, u8, u8, u8),
+}
+
+impl Eq for TextComputedStyle {}
+
+impl Default for TextComputedStyle {
+    fn default() -> Self {
+        TextComputedStyle {
+            font_size: 16.0,
+            color: (0, 0, 0, 255),
+        }
+    }
+}
+
+impl TextComputedStyle {
+    /// Construct from the inheritable fields of a parent `ComputedStyle`.
+    /// Used by the cascade to propagate inherited values into text nodes.
+    pub fn from_computed(src: &ComputedStyle) -> Self {
+        TextComputedStyle {
+            font_size: src.font_size,
+            color: src.color,
         }
     }
 }

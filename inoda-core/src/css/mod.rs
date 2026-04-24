@@ -778,20 +778,30 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
             }
         }
 
+        // --- Element path: full ComputedStyle cascade ---
+        // Text nodes use a lightweight TextComputedStyle (only font_size + color).
+        // We track both in parallel so that the shared_style pushed to children
+        // always carries the full ComputedStyle regardless of the current node type.
+        let _is_text = matches!(node, crate::dom::Node::Text(_));
+    
         let mut next_computed = crate::dom::ComputedStyle::default();
+        let mut next_text_computed = crate::dom::TextComputedStyle::default();
+    
         if !must_rematch {
             match node {
                 crate::dom::Node::Element(data) => next_computed = data.computed.clone(),
-                crate::dom::Node::Text(data) => next_computed = data.computed.clone(),
+                crate::dom::Node::Text(data) => next_text_computed = data.computed.clone(),
                 _ => {}
             }
         }
-
+    
         // Default to inheriting from parent if possible
         if must_rematch || parent_inheritable_changed {
             if let Some(pc) = &parent_computed {
                 next_computed.font_size = pc.font_size;
                 next_computed.color = pc.color;
+                next_text_computed.font_size = pc.font_size;
+                next_text_computed.color = pc.color;
             }
         }
 
@@ -834,13 +844,28 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
                             15 => next_computed.border_width[3] = val.clone(),
                             16 => if let crate::dom::StyleValue::Color(r, g, b, a) = val { next_computed.bg_color = Some((*r, *g, *b, *a)); },
                             17 => if let crate::dom::StyleValue::Color(r, g, b, a) = val { next_computed.border_color = Some((*r, *g, *b, *a)); },
-                            18 => if let crate::dom::StyleValue::Color(r, g, b, a) = val { next_computed.color = (*r, *g, *b, *a); },
+                            18 => if let crate::dom::StyleValue::Color(r, g, b, a) = val {
+                                next_computed.color = (*r, *g, *b, *a);
+                                next_text_computed.color = (*r, *g, *b, *a);
+                            },
                             19 => {
                                 match val {
-                                    crate::dom::StyleValue::LengthPx(px) => next_computed.font_size = *px,
-                                    crate::dom::StyleValue::Number(num) => next_computed.font_size = *num,
-                                    crate::dom::StyleValue::Em(num) => next_computed.font_size = num * parent_font_size,
-                                    crate::dom::StyleValue::Rem(num) => next_computed.font_size = num * document.root_font_size,
+                                    crate::dom::StyleValue::LengthPx(px) => {
+                                        next_computed.font_size = *px;
+                                        next_text_computed.font_size = *px;
+                                    }
+                                    crate::dom::StyleValue::Number(num) => {
+                                        next_computed.font_size = *num;
+                                        next_text_computed.font_size = *num;
+                                    }
+                                    crate::dom::StyleValue::Em(num) => {
+                                        next_computed.font_size = num * parent_font_size;
+                                        next_text_computed.font_size = num * parent_font_size;
+                                    }
+                                    crate::dom::StyleValue::Rem(num) => {
+                                        next_computed.font_size = num * document.root_font_size;
+                                        next_text_computed.font_size = num * document.root_font_size;
+                                    }
                                     _ => {}
                                 }
                             }
@@ -887,6 +912,7 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
             
             if next_computed.font_size == 0.0 {
                 next_computed.font_size = 16.0;
+                next_text_computed.font_size = 16.0;
             }
         }
 
@@ -905,11 +931,11 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
                     data.styles_dirty = false;
                 }
                 crate::dom::Node::Text(data) => {
-                    if data.computed != next_computed {
-                        if data.computed.font_size != next_computed.font_size || data.computed.color != next_computed.color {
+                    if data.computed != next_text_computed {
+                        if data.computed.font_size != next_text_computed.font_size || data.computed.color != next_text_computed.color {
                             next_inheritable_changed = true;
                         }
-                        data.computed = next_computed.clone();
+                        data.computed = next_text_computed.clone();
                         data.layout_dirty = true;
                     }
                     data.styles_dirty = false;

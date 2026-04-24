@@ -16,24 +16,23 @@ Early development. The engine can parse simple pages, apply stylesheets, lay out
 | `cssparser`          | 0.36    | Mozilla CSS tokenizer (same one Servo uses)    |
 | `cosmic-text`        | 0.12    | Font shaping and wrapped text measurement      |
 | `taffy`              | 0.9     | Flexbox and CSS Grid layout algorithm          |
-| `rquickjs`           | 0.11    | QuickJS JavaScript engine bindings             |
-| `generational-arena` | 0.2     | Generational index arena for the DOM           |
-| `string_cache`       | 0.9     | Atom string interning for HTML tag names       |
-| `once_cell`          | 1.19    | Static initialization for layout fallback data |
-| `phf`                | 0.11    | Compile-time HTML tag-name set for `LocalName` |
+| `rquickjs` | 0.11 | QuickJS JavaScript engine bindings |
+| `generational-arena` | 0.2 | Generational index arena for the DOM |
+| `string_cache` | 0.9 | Atom string interning for HTML tag names |
+| `phf` | 0.11 | Compile-time HTML tag-name set for `LocalName` |
 | `criterion`          | 0.5     | (dev) Benchmark harness for cascade / layout / JS |
 
 ## Module overview
 
 ```
 src/
-  lib.rs        -- crate root, re-exports modules, integration tests
-  dom/mod.rs    -- generational arena DOM: Document, Node, ElementData, ComputedStyle
-  html/mod.rs   -- html5gum token loop, streams HTML into the arena
-  css/mod.rs    -- CSS parser, specificity, cascade, inheritance, shorthand expansion
+  lib.rs -- crate root, re-exports modules, integration tests
+  dom/mod.rs -- generational arena DOM: Document, Node, ElementData, TextData, ComputedStyle, TextComputedStyle
+  html/mod.rs -- html5gum token loop, streams HTML into the arena
+  css/mod.rs -- CSS parser, specificity, cascade, inheritance, shorthand expansion
   layout/mod.rs -- arena DOM -> TaffyTree builder, text buffer pre-population, dimension parsing
   render/mod.rs -- Taffy layout + arena DOM -> renderer backend draw calls
-  js/mod.rs     -- QuickJS runtime with document.*, console.*, cooperative timers
+  js/mod.rs -- QuickJS runtime with document.*, console.*, cooperative timers
 ```
 
 ### dom
@@ -44,7 +43,7 @@ Tag names are stored as `LocalName`, which is either `Standard(DefaultAtom)` for
 
 Attribute keys and values are stored as `String`. To prevent OOM attacks from unbounded attribute names, interning into the global `DefaultAtom` pool is intentionally avoided for attributes. For security, a limit of `MAX_ATTRIBUTES` (32) is enforced during both HTML parsing and JS `setAttribute` calls. This ensures that memory consumption scales linearly with the DOM size and is fully reclaimed upon node destruction. IDs are also stored as `String` and indexed in an $O(1)$ `id_map`.
 
-`ComputedStyle` is stored directly inside `ElementData` and `TextData` for optimal L1 cache locality. It is populated once by `css::compute_styles()` during the cascade; layout and rendering read from these resolved fields without scanning style tuples. Storage is inline to eliminate the CPU overhead of deep-hashing style objects for deduplication.
+`ComputedStyle` is stored directly inside `ElementData` for optimal L1 cache locality. It uses local enums (`DisplayKeyword`, `FlexDirectionKeyword`, `AlignItemsKeyword`, `JustifyContentKeyword`, `FlexWrapKeyword`) rather than Taffy-native types. `TextData` uses a lightweight `TextComputedStyle` struct containing only `font_size` and `color`, since text nodes do not have box layout properties. Both styles are populated once by `css::compute_styles()` during the cascade; layout and rendering read from these resolved fields without scanning style tuples. Storage is inline to eliminate the CPU overhead of deep-hashing style objects for deduplication.
 
 `Document` fields:
 - `nodes: Arena<Node>` -- the arena
@@ -65,7 +64,7 @@ Content inside `<script>` and `<style>` is accumulated as raw text via an `insid
 
 - Parses CSS text into a `StyleSheet` containing pre-parsed `ComplexSelector` ASTs.
 - Property values are parsed into typed `StyleValue` enums (`LengthPx`, `Percent`, `ViewportWidth`, `ViewportHeight`, `Em`, `Rem`, `Color`, `Keyword`, `Number`, `Auto`, `None`) during the cascade. Layout and rendering operate on these enum variants, not strings.
-- Property names in `Declaration` use `PropertyName`, a strongly-typed enum (`Display`, `Width`, `MarginTop`, `FontSize`, etc.). `PropertyName::from_str` returns `Option<PropertyName>`; unrecognized property names return `None` and are discarded during the cascade. Layout-critical keyword values (e.g. `flex`, `column`, `stretch`) resolve to native Taffy enums in `ComputedStyle` during cascade, eliminating string matching in the layout engine. This makes property matching and application an integer comparison rather than a string deref and prevents unrecognized properties from silently corrupting the style tree.
+- Property names in `Declaration` use `PropertyName`, a strongly-typed enum (`Display`, `Width`, `MarginTop`, `FontSize`, etc.). `PropertyName::from_str` returns `Option<PropertyName>`; unrecognized property names return `None` and are discarded during the cascade. Layout-critical keyword values (e.g. `flex`, `column`, `stretch`) resolve to local enums (`DisplayKeyword`, `FlexDirectionKeyword`, etc.) in `ComputedStyle` during cascade, eliminating string matching in the layout engine. This makes property matching and application an integer comparison rather than a string deref and prevents unrecognized properties from silently corrupting the style tree.
 - Specificity is computed as `(id_count, class_count, tag_count)` at parse time and stored on each `ComplexSelector`.
 - Rules are stored in `HashMap<String, Vec<IndexedRule>>` buckets keyed by class and ID (plain `String`), and `HashMap<DefaultAtom, Vec<IndexedRule>>` keyed by tag (bounded set of known tag names; interning is safe here). Class and ID keys are not interned because they are uncontrolled user input. Each rule is indexed in **one** bucket only (ID, else first class on the subject compound, else tag, else universal); see the `StyleSheet` doc comment in `css/mod.rs` for why multi-class selectors are fragile at index time.
 - `compute_styles()` performs an iterative stack-based traversal of the arena DOM, evaluating combinators (`>`, space, `+`, `~`) by walking arena parent and sibling pointers. Attribute selectors (`[attr]`, `[attr=value]`) are matched against `ElementData::attributes`. The cascade uses `data.classes.split_whitespace()` iteration alongside a stack-allocated rule bucket gathering via `SmallVec<[&[IndexedRule]; 8]>`. The traversal utilizes short-circuit optimizations via `ancestor_attr_changed` flags to leapfrog un-mutated DOM nodes (Incremental Rendering). It populates `ComputedStyle` on each node by matching against pre-parsed rules and resolving inheritance.

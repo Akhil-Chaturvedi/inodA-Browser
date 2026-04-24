@@ -432,4 +432,72 @@ mod tests {
             panic!("Expected Element");
         }
     }
+    
+    #[test]
+    fn test_rem_resolution() {
+        // Verify rem resolves against root_font_size (not parent font_size)
+        let mut doc = html::parse_html("<div style='font-size: 2rem;'></div>");
+        doc.root_font_size = 20.0; // Set root font size to 20px
+        let stylesheet = css::StyleSheet::default();
+        css::compute_styles(&mut doc, &stylesheet);
+        let div_id = doc.first_child_of(doc.root_id).unwrap();
+        if let crate::dom::Node::Element(data) = doc.nodes.get(div_id).unwrap() {
+            // 2rem = 2 * 20px = 40px
+            assert_eq!(data.computed.font_size, 40.0, "rem should resolve against root_font_size");
+        } else {
+            panic!("Expected Element");
+        }
+    }
+    
+    #[test]
+    fn test_get_attribute_class_style() {
+        // Test getAttribute for "class" and "style" attributes
+        let doc = html::parse_html("<div id='test' class='foo bar' style='color: red;'></div>");
+        let engine = js::JsEngine::try_new(doc).expect("JsEngine::try_new");
+    
+        // getAttribute("class") should return data.classes
+        let class_result = engine
+            .execute_script("document.getElementById('test').getAttribute('class')")
+            .unwrap();
+        assert_eq!(class_result, "foo bar", "getAttribute('class') should return classes");
+    
+        // getAttribute("style") should return cached_inline_styles as CSS string
+        let style_result = engine
+            .execute_script("document.getElementById('test').getAttribute('style')")
+            .unwrap();
+        assert!(
+            style_result.contains("color"),
+            "getAttribute('style') should contain 'color', got: {}",
+            style_result
+        );
+    }
+    
+    #[test]
+    fn test_utf8_truncation_safety() {
+        use crate::dom::MAX_ATTRIBUTE_VALUE_LEN;
+        // Verify multi-byte UTF-8 characters don't cause panic during truncation
+        // Chinese characters are 3 bytes each in UTF-8
+        let chinese = "中文测试文本"; // 6 characters, 18 bytes
+        let mut large_val = String::new();
+        // Repeat to exceed MAX_ATTRIBUTE_VALUE_LEN
+        while large_val.len() < MAX_ATTRIBUTE_VALUE_LEN + 100 {
+            large_val.push_str(chinese);
+        }
+    
+        let html = format!("<div class='{}'></div>", large_val);
+        // This should not panic even though we're truncating mid-character
+        let doc = html::parse_html(&html);
+        let div_id = find_node(&doc, "div").unwrap();
+        if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(div_id) {
+            // Should be truncated to at most MAX_ATTRIBUTE_VALUE_LEN
+            assert!(data.classes.len() <= MAX_ATTRIBUTE_VALUE_LEN,
+                "Truncated length {} should be <= MAX {}", data.classes.len(), MAX_ATTRIBUTE_VALUE_LEN);
+            // Should be within 1 byte of limit (truncation finds valid char boundary)
+            assert!(data.classes.len() >= MAX_ATTRIBUTE_VALUE_LEN - 1,
+                "Truncated length {} should be >= MAX - 1", data.classes.len());
+            // Verify it's valid UTF-8 (no partial characters)
+            assert!(std::str::from_utf8(data.classes.as_bytes()).is_ok(),
+                "Truncated string should be valid UTF-8, got bytes: {:?}", &data.classes.as_bytes()[data.classes.len().saturating_sub(10)..]);
+        }
+    }
 }

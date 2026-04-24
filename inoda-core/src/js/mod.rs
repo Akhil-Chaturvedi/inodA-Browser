@@ -10,8 +10,8 @@
 //! DOM handles are exposed to JavaScript as native `NodeHandle` class instances
 //! wrapping a `generational_arena::Index`. Methods include:
 //! - `handle.tagName` (lazy lookup in arena, no redundant string storage)
-//! - `handle.getAttribute(key)`
-//! - `handle.setAttribute(key, value)`
+//! - `handle.getAttribute(key)` (checks `classes` and `cached_inline_styles` for class/style)
+//! - `handle.setAttribute(key, value)` (truncates at `MAX_ATTRIBUTE_VALUE_LEN` with UTF-8 safety)
 //! - `handle.removeChild(child)`
 //!
 //! Each `NodeHandle` carries a `__nodeKey` property: a two-element JS array
@@ -23,6 +23,9 @@
 //! `_garbageCollectNodeRaw` (mapped to `try_cleanup_node` in Rust) to decrement
 //! the handle count. Detached nodes are cleared from the arena by the batched
 //! `collect_garbage()` sweep.
+//!
+//! Event dispatching fires target-level listeners first, then document-level
+//! listeners (minimal propagation covering the most common event pattern).
 //!
 //! The Document is held behind `Rc<RefCell<Document>>` for single-threaded access.
 //! All JS operations are synchronous and serialized through this lock.
@@ -123,8 +126,6 @@ unsafe impl<'js> rquickjs::JsLifetime<'js> for NodeHandle {
     type Changed<'to> = NodeHandle;
 }
 
-// NodeHandleWithTag is removed as NodeHandle now includes tagName and node_key getters.
-
 // ---------------------------------------------------------------------------
 // Timer queue
 // ---------------------------------------------------------------------------
@@ -183,8 +184,9 @@ pub struct JsEngine {
 }
 
 impl JsEngine {
-    /// Dispatches a DOM event to listeners registered on the hit node. Failures are
-    /// returned so the host can log or ignore them; they are non-fatal for the engine.
+    /// Dispatches a DOM event to listeners registered on the hit node, then
+    /// to listeners registered on the document object. Failures are returned
+    /// so the host can log or ignore them; they are non-fatal for the engine.
     pub fn dispatch_event(&self, x: f32, y: f32, event_type: &str) -> Result<(), JsEngineError> {
         let hit = {
             let doc = self.document.borrow();
@@ -288,6 +290,7 @@ impl JsEngine {
                 "proto _tagNameRaw",
             )?;
 
+            // Item 4: getAttribute now checks class/style dedicated fields
             let get_attr_func = js_try(
                 rquickjs::Function::new(ctx.clone(), {
                     let doc_ref = doc_ref.clone();
@@ -297,6 +300,71 @@ impl JsEngine {
                         let doc = doc_ref.borrow();
                         let node_id = this.borrow().to_node_id();
                         if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
+                            // Check dedicated class field first
+                            if attr == "class" {
+                                if !data.classes.is_empty() {
+                                    return Some(data.classes.clone());
+                                }
+                                return None;
+                            }
+                            // Check dedicated style field
+                            if attr == "style" {
+                                if let Some(inline) = &data.cached_inline_styles {
+                                    let reconstructed: String = inline
+                                        .iter()
+                                        .map(|(name, val)| {
+                                            let val_str = match val {
+                                                crate::dom::StyleValue::LengthPx(n) => {
+                                                    format!("{}px", n)
+                                                }
+                                                crate::dom::StyleValue::Percent(n) => {
+                                                    format!("{}%", n)
+                                                }
+                                                crate::dom::StyleValue::Keyword(k) => {
+                                                    k.to_string()
+                                                }
+                                                crate::dom::StyleValue::Color(r, g, b, a) => {
+                                                    if *a == 255 {
+                                                        format!("#{:02x}{:02x}{:02x}", r, g, b)
+                                                    } else {
+                                                        format!(
+                                                            "rgba({},{},{},{})",
+                                                            r,
+                                                            g,
+                                                            b,
+                                                            *a as f32 / 255.0
+                                                        )
+                                                    }
+                                                }
+                                                crate::dom::StyleValue::Auto => "auto".to_string(),
+                                                crate::dom::StyleValue::Number(n) => n.to_string(),
+                                                crate::dom::StyleValue::Em(n) => format!("{}em", n),
+                                                crate::dom::StyleValue::Rem(n) => {
+                                                    format!("{}rem", n)
+                                                }
+                                                crate::dom::StyleValue::ViewportWidth(n) => {
+                                                    format!("{}vw", n)
+                                                }
+                                                crate::dom::StyleValue::ViewportHeight(n) => {
+                                                    format!("{}vh", n)
+                                                }
+                                                crate::dom::StyleValue::None => "none".to_string(),
+                                            };
+                                            format!(
+                                                "{}:{}",
+                                                crate::dom::PropertyName::to_string(*name),
+                                                val_str
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(";");
+                                    if !reconstructed.is_empty() {
+                                        return Some(reconstructed);
+                                    }
+                                }
+                                return None;
+                            }
+                            // Fall through to attributes vector for all other keys
                             for (k, v) in &data.attributes {
                                 if k == &attr {
                                     return Some(v.clone());
@@ -319,92 +387,108 @@ impl JsEngine {
                     move |This(this): This<rquickjs::Class<'_, NodeHandle>>,
                           key: String,
                           mut value: String| {
-                    if value.len() > crate::dom::MAX_ATTRIBUTE_VALUE_LEN {
-                        value.truncate(crate::dom::MAX_ATTRIBUTE_VALUE_LEN);
-                    }
-                    let mut doc = doc_ref.borrow_mut();
-                    let node_id = this.borrow().to_node_id();
-                    let mut old_id = None;
-                    let mut is_class = false;
-                    let mut is_style = false;
+                        // Item 3: Safe UTF-8 truncation — avoid splitting multi-byte characters
+                        if value.len() > crate::dom::MAX_ATTRIBUTE_VALUE_LEN {
+                            let mut cap = crate::dom::MAX_ATTRIBUTE_VALUE_LEN;
+                            while !value.is_char_boundary(cap) {
+                                cap -= 1;
+                            }
+                            value.truncate(cap);
+                        }
+                        let mut doc = doc_ref.borrow_mut();
+                        let node_id = this.borrow().to_node_id();
+                        let mut old_id = None;
+                        let mut is_class = false;
+                        let mut is_style = false;
 
-                    if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
-                        if key == "class" { is_class = true; }
-                        else if key == "style" { is_style = true; }
-                        else if key == "id" {
-                            for (k, v) in &data.attributes {
-                                if k == "id" {
-                                    old_id = Some(v.clone());
-                                    break;
+                        if let Some(crate::dom::Node::Element(data)) = doc.nodes.get(node_id) {
+                            if key == "class" {
+                                is_class = true;
+                            } else if key == "style" {
+                                is_style = true;
+                            } else if key == "id" {
+                                for (k, v) in &data.attributes {
+                                    if k == "id" {
+                                        old_id = Some(v.clone());
+                                        break;
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    if is_class {
+                        if is_class {
+                            if let Some(crate::dom::Node::Element(data)) =
+                                doc.nodes.get_mut(node_id)
+                            {
+                                data.classes = value.clone();
+
+                                // Also update attributes vector for consistency with getAttribute
+                                let mut found = false;
+                                for (k, v) in data.attributes.iter_mut() {
+                                    if k == "class" {
+                                        *v = value.clone();
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if !found {
+                                    data.attributes
+                                        .push(("class".to_string(), value.clone()));
+                                }
+                            }
+                        } else if is_style {
+                            let decls = crate::css::parse_inline_declarations(&value);
+                            if let Some(crate::dom::Node::Element(data)) =
+                                doc.nodes.get_mut(node_id)
+                            {
+                                data.cached_inline_styles =
+                                    Some(decls.into_iter().map(|d| (d.name, d.value)).collect());
+
+                                // Also update attributes vector
+                                let mut found = false;
+                                for (k, v) in data.attributes.iter_mut() {
+                                    if k == "style" {
+                                        *v = value.clone();
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if !found {
+                                    data.attributes
+                                        .push(("style".to_string(), value.clone()));
+                                }
+                            }
+                        } else {
+                            if key == "id" {
+                                if let Some(oid) = old_id {
+                                    doc.id_map.remove(&oid);
+                                }
+                                doc.id_map.insert(value.clone(), node_id);
+                            }
+
+                            if let Some(crate::dom::Node::Element(data)) =
+                                doc.nodes.get_mut(node_id)
+                            {
+                                let mut found = false;
+                                for (k, v) in data.attributes.iter_mut() {
+                                    if k == &key {
+                                        *v = value.clone();
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if !found && data.attributes.len() < crate::dom::MAX_ATTRIBUTES {
+                                    data.attributes.push((key, value));
+                                }
+                            }
+                        }
+
                         if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
-                            data.classes = value.clone();
-
-                            // Also update attributes vector for consistency with getAttribute
-                            let mut found = false;
-                            for (k, v) in data.attributes.iter_mut() {
-                                if k == "class" {
-                                    *v = value.clone();
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if !found {
-                                data.attributes.push(("class".to_string(), value.clone()));
-                            }
-                        }
-                    } else if is_style {
-                        let decls = crate::css::parse_inline_declarations(&value);
-                        if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
-                            data.cached_inline_styles = Some(decls.into_iter().map(|d| (d.name, d.value)).collect());
-
-                            // Also update attributes vector
-                            let mut found = false;
-                            for (k, v) in data.attributes.iter_mut() {
-                                if k == "style" {
-                                    *v = value.clone();
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if !found {
-                                data.attributes.push(("style".to_string(), value.clone()));
-                            }
-                        }
-                    } else {
-                        if key == "id" {
-                            if let Some(oid) = old_id {
-                                doc.id_map.remove(&oid);
-                            }
-                            doc.id_map.insert(value.clone(), node_id);
+                            data.styles_dirty = true;
                         }
 
-                        if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
-                            let mut found = false;
-                            for (k, v) in data.attributes.iter_mut() {
-                                if k == &key {
-                                    *v = value.clone();
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if !found && data.attributes.len() < crate::dom::MAX_ATTRIBUTES {
-                                data.attributes.push((key, value));
-                            }
-                        }
+                        doc.dirty = true;
                     }
-
-                    if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
-                        data.styles_dirty = true;
-                    }
-
-                    doc.dirty = true;
-                }
                 }),
                 "Function setAttribute",
             )?;
@@ -433,22 +517,22 @@ impl JsEngine {
 
             let parent_node_func = js_try(
                 rquickjs::Function::new(ctx.clone(), {
-                let doc_ref = doc_ref.clone();
-                move |This(this): This<rquickjs::Class<'_, NodeHandle>>| -> Option<NodeHandle> {
-                    let mut doc = doc_ref.borrow_mut();
-                    let node_id = this.borrow().to_node_id();
-                    if let Some(parent_id) = doc.parent_of(node_id) {
-                        if let Some(node) = doc.nodes.get_mut(parent_id) {
-                            match node {
-                                crate::dom::Node::Element(d) => d.js_handles += 1,
-                                crate::dom::Node::Text(d) => d.js_handles += 1,
-                                crate::dom::Node::Root(d) => d.js_handles += 1,
+                    let doc_ref = doc_ref.clone();
+                    move |This(this): This<rquickjs::Class<'_, NodeHandle>>| -> Option<NodeHandle> {
+                        let mut doc = doc_ref.borrow_mut();
+                        let node_id = this.borrow().to_node_id();
+                        if let Some(parent_id) = doc.parent_of(node_id) {
+                            if let Some(node) = doc.nodes.get_mut(parent_id) {
+                                match node {
+                                    crate::dom::Node::Element(d) => d.js_handles += 1,
+                                    crate::dom::Node::Text(d) => d.js_handles += 1,
+                                    crate::dom::Node::Root(d) => d.js_handles += 1,
+                                }
+                                return Some(NodeHandle::from_node_id(parent_id));
                             }
-                            return Some(NodeHandle::from_node_id(parent_id));
                         }
+                        None
                     }
-                    None
-                }
                 }),
                 "Function _parentNodeRaw",
             )?;
@@ -459,22 +543,22 @@ impl JsEngine {
 
             let first_child_func = js_try(
                 rquickjs::Function::new(ctx.clone(), {
-                let doc_ref = doc_ref.clone();
-                move |This(this): This<rquickjs::Class<'_, NodeHandle>>| -> Option<NodeHandle> {
-                    let mut doc = doc_ref.borrow_mut();
-                    let node_id = this.borrow().to_node_id();
-                    if let Some(child_id) = doc.first_child_of(node_id) {
-                        if let Some(node) = doc.nodes.get_mut(child_id) {
-                            match node {
-                                crate::dom::Node::Element(d) => d.js_handles += 1,
-                                crate::dom::Node::Text(d) => d.js_handles += 1,
-                                crate::dom::Node::Root(d) => d.js_handles += 1,
+                    let doc_ref = doc_ref.clone();
+                    move |This(this): This<rquickjs::Class<'_, NodeHandle>>| -> Option<NodeHandle> {
+                        let mut doc = doc_ref.borrow_mut();
+                        let node_id = this.borrow().to_node_id();
+                        if let Some(child_id) = doc.first_child_of(node_id) {
+                            if let Some(node) = doc.nodes.get_mut(child_id) {
+                                match node {
+                                    crate::dom::Node::Element(d) => d.js_handles += 1,
+                                    crate::dom::Node::Text(d) => d.js_handles += 1,
+                                    crate::dom::Node::Root(d) => d.js_handles += 1,
+                                }
+                                return Some(NodeHandle::from_node_id(child_id));
                             }
-                            return Some(NodeHandle::from_node_id(child_id));
                         }
+                        None
                     }
-                    None
-                }
                 }),
                 "Function _firstChildRaw",
             )?;
@@ -485,22 +569,22 @@ impl JsEngine {
 
             let next_sibling_func = js_try(
                 rquickjs::Function::new(ctx.clone(), {
-                let doc_ref = doc_ref.clone();
-                move |This(this): This<rquickjs::Class<'_, NodeHandle>>| -> Option<NodeHandle> {
-                    let mut doc = doc_ref.borrow_mut();
-                    let node_id = this.borrow().to_node_id();
-                    if let Some(sibling_id) = doc.next_sibling_of(node_id) {
-                        if let Some(node) = doc.nodes.get_mut(sibling_id) {
-                            match node {
-                                crate::dom::Node::Element(d) => d.js_handles += 1,
-                                crate::dom::Node::Text(d) => d.js_handles += 1,
-                                crate::dom::Node::Root(d) => d.js_handles += 1,
+                    let doc_ref = doc_ref.clone();
+                    move |This(this): This<rquickjs::Class<'_, NodeHandle>>| -> Option<NodeHandle> {
+                        let mut doc = doc_ref.borrow_mut();
+                        let node_id = this.borrow().to_node_id();
+                        if let Some(sibling_id) = doc.next_sibling_of(node_id) {
+                            if let Some(node) = doc.nodes.get_mut(sibling_id) {
+                                match node {
+                                    crate::dom::Node::Element(d) => d.js_handles += 1,
+                                    crate::dom::Node::Text(d) => d.js_handles += 1,
+                                    crate::dom::Node::Root(d) => d.js_handles += 1,
+                                }
+                                return Some(NodeHandle::from_node_id(sibling_id));
                             }
-                            return Some(NodeHandle::from_node_id(sibling_id));
                         }
+                        None
                     }
-                    None
-                }
                 }),
                 "Function _nextSiblingRaw",
             )?;
@@ -549,7 +633,9 @@ impl JsEngine {
                     move |id: String| -> Option<NodeHandle> {
                         let mut doc = doc_ref.borrow_mut();
                         if let Some(&node_id) = doc.id_map.get(&id) {
-                            if let Some(crate::dom::Node::Element(data)) = doc.nodes.get_mut(node_id) {
+                            if let Some(crate::dom::Node::Element(data)) =
+                                doc.nodes.get_mut(node_id)
+                            {
                                 data.js_handles += 1;
                                 return Some(NodeHandle::from_node_id(node_id));
                             }
@@ -570,80 +656,80 @@ impl JsEngine {
                 rquickjs::Function::new(ctx.clone(), {
                     let doc_ref = doc_ref.clone();
                     move |selector: String| -> Option<NodeHandle> {
-                    let mut doc = doc_ref.borrow_mut();
-                    let root_id = doc.root_id;
+                        let mut doc = doc_ref.borrow_mut();
+                        let root_id = doc.root_id;
 
-                    fn matches_selector(selector: &str, data: &crate::dom::ElementData) -> bool {
-                        if selector.starts_with('.') {
-                            let class_name = &selector[1..];
-                            data.classes.split_whitespace().any(|c| c == class_name)
-                        } else if selector.starts_with('#') {
-                            let id_name = &selector[1..];
-                            data.attributes
-                                .iter()
-                                .any(|(k, v)| &**k == "id" && v == id_name)
-                        } else {
-                            &*data.tag_name == selector
-                        }
-                    }
-
-                    fn find_iterative(
-                        doc: &crate::dom::Document,
-                        root: crate::dom::NodeId,
-                        selector: &str,
-                    ) -> Option<crate::dom::NodeId> {
-                        // Depth-first search using an explicit stack
-                        let mut stack = vec![root];
-                        while let Some(current) = stack.pop() {
-                            if let Some(node) = doc.nodes.get(current) {
-                                if let crate::dom::Node::Element(data) = node {
-                                    if matches_selector(selector, data) {
-                                        return Some(current);
-                                    }
-                                }
-                                
-                                // Push children in reverse order so first child is popped first
-                                let mut children_to_push = Vec::new();
-                                let mut child = doc.first_child_of(current);
-                                while let Some(c) = child {
-                                    children_to_push.push(c);
-                                    child = doc.next_sibling_of(c);
-                                }
-                                for c in children_to_push.into_iter().rev() {
-                                    stack.push(c);
-                                }
+                        fn matches_selector(selector: &str, data: &crate::dom::ElementData) -> bool {
+                            if selector.starts_with('.') {
+                                let class_name = &selector[1..];
+                                data.classes.split_whitespace().any(|c| c == class_name)
+                            } else if selector.starts_with('#') {
+                                let id_name = &selector[1..];
+                                data.attributes
+                                    .iter()
+                                    .any(|(k, v)| &**k == "id" && v == id_name)
+                            } else {
+                                &*data.tag_name == selector
                             }
                         }
-                        None
-                    }
 
-                    if selector.starts_with('#') {
-                        let id_name = &selector[1..];
-                        if let Some(&node_id) = doc.id_map.get(id_name) {
+                        fn find_iterative(
+                            doc: &crate::dom::Document,
+                            root: crate::dom::NodeId,
+                            selector: &str,
+                        ) -> Option<crate::dom::NodeId> {
+                            // Depth-first search using an explicit stack
+                            let mut stack = vec![root];
+                            while let Some(current) = stack.pop() {
+                                if let Some(node) = doc.nodes.get(current) {
+                                    if let crate::dom::Node::Element(data) = node {
+                                        if matches_selector(selector, data) {
+                                            return Some(current);
+                                        }
+                                    }
+
+                                    // Push children in reverse order so first child is popped first
+                                    let mut children_to_push = Vec::new();
+                                    let mut child = doc.first_child_of(current);
+                                    while let Some(c) = child {
+                                        children_to_push.push(c);
+                                        child = doc.next_sibling_of(c);
+                                    }
+                                    for c in children_to_push.into_iter().rev() {
+                                        stack.push(c);
+                                    }
+                                }
+                            }
+                            None
+                        }
+
+                        if selector.starts_with('#') {
+                            let id_name = &selector[1..];
+                            if let Some(&node_id) = doc.id_map.get(id_name) {
+                                if let Some(node) = doc.nodes.get_mut(node_id) {
+                                    match node {
+                                        crate::dom::Node::Element(d) => d.js_handles += 1,
+                                        crate::dom::Node::Text(d) => d.js_handles += 1,
+                                        crate::dom::Node::Root(d) => d.js_handles += 1,
+                                    }
+                                    return Some(NodeHandle::from_node_id(node_id));
+                                }
+                            }
+                            return None;
+                        }
+
+                        if let Some(node_id) = find_iterative(&doc, root_id, &selector) {
                             if let Some(node) = doc.nodes.get_mut(node_id) {
                                 match node {
                                     crate::dom::Node::Element(d) => d.js_handles += 1,
                                     crate::dom::Node::Text(d) => d.js_handles += 1,
                                     crate::dom::Node::Root(d) => d.js_handles += 1,
                                 }
-                                return Some(NodeHandle::from_node_id(node_id));
                             }
+                            return Some(NodeHandle::from_node_id(node_id));
                         }
-                        return None;
+                        None
                     }
-
-                    if let Some(node_id) = find_iterative(&doc, root_id, &selector) {
-                        if let Some(node) = doc.nodes.get_mut(node_id) {
-                            match node {
-                                crate::dom::Node::Element(d) => d.js_handles += 1,
-                                crate::dom::Node::Text(d) => d.js_handles += 1,
-                                crate::dom::Node::Root(d) => d.js_handles += 1,
-                            }
-                        }
-                        return Some(NodeHandle::from_node_id(node_id));
-                    }
-                    None
-                }
                 }),
                 "Function _querySelectorRaw",
             )?;
@@ -721,62 +807,66 @@ impl JsEngine {
 
             js_try(globals.set("document", document_obj), "globals document")?;
 
+            // Item 2: _triggerEvent now fires document-level listeners after target-level listeners
             let _: () = js_try(
                 ctx.eval(
                     r#"
-                document.__nodeCache = new Map();
-                document.__nodeRegistry = new FinalizationRegistry(key => {
-                    let mapKey = BigInt(key[0]) | (BigInt(key[1]) << 32n);
-                    document.__nodeCache.delete(mapKey);
-                    document._garbageCollectNodeRaw(key);
-                });
-                document.__ephemeralRegistry = new FinalizationRegistry(key => {
-                    document._garbageCollectNodeRaw(key);
-                });
+                    document.__nodeCache = new Map();
+                    document.__nodeRegistry = new FinalizationRegistry(key => {
+                        let mapKey = BigInt(key[0]) | (BigInt(key[1]) << 32n);
+                        document.__nodeCache.delete(mapKey);
+                        document._garbageCollectNodeRaw(key);
+                    });
+                    document.__ephemeralRegistry = new FinalizationRegistry(key => {
+                        document._garbageCollectNodeRaw(key);
+                    });
 
-                document._wrapNode = function(rawNode) {
-                    if (!rawNode) return null;
-                    let keyPair = rawNode.__nodeKey; // [idx, gen]
-                    let mapKey = BigInt(keyPair[0]) | (BigInt(keyPair[1]) << 32n);
-                    let cachedRef = document.__nodeCache.get(mapKey);
-                    if (cachedRef) {
-                        let cachedObj = cachedRef.deref();
-                        if (cachedObj) {
-                            document.__ephemeralRegistry.register(rawNode, keyPair);
-                            return cachedObj;
+                    document._wrapNode = function(rawNode) {
+                        if (!rawNode) return null;
+                        let keyPair = rawNode.__nodeKey; // [idx, gen]
+                        let mapKey = BigInt(keyPair[0]) | (BigInt(keyPair[1]) << 32n);
+                        let cachedRef = document.__nodeCache.get(mapKey);
+                        if (cachedRef) {
+                            let cachedObj = cachedRef.deref();
+                            if (cachedObj) {
+                                document.__ephemeralRegistry.register(rawNode, keyPair);
+                                return cachedObj;
+                            }
                         }
-                    }
-                    document.__nodeCache.set(mapKey, new WeakRef(rawNode));
-                    document.__nodeRegistry.register(rawNode, keyPair);
-                    return rawNode;
-                };
+                        document.__nodeCache.set(mapKey, new WeakRef(rawNode));
+                        document.__nodeRegistry.register(rawNode, keyPair);
+                        return rawNode;
+                    };
 
-                document.getElementById = function(id) {
-                    return this._wrapNode(this._getElementByIdRaw(id));
-                };
-                document.querySelector = function(selector) {
-                    return this._wrapNode(this._querySelectorRaw(selector));
-                };
-                document.createElement = function(tag) {
-                    return this._wrapNode(this._createElementRaw(tag));
-                };
-                document.addEventListener = function(eventType, cb) {
-                    this.__listeners = this.__listeners || {};
-                    this.__listeners[eventType] = this.__listeners[eventType] || [];
-                    this.__listeners[eventType].push(cb);
-                };
-                document._triggerEvent = function(keyPair, eventType) {
-                    let mapKey = BigInt(keyPair[0]) | (BigInt(keyPair[1]) << 32n);
-                    let cachedRef = document.__nodeCache.get(mapKey);
-                    if (!cachedRef) return;
-                    let target = cachedRef.deref();
-                    if (!target) return;
-                    if (target.__listeners && target.__listeners[eventType]) {
+                    document.getElementById = function(id) {
+                        return this._wrapNode(this._getElementByIdRaw(id));
+                    };
+                    document.querySelector = function(selector) {
+                        return this._wrapNode(this._querySelectorRaw(selector));
+                    };
+                    document.createElement = function(tag) {
+                        return this._wrapNode(this._createElementRaw(tag));
+                    };
+                    document.addEventListener = function(eventType, cb) {
+                        this.__listeners = this.__listeners || {};
+                        this.__listeners[eventType] = this.__listeners[eventType] || [];
+                        this.__listeners[eventType].push(cb);
+                    };
+                    document._triggerEvent = function(keyPair, eventType) {
+                        let mapKey = BigInt(keyPair[0]) | (BigInt(keyPair[1]) << 32n);
+                        let cachedRef = document.__nodeCache.get(mapKey);
+                        if (!cachedRef) return;
+                        let target = cachedRef.deref();
+                        if (!target) return;
                         let event = { target, type: eventType };
-                        for (let cb of target.__listeners[eventType]) cb(event);
-                    }
-                };
-            "#,
+                        if (target.__listeners && target.__listeners[eventType]) {
+                            for (let cb of target.__listeners[eventType]) cb(event);
+                        }
+                        if (document.__listeners && document.__listeners[eventType]) {
+                            for (let cb of document.__listeners[eventType]) cb(event);
+                        }
+                    };
+                    "#,
                 ),
                 "ctx.eval bootstrap",
             )?;
@@ -784,18 +874,18 @@ impl JsEngine {
             let patch_func: rquickjs::Function = js_try(
                 ctx.eval(
                     r#"
-                (function(proto) {
-                    Object.defineProperty(proto, "parentNode", { get() { return document._wrapNode(this._parentNodeRaw()); } });
-                    Object.defineProperty(proto, "firstChild", { get() { return document._wrapNode(this._firstChildRaw()); } });
-                    Object.defineProperty(proto, "nextSibling", { get() { return document._wrapNode(this._nextSiblingRaw()); } });
-                    Object.defineProperty(proto, "tagName", { get() { return this._tagNameRaw(); } });
-                    proto.addEventListener = function(eventType, cb) {
-                        this.__listeners = this.__listeners || {};
-                        this.__listeners[eventType] = this.__listeners[eventType] || [];
-                        this.__listeners[eventType].push(cb);
-                    };
-                })
-                "#,
+                    (function(proto) {
+                        Object.defineProperty(proto, "parentNode", { get() { return document._wrapNode(this._parentNodeRaw()); } });
+                        Object.defineProperty(proto, "firstChild", { get() { return document._wrapNode(this._firstChildRaw()); } });
+                        Object.defineProperty(proto, "nextSibling", { get() { return document._wrapNode(this._nextSiblingRaw()); } });
+                        Object.defineProperty(proto, "tagName", { get() { return this._tagNameRaw(); } });
+                        proto.addEventListener = function(eventType, cb) {
+                            this.__listeners = this.__listeners || {};
+                            this.__listeners[eventType] = this.__listeners[eventType] || [];
+                            this.__listeners[eventType].push(cb);
+                        };
+                    })
+                    "#,
                 ),
                 "ctx.eval prototype patch",
             )?;
@@ -807,56 +897,56 @@ impl JsEngine {
             // --- setTimeout with Persistent<Function> storage ---
             let set_timeout_func = js_try(
                 rquickjs::Function::new(ctx.clone(), {
-                let timer_id_counter = timer_id_counter.clone();
-                let pending_timers = pending_timers.clone();
-                let active_timers = active_timers.clone();
-                move |cb: Persistent<rquickjs::Function<'static>>, delay: i32| -> u32 {
-                    let timer_id = timer_id_counter.get();
-                    timer_id_counter.set(timer_id + 1);
+                    let timer_id_counter = timer_id_counter.clone();
+                    let pending_timers = pending_timers.clone();
+                    let active_timers = active_timers.clone();
+                    move |cb: Persistent<rquickjs::Function<'static>>, delay: i32| -> u32 {
+                        let timer_id = timer_id_counter.get();
+                        timer_id_counter.set(timer_id + 1);
 
-                    active_timers.borrow_mut().insert(timer_id);
+                        active_timers.borrow_mut().insert(timer_id);
 
-                    let delay_ms = delay.max(0) as u64;
-                    let fire_at = Instant::now() + std::time::Duration::from_millis(delay_ms);
+                        let delay_ms = delay.max(0) as u64;
+                        let fire_at = Instant::now() + std::time::Duration::from_millis(delay_ms);
 
-                    pending_timers.borrow_mut().push(PendingTimer {
-                        id: timer_id,
-                        fire_at,
-                        callback: cb,
-                        is_interval: false,
-                        delay_ms,
-                    });
+                        pending_timers.borrow_mut().push(PendingTimer {
+                            id: timer_id,
+                            fire_at,
+                            callback: cb,
+                            is_interval: false,
+                            delay_ms,
+                        });
 
-                    timer_id
-                }
+                        timer_id
+                    }
                 }),
                 "setTimeout",
             )?;
 
             let set_interval_func = js_try(
                 rquickjs::Function::new(ctx.clone(), {
-                let timer_id_counter = timer_id_counter.clone();
-                let pending_timers = pending_timers.clone();
-                let active_timers = active_timers.clone();
-                move |cb: Persistent<rquickjs::Function<'static>>, delay: i32| -> u32 {
-                    let timer_id = timer_id_counter.get();
-                    timer_id_counter.set(timer_id + 1);
+                    let timer_id_counter = timer_id_counter.clone();
+                    let pending_timers = pending_timers.clone();
+                    let active_timers = active_timers.clone();
+                    move |cb: Persistent<rquickjs::Function<'static>>, delay: i32| -> u32 {
+                        let timer_id = timer_id_counter.get();
+                        timer_id_counter.set(timer_id + 1);
 
-                    active_timers.borrow_mut().insert(timer_id);
+                        active_timers.borrow_mut().insert(timer_id);
 
-                    let delay_ms = delay.max(0) as u64;
-                    let fire_at = Instant::now() + std::time::Duration::from_millis(delay_ms);
+                        let delay_ms = delay.max(0) as u64;
+                        let fire_at = Instant::now() + std::time::Duration::from_millis(delay_ms);
 
-                    pending_timers.borrow_mut().push(PendingTimer {
-                        id: timer_id,
-                        fire_at,
-                        callback: cb,
-                        is_interval: true,
-                        delay_ms,
-                    });
+                        pending_timers.borrow_mut().push(PendingTimer {
+                            id: timer_id,
+                            fire_at,
+                            callback: cb,
+                            is_interval: true,
+                            delay_ms,
+                        });
 
-                    timer_id
-                }
+                        timer_id
+                    }
                 }),
                 "setInterval",
             )?;
@@ -901,7 +991,7 @@ impl JsEngine {
         {
             let mut timers = self.pending_timers.borrow_mut();
             let mut active = self.active_timers.borrow_mut();
-            
+
             // Periodic compaction to prevent memory drift from cancelled timers
             if timers.len() > 128 {
                 let mut v = std::mem::take(&mut *timers).into_vec();

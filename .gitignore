@@ -1,6 +1,7 @@
 rustup-init.exe
-.aider*
 .brain/phases.yaml
-.gitignore
 Hardening_Inoda_Engine_Architecture.txt
 InodA_Browser.txt
+inoda-core/target/
+inoda-core/target/criterion/
+inoda-core/Cargo.lock

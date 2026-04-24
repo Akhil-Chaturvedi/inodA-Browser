@@ -47,85 +47,87 @@ pub fn draw_layout_tree<R: RendererBackend>(
     root_offset_y: f32,
     buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
 ) {
+    // Reusable scratch buffer for collecting child tuples — avoids a
+    // per-element `Vec::new()` allocation on every iteration (Item 6).
+    let mut children_buf: Vec<(crate::dom::NodeId, taffy::NodeId, f32, f32)> = Vec::new();
     let mut stack = vec![(root_node_id, root_layout_node_id, root_offset_x, root_offset_y)];
 
     while let Some((node_id, layout_node_id, offset_x, offset_y)) = stack.pop() {
-        let computed = match document.nodes.get(node_id) {
-            Some(crate::dom::Node::Element(data)) => &data.computed,
-            Some(crate::dom::Node::Text(data)) => &data.computed,
-            _ => continue,
-        };
-
         if let Ok(layout) = layout_tree.layout(layout_node_id) {
             let abs_x = offset_x + layout.location.x;
             let abs_y = offset_y + layout.location.y;
 
-            if let Some((r, g, b, a)) = computed.bg_color {
-                renderer.fill_rect(
-                    abs_x,
-                    abs_y,
-                    layout.size.width,
-                    layout.size.height,
-                    Color { r, g, b, a },
-                );
-            }
+            match document.nodes.get(node_id) {
+                Some(crate::dom::Node::Element(data)) => {
+                    if let Some((r, g, b, a)) = data.computed.bg_color {
+                        renderer.fill_rect(
+                            abs_x,
+                            abs_y,
+                            layout.size.width,
+                            layout.size.height,
+                            Color { r, g, b, a },
+                        );
+                    }
 
-            if let Some((r, g, b, a)) = computed.border_color {
-                renderer.stroke_rect(
-                    abs_x,
-                    abs_y,
-                    layout.size.width,
-                    layout.size.height,
-                    1.0,
-                    Color { r, g, b, a },
-                );
-            }
+                    if let Some((r, g, b, a)) = data.computed.border_color {
+                        renderer.stroke_rect(
+                            abs_x,
+                            abs_y,
+                            layout.size.width,
+                            layout.size.height,
+                            1.0,
+                            Color { r, g, b, a },
+                        );
+                    }
 
-            if let crate::dom::Node::Text(_) = document.nodes.get(node_id).unwrap() {
-                let buffer = buffer_cache.get_mut(&node_id).unwrap();
-                let color = Color {
-                    r: computed.color.0,
-                    g: computed.color.1,
-                    b: computed.color.2,
-                    a: computed.color.3,
-                };
+                    if &*data.tag_name == "img" {
+                        if let Some((_, src)) = data.attributes.iter().find(|(k, _)| k == "src") {
+                            renderer.draw_image(abs_x, abs_y, layout.size.width, layout.size.height, src);
+                        }
+                    }
 
-                for run in buffer.layout_runs() {
-                    renderer.draw_glyphs(
-                        abs_x,
-                        abs_y + run.line_y,
-                        run.glyphs,
-                        computed.font_size,
-                        color,
-                    );
-                }
-            } else if let Some(crate::dom::Node::Element(d)) = document.nodes.get(node_id) {
-                if &*d.tag_name == "img" {
-                    if let Some((_, src)) = d.attributes.iter().find(|(k, _)| k == "src") {
-                        renderer.draw_image(abs_x, abs_y, layout.size.width, layout.size.height, src);
+                    // Collect children into the reusable scratch buffer
+                    children_buf.clear();
+                    let mut dom_child_id = document.first_child_of(node_id);
+                    while let Some(c) = dom_child_id {
+                        let t_node = match document.nodes.get(c) {
+                            Some(crate::dom::Node::Element(d)) => d.taffy_node,
+                            Some(crate::dom::Node::Text(d)) => d.taffy_node,
+                            Some(crate::dom::Node::Root(d)) => d.taffy_node,
+                            _ => None,
+                        };
+
+                        if let Some(tn) = t_node {
+                            children_buf.push((c, tn, abs_x, abs_y));
+                        }
+                        dom_child_id = document.next_sibling_of(c);
+                    }
+
+                    // Push in reverse order so that the first child is popped first
+                    for child in children_buf.iter().rev() {
+                        stack.push(*child);
                     }
                 }
-                
-                let mut children_to_push = Vec::new();
-                let mut dom_child_id = document.first_child_of(node_id);
-                while let Some(c) = dom_child_id {
-                    let t_node = match document.nodes.get(c) {
-                        Some(crate::dom::Node::Element(d)) => d.taffy_node,
-                        Some(crate::dom::Node::Text(d)) => d.taffy_node,
-                        Some(crate::dom::Node::Root(d)) => d.taffy_node,
-                        _ => None,
+                Some(crate::dom::Node::Text(data)) => {
+                    let buffer = buffer_cache.get_mut(&node_id).unwrap();
+                    let color = Color {
+                        r: data.computed.color.0,
+                        g: data.computed.color.1,
+                        b: data.computed.color.2,
+                        a: data.computed.color.3,
                     };
 
-                    if let Some(tn) = t_node {
-                        children_to_push.push((c, tn, abs_x, abs_y));
+                    for run in buffer.layout_runs() {
+                        renderer.draw_glyphs(
+                            abs_x,
+                            abs_y + run.line_y,
+                            run.glyphs,
+                            data.computed.font_size,
+                            color,
+                        );
                     }
-                    dom_child_id = document.next_sibling_of(c);
                 }
-                
-                // Push in reverse order so that the first child is popped first
-                for child in children_to_push.into_iter().rev() {
-                    stack.push(child);
-                }
+                _ => continue,
             }
         }
     }

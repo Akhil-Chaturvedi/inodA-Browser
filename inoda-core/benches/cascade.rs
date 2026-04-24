@@ -6,11 +6,15 @@ mod fixtures;
 fn bench_cascade(c: &mut Criterion) {
     let sheet = css::parse_stylesheet(fixtures::CSS_MEDIUM);
     c.bench_function("compute_styles_medium", |b| {
-        b.iter(|| {
-            let mut doc = html::parse_html(fixtures::HTML_MEDIUM);
-            css::compute_styles(black_box(&mut doc), black_box(&sheet));
-            black_box(doc);
-        });
+        // iter_batched runs setup once, then measures iteration multiple times
+        b.iter_batched(
+            || html::parse_html(fixtures::HTML_MEDIUM),
+            |mut doc| {
+                css::compute_styles(black_box(&mut doc), black_box(&sheet));
+                black_box(doc);
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 }
 

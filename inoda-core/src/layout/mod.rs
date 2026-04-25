@@ -195,25 +195,40 @@ fn prepare_text_buffers(
 }
 
 /// Iterative post-pass: reshapes text buffers at their final resolved widths.
+///
+/// Compares the resolved layout width against `ctx.last_measure_width` to avoid
+/// unnecessary reshaping. Only reshapes if the width differs beyond MEASURE_WIDTH_EPSILON.
+/// This replaces the previous `layout_dirty` flag check, which was already cleared by
+/// `prepare_text_buffers` before this function runs.
 fn finalize_text_measurements(
     tree: &TaffyTree<crate::dom::TextMeasureContext>,
     root_taffy_node: taffy::NodeId,
     font_system: &mut FontSystem,
     buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
 ) {
+    const MEASURE_WIDTH_EPSILON: f32 = 0.5;
+
     let mut stack = vec![root_taffy_node];
     while let Some(taffy_node) = stack.pop() {
         if let Some(ctx) = tree.get_node_context(taffy_node) {
             if let Ok(layout) = tree.layout(taffy_node) {
-                let width_constraint = layout.size.width;
+                let resolved_width = layout.size.width;
 
-                let buffer = buffer_cache.get_mut(&ctx.node_id).unwrap();
-                buffer.set_size(
-                    font_system,
-                    Some(width_constraint.max(1.0)),
-                    Some(f32::INFINITY),
-                );
-                buffer.shape_until_scroll(font_system, false);
+                // Only reshape if width differs from last measure by more than epsilon
+                let needs_reshape = ctx.last_measure_width
+                    .map(|last_w| (last_w - resolved_width).abs() > MEASURE_WIDTH_EPSILON)
+                    .unwrap_or(true);
+
+                if needs_reshape {
+                    if let Some(buffer) = buffer_cache.get_mut(&ctx.node_id) {
+                        buffer.set_size(
+                            font_system,
+                            Some(resolved_width.max(1.0)),
+                            Some(f32::INFINITY),
+                        );
+                        buffer.shape_until_scroll(font_system, false);
+                    }
+                }
             }
         }
 

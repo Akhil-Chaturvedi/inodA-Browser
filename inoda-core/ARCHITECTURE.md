@@ -94,7 +94,7 @@ Generational indices prevent ABA problems. The DOM tree is wired as an intrusive
 
 `LocalName` separates standard HTML tags (interned as `DefaultAtom`) from custom element names (heap-allocated `String`). This prevents unbounded growth of the global `DefaultAtom` intern pool when arbitrary custom element names are created from JavaScript.
 
-`ElementData::classes` stores class tokens in a single space-separated `String`. CSS class names are uncontrolled user input (modern frameworks generate randomized names like `css-1x8g9u`); interning them as `DefaultAtom` would cause the global intern pool to grow unboundedly and never shrink. ID values and attribute keys are also stored as `String` for the same reason, preventing OOM attacks from unbounded attribute labels. Unrecognized keywords in `StyleValue` are whitelisted to prevent arbitrary string leakage into the atom pool. A hard limit of `MAX_ATTRIBUTES = 32` is enforced during parsing and mutation.
+`ElementData::classes` stores class tokens in a single space-separated `String`. CSS class names are uncontrolled user input (modern frameworks generate randomized names like `css-1x8g9u`); interning them as `DefaultAtom` would cause the global intern pool to grow unboundedly and never shrink. ID values and attribute keys are also stored as `String` for the same reason, preventing OOM attacks from unbounded attribute labels. Unrecognized keywords in `StyleValue` are whitelisted to prevent arbitrary string leakage into the atom pool. Hard limits enforced: `MAX_ATTRIBUTES = 32` per element, `MAX_ATTRIBUTE_VALUE_LEN = 16KB` per value.
 
 ### ComputedStyle (dom/mod.rs)
 
@@ -148,7 +148,7 @@ Combinator    = Descendant | Child | NextSibling | SubsequentSibling
 Declaration   { name: PropertyName, value: StyleValue }
 ```
 
-`PropertyName` is a strongly-typed enum covering all CSS properties the engine recognizes (`Display`, `Width`, `MarginTop`, `Color`, `FontSize`, `AlignItems`, `JustifyContent`, `FlexWrap`, `FlexGrow`, `FlexShrink`, `RowGap`, `ColumnGap`, `MinWidth`, `MaxWidth`, `MinHeight`, `MaxHeight`, etc.). `PropertyName::from_str` returns `Option<Self>`; unknown property names return `None` and are discarded during cascade. There is no catch-all fallback variant -- previously, unrecognized names silently aliased to `LineHeight`, corrupting the style tree. Property matching during `compute_styles` is a direct integer comparison using pre-computed enum variants mapped to a fixed-size `[Option<StyleValue>; 36]` array. Layout-defining keywords resolve to native Taffy enums (e.g. `taffy::style::Display`) during the cascade to eliminate string comparisons in `build_taffy_node`.
+`PropertyName` is a strongly-typed enum covering all CSS properties the engine recognizes (`Display`, `Width`, `MarginTop`, `Color`, `FontSize`, `AlignItems`, `JustifyContent`, `FlexWrap`, `FlexGrow`, `FlexShrink`, `RowGap`, `ColumnGap`, `MinWidth`, `MaxWidth`, `MinHeight`, `MaxHeight`, etc.). `PropertyName::from_str` returns `Option<Self>`; unknown property names return `None` and are discarded during cascade. There is no catch-all fallback variant -- previously, unrecognized names silently aliased to `LineHeight`, corrupting the style tree. Property matching during `compute_styles` is a direct integer comparison using pre-computed enum variants mapped to a fixed-size `[Option<StyleValue>; 36]` array. Layout-defining keywords resolve to local enums (`DisplayKeyword`, `FlexDirectionKeyword`, etc.) during the cascade; `build_taffy_node` converts these to Taffy types.
 
 Selectors are pre-parsed into ASTs at stylesheet creation time. Specificity is computed once. Each rule is placed in a **single** hash-map bucket chosen from the subject compound: ID if present, else the **first** class simple selector in `parts`, else tag, else `universal` — not duplicated per class. During style resolution, the cascade collects slices for the element’s id, **each** class token, tag, and universal rules, then merges them via a k-way pointer walk over pre-sorted slices. Changing `add_rule` without aligning this with `compute_styles` can introduce missed matches (false negatives) for multi-class subject compounds.
 
@@ -166,7 +166,7 @@ PendingTimer {
 }
 ```
 
-Timers are stored in a `std::collections::BinaryHeap` ordered by `fire_at` (min-heap via reversed `Ord`). Active timer IDs are tracked in an `active_timers` HashSet; `pump()` skips any popped timer whose ID is no longer in the set. When an interval timer fires, `pump()` reschedules it by pushing a new `PendingTimer` with `fire_at = now + delay_ms`. The `BinaryHeap` does not support in-place cancellation -- the active set approach avoids rebuilding the heap on `clearTimeout`.
+Timers are stored in a `std::collections::BinaryHeap` ordered by `fire_at` (min-heap via reversed `Ord`). Active timer IDs are tracked in an `active_timers` HashSet; `pump()` skips any popped timer whose ID is no longer in the set. When an interval timer fires, `pump()` reschedules it by pushing a new `PendingTimer` with `fire_at = now + delay_ms`. The `BinaryHeap` does not support in-place cancellation -- the active set approach avoids rebuilding the heap on `clearTimeout`. A maximum of `MAX_TIMERS = 256` concurrent active timers is enforced; `setTimeout`/`setInterval` return 0 if the limit is reached.
 
 ## Cascade and inheritance
 

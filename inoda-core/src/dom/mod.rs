@@ -22,6 +22,9 @@ mod tags;
 
 pub const MAX_ATTRIBUTES: usize = 32;
 pub const MAX_ATTRIBUTE_VALUE_LEN: usize = 16384; // 16 KB per attribute
+/// Maximum number of DOM nodes allowed per document.
+/// Prevents memory exhaustion on malicious or malformed HTML.
+pub const MAX_NODES: usize = 65536;
 
 #[derive(Debug, Clone, Copy)]
 pub struct TextMeasureContext {
@@ -242,7 +245,7 @@ impl PropertyName {
 
     /// Returns the CSS property name string (kebab-case) for this variant.
     /// Used by `getAttribute("style")` to reconstruct inline style text.
-    pub fn to_string(self) -> String {
+    pub fn as_str(self) -> &'static str {
         match self {
             PropertyName::Display => "display",
             PropertyName::FlexDirection => "flex-direction",
@@ -281,7 +284,6 @@ impl PropertyName {
             PropertyName::MinHeight => "min-height",
             PropertyName::MaxHeight => "max-height",
         }
-        .to_string()
     }
 }
 
@@ -905,7 +907,6 @@ impl Document {
             }
         }
     }
-
     pub fn hit_test(&self, px: f32, py: f32) -> Option<NodeId> {
         let root_taffy = match self.nodes.get(self.root_id) {
             Some(Node::Root(r)) => r.taffy_node?,
@@ -914,6 +915,8 @@ impl Document {
 
         let mut hit = None;
         let mut stack = vec![(self.root_id, root_taffy, 0.0, 0.0)];
+        // Reusable scratch buffer to avoid per-node Vec allocation
+        let mut children_buf = Vec::new();
 
         while let Some((node_id, taffy_id, offset_x, offset_y)) = stack.pop() {
             if let Ok(layout) = self.taffy_tree.layout(taffy_id) {
@@ -922,29 +925,30 @@ impl Document {
 
                 if px >= abs_x && px <= abs_x + layout.size.width &&
                    py >= abs_y && py <= abs_y + layout.size.height {
-                       
+
                     hit = Some(node_id);
 
-                     let mut children = Vec::new();
-                     let mut child_id = self.first_child_of(node_id);
-                     while let Some(c) = child_id {
-                         children.push(c);
-                         child_id = self.next_sibling_of(c);
-                     }
+                    children_buf.clear();
+                    let mut child_id = self.first_child_of(node_id);
+                    while let Some(c) = child_id {
+                        children_buf.push(c);
+                        child_id = self.next_sibling_of(c);
+                    }
 
-                     for c in children {
-                         let c_taffy = match self.nodes.get(c) {
-                             Some(Node::Element(d)) => d.taffy_node,
-                             Some(Node::Text(d)) => d.taffy_node,
-                             _ => None,
-                         };
-                         if let Some(t) = c_taffy {
-                             stack.push((c, t, abs_x, abs_y));
-                         }
-                     }
+                    for c in &children_buf {
+                        let c_taffy = match self.nodes.get(*c) {
+                            Some(Node::Element(d)) => d.taffy_node,
+                            Some(Node::Text(d)) => d.taffy_node,
+                            _ => None,
+                        };
+                        if let Some(t) = c_taffy {
+                            stack.push((*c, t, abs_x, abs_y));
+                        }
+                    }
                 }
             }
         }
+
         hit
     }
 }

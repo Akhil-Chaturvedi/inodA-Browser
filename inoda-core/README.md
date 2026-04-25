@@ -10,16 +10,16 @@ Early development. The engine can parse simple pages, apply stylesheets, lay out
 
 ## Dependencies
 
-| Crate                | Version | Purpose                                        |
-|----------------------|---------|------------------------------------------------|
-| `html5gum`           | 0.5     | Streaming HTML tokenizer                       |
-| `cssparser`          | 0.36    | Mozilla CSS tokenizer (same one Servo uses)    |
-| `cosmic-text`        | 0.12    | Font shaping and wrapped text measurement      |
-| `taffy`              | 0.9     | Flexbox and CSS Grid layout algorithm          |
-| `rquickjs` | 0.11 | QuickJS JavaScript engine bindings |
-| `generational-arena` | 0.2 | Generational index arena for the DOM |
-| `string_cache` | 0.9 | Atom string interning for HTML tag names |
-| `phf` | 0.11 | Compile-time HTML tag-name set for `LocalName` |
+| Crate                | Version | Purpose                                           |
+|----------------------|---------|---------------------------------------------------|
+| `html5gum`           | 0.5     | Streaming HTML tokenizer                          |
+| `cssparser`          | 0.36    | Mozilla CSS tokenizer (same one Servo uses)       |
+| `cosmic-text`        | 0.12    | Font shaping and wrapped text measurement         |
+| `taffy`              | 0.9     | Flexbox and CSS Grid layout algorithm             |
+| `rquickjs`           | 0.11    | QuickJS JavaScript engine bindings                |
+| `generational-arena` | 0.2     | Generational index arena for the DOM              |
+| `string_cache`       | 0.9     | Atom string interning for HTML tag names          |
+| `phf`                | 0.11    | Compile-time HTML tag-name set for `LocalName`    |
 | `criterion`          | 0.5     | (dev) Benchmark harness for cascade / layout / JS |
 
 ## Module overview
@@ -41,7 +41,7 @@ src/
 
 Tag names are stored as `LocalName`, which is either `Standard(DefaultAtom)` for known HTML elements (interned, pointer-equality comparison) or `Custom(String)` for custom element names. Known tags are resolved with a compile-time `phf` set (callers must pass ASCII-lowercase names, as the tokenizer and `createElement` already do). This prevents unbounded growth of the global intern pool from arbitrary names passed through `document.createElement`.
 
-Attribute keys and values are stored as `String`. To prevent OOM attacks from unbounded attribute names, interning into the global `DefaultAtom` pool is intentionally avoided for attributes. For security, a limit of `MAX_ATTRIBUTES` (32) is enforced during both HTML parsing and JS `setAttribute` calls. This ensures that memory consumption scales linearly with the DOM size and is fully reclaimed upon node destruction. IDs are also stored as `String` and indexed in an $O(1)$ `id_map`.
+Attribute keys and values are stored as `String`. To prevent OOM attacks from unbounded attribute names, interning into the global `DefaultAtom` pool is intentionally avoided for attributes. For security, limits are enforced: `MAX_ATTRIBUTES` (32) per element during parsing and `setAttribute`, `MAX_ATTRIBUTE_VALUE_LEN` (16KB) per value. This ensures that memory consumption scales linearly with the DOM size and is fully reclaimed upon node destruction. IDs are also stored as `String` and indexed in an $O(1)$ `id_map`.
 
 `ComputedStyle` is stored directly inside `ElementData` for optimal L1 cache locality. It uses local enums (`DisplayKeyword`, `FlexDirectionKeyword`, `AlignItemsKeyword`, `JustifyContentKeyword`, `FlexWrapKeyword`) rather than Taffy-native types. `TextData` uses a lightweight `TextComputedStyle` struct containing only `font_size` and `color`, since text nodes do not have box layout properties. Both styles are populated once by `css::compute_styles()` during the cascade; layout and rendering read from these resolved fields without scanning style tuples. Storage is inline to eliminate the CPU overhead of deep-hashing style objects for deduplication.
 

@@ -132,6 +132,10 @@ unsafe impl<'js> rquickjs::JsLifetime<'js> for NodeHandle {
 
 use std::cmp::Ordering;
 
+/// Maximum number of concurrent timers (setTimeout/setInterval).
+/// Prevents timer queue exhaustion on malicious scripts.
+pub const MAX_TIMERS: usize = 256;
+
 /// A pending timer entry storing a persistent JS callback.
 struct PendingTimer {
     id: u32,
@@ -352,7 +356,7 @@ impl JsEngine {
                                             };
                                             format!(
                                                 "{}:{}",
-                                                crate::dom::PropertyName::to_string(*name),
+                                                crate::dom::PropertyName::as_str(*name),
                                                 val_str
                                             )
                                         })
@@ -901,14 +905,18 @@ impl JsEngine {
                     let pending_timers = pending_timers.clone();
                     let active_timers = active_timers.clone();
                     move |cb: Persistent<rquickjs::Function<'static>>, delay: i32| -> u32 {
+                        // Enforce MAX_TIMERS limit to prevent timer queue exhaustion
+                        if active_timers.borrow().len() >= MAX_TIMERS {
+                            return 0; // Return 0 to indicate failure (like standard browsers)
+                        }
                         let timer_id = timer_id_counter.get();
                         timer_id_counter.set(timer_id + 1);
-
+                    
                         active_timers.borrow_mut().insert(timer_id);
-
+                    
                         let delay_ms = delay.max(0) as u64;
                         let fire_at = Instant::now() + std::time::Duration::from_millis(delay_ms);
-
+                    
                         pending_timers.borrow_mut().push(PendingTimer {
                             id: timer_id,
                             fire_at,
@@ -916,7 +924,7 @@ impl JsEngine {
                             is_interval: false,
                             delay_ms,
                         });
-
+                    
                         timer_id
                     }
                 }),
@@ -929,14 +937,18 @@ impl JsEngine {
                     let pending_timers = pending_timers.clone();
                     let active_timers = active_timers.clone();
                     move |cb: Persistent<rquickjs::Function<'static>>, delay: i32| -> u32 {
+                        // Enforce MAX_TIMERS limit to prevent timer queue exhaustion
+                        if active_timers.borrow().len() >= MAX_TIMERS {
+                            return 0; // Return 0 to indicate failure (like standard browsers)
+                        }
                         let timer_id = timer_id_counter.get();
                         timer_id_counter.set(timer_id + 1);
-
+                    
                         active_timers.borrow_mut().insert(timer_id);
-
+                    
                         let delay_ms = delay.max(0) as u64;
                         let fire_at = Instant::now() + std::time::Duration::from_millis(delay_ms);
-
+                    
                         pending_timers.borrow_mut().push(PendingTimer {
                             id: timer_id,
                             fire_at,
@@ -944,7 +956,7 @@ impl JsEngine {
                             is_interval: true,
                             delay_ms,
                         });
-
+                    
                         timer_id
                     }
                 }),

@@ -45,7 +45,7 @@ pub fn draw_layout_tree<R: RendererBackend>(
     root_layout_node_id: taffy::NodeId,
     root_offset_x: f32,
     root_offset_y: f32,
-    buffer_cache: &mut HashMap<crate::dom::NodeId, Buffer>,
+    buffer_cache: &HashMap<crate::dom::NodeId, Buffer>,
 ) {
     // Reusable scratch buffer for collecting child tuples — avoids a
     // per-element `Vec::new()` allocation on every iteration (Item 6).
@@ -109,7 +109,7 @@ pub fn draw_layout_tree<R: RendererBackend>(
                     }
                 }
                 Some(crate::dom::Node::Text(data)) => {
-                    let buffer = buffer_cache.get_mut(&node_id).unwrap();
+                    let buffer = buffer_cache.get(&node_id).unwrap();
                     let color = Color {
                         r: data.computed.color.0,
                         g: data.computed.color.1,

@@ -29,7 +29,7 @@
 //! Note: inline and inline-block are normalized to block.
 //! Box model properties mapped: margin-*, padding-*, border-*-width.
 
-use std::{cell::UnsafeCell, collections::HashMap};
+use std::collections::HashMap;
 
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, Wrap};
 use taffy::{
@@ -68,77 +68,60 @@ pub fn compute_layout(
         &mut scratchpad,
     );
 
-    let tree = &mut document.taffy_tree;
     let available_space = Size {
         width: AvailableSpace::Definite(viewport_width),
         height: AvailableSpace::Definite(viewport_height),
     };
 
-    // Use UnsafeCell instead of RefCell for the measure hot path.
-    // Safety: compute_layout_with_measure executes the closure synchronously
-    // and sequentially. No aliasing mutations occur — font_system and
-    // buffer_cache are only accessed through these cells within the closure,
-    // and the closure is not re-entrant.
-    let font_system_cell = UnsafeCell::new(font_system);
-    let buffer_cache_cell = UnsafeCell::new(buffer_cache);
+    // Taffy 0.9's compute_layout_with_measure takes FnMut, so we can capture
+    // &mut font_system and &mut buffer_cache directly — they are disjoint from
+    // &mut document.taffy_tree. No UnsafeCell needed.
+    document.taffy_tree.compute_layout_with_measure(
+        root_taffy_node,
+        available_space,
+        |_known_dimensions,
+         available_space,
+         _node_id,
+         context: Option<&mut crate::dom::TextMeasureContext>,
+         _style| {
+            let Some(ctx) = context else {
+                return taffy::geometry::Size::ZERO;
+            };
 
-    {
-        // SAFETY: The measure closure is called synchronously by Taffy's solver.
-        // No other code accesses font_system or buffer_cache while the solver runs.
-        let fs = unsafe { &mut *font_system_cell.get() };
-        let bc = unsafe { &mut *buffer_cache_cell.get() };
+            let width_constraint = match available_space.width {
+                AvailableSpace::Definite(w) if w.is_finite() && w > 0.0 => w,
+                _ => viewport_width.max(1.0),
+            };
 
-        tree.compute_layout_with_measure(
-            root_taffy_node,
-            available_space,
-            |_known_dimensions,
-             available_space,
-             _node_id,
-             context: Option<&mut crate::dom::TextMeasureContext>,
-             _style| {
-                let Some(ctx) = context else {
-                    return taffy::geometry::Size::ZERO;
-                };
-
-                let width_constraint = match available_space.width {
-                    AvailableSpace::Definite(w) if w.is_finite() && w > 0.0 => w,
-                    _ => viewport_width.max(1.0),
-                };
-
-                if let Some(buffer) = bc.get_mut(&ctx.node_id) {
-                    let line_height = (ctx.font_size * 1.2).max(1.0);
-                    if let Some(last_w) = ctx.last_measure_width {
-                        if (last_w - width_constraint).abs() <= MEASURE_WIDTH_EPSILON {
-                            let width = ctx.max_intrinsic_width.min(width_constraint);
-                            let height =
-                                (ctx.last_line_count * line_height).max(line_height);
-                            return taffy::geometry::Size { width, height };
-                        }
+            if let Some(buffer) = buffer_cache.get_mut(&ctx.node_id) {
+                let line_height = (ctx.font_size * 1.2).max(1.0);
+                if let Some(last_w) = ctx.last_measure_width {
+                    if (last_w - width_constraint).abs() <= MEASURE_WIDTH_EPSILON {
+                        let width = ctx.max_intrinsic_width.min(width_constraint);
+                        let height =
+                            (ctx.last_line_count * line_height).max(line_height);
+                        return taffy::geometry::Size { width, height };
                     }
-
-                    buffer.set_size(fs, Some(width_constraint), None);
-                    let line_count = buffer.layout_runs().count() as f32;
-                    ctx.last_measure_width = Some(width_constraint);
-                    ctx.last_line_count = line_count;
-
-                    let width = ctx.max_intrinsic_width.min(width_constraint);
-                    let height = (line_count * line_height).max(line_height);
-
-                    taffy::geometry::Size { width, height }
-                } else {
-                    // Fallback to minimal approximation if buffer is missing
-                    let width = ctx.max_intrinsic_width.min(width_constraint);
-                    let height = (ctx.font_size * 1.2).max(1.0);
-                    taffy::geometry::Size { width, height }
                 }
-            },
-        )
-        .unwrap();
-    }
 
-    // Recover owned values from the UnsafeCells
-    let font_system = font_system_cell.into_inner();
-    let buffer_cache = buffer_cache_cell.into_inner();
+                buffer.set_size(font_system, Some(width_constraint), None);
+                let line_count = buffer.layout_runs().count() as f32;
+                ctx.last_measure_width = Some(width_constraint);
+                ctx.last_line_count = line_count;
+
+                let width = ctx.max_intrinsic_width.min(width_constraint);
+                let height = (line_count * line_height).max(line_height);
+
+                taffy::geometry::Size { width, height }
+            } else {
+                // Fallback to minimal approximation if buffer is missing
+                let width = ctx.max_intrinsic_width.min(width_constraint);
+                let height = (ctx.font_size * 1.2).max(1.0);
+                taffy::geometry::Size { width, height }
+            }
+        },
+    )
+    .unwrap();
 
     // We walk the tree one last time to enforce exact text heights for empty nodes
     finalize_text_measurements(
@@ -163,7 +146,8 @@ fn prepare_text_buffers(
         if let Some(crate::dom::Node::Text(data)) = document.nodes.get_mut(node_id) {
             if data.layout_dirty {
                 buffer_cache.remove(&node_id);
-                data.layout_dirty = false;
+                // Don't clear layout_dirty here — build_taffy_node still needs to
+                // read it to decide whether to recalculate intrinsic widths.
             }
 
             let font_size = data.computed.font_size;
@@ -480,8 +464,14 @@ fn build_taffy_node(
     
         // is_text specific shaping:
         if is_text {
-            let needs_measure = is_new_taffy_node || match document.nodes.get(node_id) {
-                Some(crate::dom::Node::Text(t)) => t.layout_dirty,
+            // Read AND clear layout_dirty here (deferred from prepare_text_buffers).
+            // This ensures intrinsic widths are recalculated for dirty text nodes.
+            let needs_measure = is_new_taffy_node || match document.nodes.get_mut(node_id) {
+                Some(crate::dom::Node::Text(t)) => {
+                    let dirty = t.layout_dirty;
+                    t.layout_dirty = false;
+                    dirty
+                }
                 _ => false,
             };
 

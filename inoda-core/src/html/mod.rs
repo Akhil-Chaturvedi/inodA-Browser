@@ -53,6 +53,9 @@ pub fn parse_html(html: &str) -> Document {
                     }
                     // Zero-allocation UTF-8 validation for attribute keys
                     let k_str = std::str::from_utf8(&key).unwrap_or("").to_string();
+                    if k_str.is_empty() {
+                        continue;
+                    }
                     // Attribute values must be owned; validate UTF-8 without lossy replacement
                     let mut v_str = std::str::from_utf8(&value).unwrap_or("").to_string();
 

@@ -230,16 +230,16 @@ impl PropertyName {
     }
 
     /// Returns true if this property is CSS-inheritable.
+    ///
+    /// Only properties with corresponding `ComputedStyle` fields that are actually
+    /// applied during the cascade are listed here. Unimplemented properties
+    /// (FontFamily, FontWeight, LineHeight, TextAlign, Visibility) are parsed
+    /// and stored but silently discarded — marking them inheritable would waste
+    /// cascade time propagating values that are never applied.
     pub fn is_inheritable(&self) -> bool {
         matches!(
             self,
-            PropertyName::Color
-            | PropertyName::FontFamily
-            | PropertyName::FontSize
-            | PropertyName::FontWeight
-            | PropertyName::LineHeight
-            | PropertyName::TextAlign
-            | PropertyName::Visibility
+            PropertyName::Color | PropertyName::FontSize
         )
     }
 
@@ -557,15 +557,10 @@ impl Document {
         
         let node_copy = self.nodes.get(id).cloned();
 
-        // 1. Unlink from parent and siblings
+        // Unlink from parent and siblings; remove_child now handles cleanup
+        // of detached subtrees with zero JS handles.
         if let Some(parent_id) = self.parent_of(id) {
             self.remove_child(parent_id, id);
-        }
-
-        // 2. If it's now detached and the whole tree has 0 handles, wipe it.
-        // This keeps the Arena clean for non-JS-referenced nodes.
-        if id != self.root_id && self.can_wipe_detached_tree(id) {
-            self.wipe_node_recursive(id);
         }
 
         node_copy
@@ -819,6 +814,13 @@ impl Document {
         self.set_parent(child_id, None);
         self.set_prev_sibling(child_id, None);
         self.set_next_sibling(child_id, None);
+
+        // Attempt to wipe the detached subtree if no JS handles reference it.
+        // This prevents memory leaks for parser-created nodes removed via removeChild
+        // that were never held by JS (and thus never trigger FinalizationRegistry).
+        if child_id != self.root_id && self.can_wipe_detached_tree(child_id) {
+            self.wipe_node_recursive(child_id);
+        }
     }
 
     pub fn is_attached_to_root(&self, node_id: NodeId) -> bool {

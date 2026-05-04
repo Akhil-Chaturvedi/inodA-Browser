@@ -29,7 +29,7 @@ use cssparser::{Parser, ParserInput, Token};
 /// A single selector component.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SimpleSelector {
-    Tag(String),
+    Tag(crate::dom::LocalName),
     Class(String),
     Id(String),
     Attribute(String, Option<String>),
@@ -132,8 +132,14 @@ impl StyleSheet {
                     .or_default()
                     .push(indexed);
             } else if let Some(tag) = tag_key {
+                // Convert LocalName to DefaultAtom for the tag index.
+                // Standard tags reuse the existing atom (cheap clone); custom tags intern once.
+                let atom = match &tag {
+                    crate::dom::LocalName::Standard(a) => a.clone(),
+                    crate::dom::LocalName::Custom(s) => string_cache::DefaultAtom::from(s.as_str()),
+                };
                 self.by_tag
-                    .entry(string_cache::DefaultAtom::from(tag.as_str()))
+                    .entry(atom)
                     .or_default()
                     .push(indexed);
             } else {
@@ -248,6 +254,8 @@ fn parse_color(val: &str) -> Option<(u8, u8, u8, u8)> {
                 };
                 
                 let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+                // CSS spec: hue is unbounded and must be normalized to [0, 360)
+                let h = h.rem_euclid(360.0);
                 let h_prime = h / 60.0;
                 let x = c * (1.0 - (h_prime % 2.0 - 1.0).abs());
                 let m = l - c / 2.0;
@@ -329,6 +337,62 @@ pub fn parse_style_value(val: &str) -> crate::dom::StyleValue {
         crate::dom::StyleValue::Keyword(string_cache::DefaultAtom::from(trimmed))
     } else {
         crate::dom::StyleValue::Keyword(string_cache::DefaultAtom::from("unknown"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shorthand expansion — shared by both stylesheet rules and inline styles
+// ---------------------------------------------------------------------------
+
+/// Expand `margin` or `padding` shorthand into longhand declarations.
+/// Pushes results into `declarations` to avoid extra allocation.
+fn expand_margin_padding_shorthand(
+    name_str: &str,
+    value_trimmed: &str,
+    declarations: &mut Vec<Declaration>,
+) {
+    let parts: Vec<&str> = value_trimmed.split_whitespace().collect();
+    let (top, right, bottom, left) = if name_str == "margin" {
+        ("margin-top", "margin-right", "margin-bottom", "margin-left")
+    } else {
+        ("padding-top", "padding-right", "padding-bottom", "padding-left")
+    };
+
+    match parts.len() {
+        1 => {
+            for n in [top, right, bottom, left] {
+                if let Some(p) = crate::dom::PropertyName::from_str(n) {
+                    declarations.push(Declaration { name: p, value: parse_style_value(parts[0]) });
+                }
+            }
+        }
+        2 => {
+            let v = [parts[0], parts[1], parts[0], parts[1]]; // T, R, B, L
+            let n = [top, right, bottom, left];
+            for i in 0..4 {
+                if let Some(p) = crate::dom::PropertyName::from_str(n[i]) {
+                    declarations.push(Declaration { name: p, value: parse_style_value(v[i]) });
+                }
+            }
+        }
+        3 => {
+            let v = [parts[0], parts[1], parts[2], parts[1]]; // T, R, B, L
+            let n = [top, right, bottom, left];
+            for i in 0..4 {
+                if let Some(p) = crate::dom::PropertyName::from_str(n[i]) {
+                    declarations.push(Declaration { name: p, value: parse_style_value(v[i]) });
+                }
+            }
+        }
+        4 => {
+            let n = [top, right, bottom, left];
+            for i in 0..4 {
+                if let Some(p) = crate::dom::PropertyName::from_str(n[i]) {
+                    declarations.push(Declaration { name: p, value: parse_style_value(parts[i]) });
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -456,7 +520,7 @@ fn parse_compound_selector(s: &str) -> CompoundSelector {
         if tag == "*" {
             parts.push(SimpleSelector::Universal);
         } else if !tag.is_empty() {
-            parts.push(SimpleSelector::Tag(tag.to_string()));
+            parts.push(SimpleSelector::Tag(crate::dom::LocalName::new(tag)));
             spec.2 += 1;
         }
         remaining = &remaining[end..];
@@ -610,7 +674,8 @@ fn match_compound_selector(
     for part in &compound.parts {
         match part {
             SimpleSelector::Tag(t) => {
-                if t != &**tag_name {
+                // LocalName PartialEq: pointer comparison for Standard tags, string for Custom
+                if t != tag_name {
                     return false;
                 }
             }
@@ -1044,86 +1109,8 @@ fn parse_rule<'i, 't>(
                 let value_trimmed = value.trim();
                 let name_str = name; // string_cache interning input string
                 if name_str == "margin" || name_str == "padding" {
-                    let parts: Vec<&str> = value_trimmed.split_whitespace().collect();
-                    let (top, right, bottom, left) = if name_str == "margin" {
-                        ("margin-top", "margin-right", "margin-bottom", "margin-left")
-                    } else {
-                        (
-                            "padding-top",
-                            "padding-right",
-                            "padding-bottom",
-                            "padding-left",
-                        )
-                    };
-                    match parts.len() {
-                        1 => {
-                            if let Some(p) = crate::dom::PropertyName::from_str(top) {
-                                declarations.push(Declaration { name: p, value: parse_style_value(parts[0]) });
-                            }
-                            if let Some(p) = crate::dom::PropertyName::from_str(right) {
-                                declarations.push(Declaration { name: p, value: parse_style_value(parts[0]) });
-                            }
-                            if let Some(p) = crate::dom::PropertyName::from_str(bottom) {
-                                declarations.push(Declaration { name: p, value: parse_style_value(parts[0]) });
-                            }
-                            if let Some(p) = crate::dom::PropertyName::from_str(left) {
-                                declarations.push(Declaration { name: p, value: parse_style_value(parts[0]) });
-                            }
-                        }
-                        2 => {
-                            if let Some(p) = crate::dom::PropertyName::from_str(top) {
-                                declarations.push(Declaration { name: p, value: parse_style_value(parts[0]) });
-                            }
-                            if let Some(p) = crate::dom::PropertyName::from_str(bottom) {
-                                declarations.push(Declaration { name: p, value: parse_style_value(parts[0]) });
-                            }
-                            if let Some(p) = crate::dom::PropertyName::from_str(left) {
-                                declarations.push(Declaration { name: p, value: parse_style_value(parts[1]) });
-                            }
-                            if let Some(p) = crate::dom::PropertyName::from_str(right) {
-                                declarations.push(Declaration { name: p, value: parse_style_value(parts[1]) });
-                            }
-                        }
-                        3 => {
-                            let values = [
-                                parse_style_value(parts[0]), // top
-                                parse_style_value(parts[1]), // horizontal (right)
-                                parse_style_value(parts[2]), // bottom
-                                parse_style_value(parts[1]), // horizontal (left)
-                            ];
-                            let names = [top, right, bottom, left];
-                            for i in 0..4 {
-                                if let Some(p) = crate::dom::PropertyName::from_str(names[i]) {
-                                    declarations.push(Declaration {
-                                        name: p,
-                                        value: values[i].clone(),
-                                    });
-                                }
-                            }
-                        }
-                        4 => {
-                            if let Some(p) = crate::dom::PropertyName::from_str(top) {
-                                declarations.push(Declaration { name: p, value: parse_style_value(parts[0]) });
-                            }
-                            if let Some(p) = crate::dom::PropertyName::from_str(right) {
-                                declarations.push(Declaration { name: p, value: parse_style_value(parts[1]) });
-                            }
-                            if let Some(p) = crate::dom::PropertyName::from_str(bottom) {
-                                declarations.push(Declaration { name: p, value: parse_style_value(parts[2]) });
-                            }
-                            if let Some(p) = crate::dom::PropertyName::from_str(left) {
-                                declarations.push(Declaration { name: p, value: parse_style_value(parts[3]) });
-                            }
-                        }
-                        _ => {
-                            if let Some(p) = crate::dom::PropertyName::from_str(&name_str) {
-                                declarations.push(Declaration {
-                                    name: p,
-                                    value: parse_style_value(&value),
-                                });
-                            }
-                        }
-                    }
+                    expand_margin_padding_shorthand(name_str.as_str(), value_trimmed, &mut declarations);
+                } else if name_str == "background" {
                     if let Some(p) = crate::dom::PropertyName::from_str("background-color") {
                         declarations.push(Declaration {
                             name: p,
@@ -1201,49 +1188,7 @@ impl<'i> DeclarationParser<'i> for InlineStyleParser {
         let mut declarations = Vec::new();
 
         if name_str == "margin" || name_str == "padding" {
-            let parts: Vec<&str> = value_trimmed.split_whitespace().collect();
-            let (top, right, bottom, left) = if name_str == "margin" {
-                ("margin-top", "margin-right", "margin-bottom", "margin-left")
-            } else {
-                ("padding-top", "padding-right", "padding-bottom", "padding-left")
-            };
-
-            match parts.len() {
-                1 => {
-                    for n in [top, right, bottom, left] {
-                        if let Some(p) = crate::dom::PropertyName::from_str(n) {
-                            declarations.push(Declaration { name: p, value: parse_style_value(parts[0]) });
-                        }
-                    }
-                }
-                2 => {
-                    let v = [parts[0], parts[1], parts[0], parts[1]]; // T, R, B, L
-                    let n = [top, right, bottom, left];
-                    for i in 0..4 {
-                        if let Some(p) = crate::dom::PropertyName::from_str(n[i]) {
-                            declarations.push(Declaration { name: p, value: parse_style_value(v[i]) });
-                        }
-                    }
-                }
-                3 => {
-                    let v = [parts[0], parts[1], parts[2], parts[1]]; // T, R, B, L
-                    let n = [top, right, bottom, left];
-                    for i in 0..4 {
-                        if let Some(p) = crate::dom::PropertyName::from_str(n[i]) {
-                            declarations.push(Declaration { name: p, value: parse_style_value(v[i]) });
-                        }
-                    }
-                }
-                4 => {
-                    let n = [top, right, bottom, left];
-                    for i in 0..4 {
-                        if let Some(p) = crate::dom::PropertyName::from_str(n[i]) {
-                            declarations.push(Declaration { name: p, value: parse_style_value(parts[i]) });
-                        }
-                    }
-                }
-                _ => {}
-            }
+            expand_margin_padding_shorthand(name_str, value_trimmed, &mut declarations);
         } else if name_str == "background" {
             if let Some(p) = crate::dom::PropertyName::from_str("background-color") {
                 declarations.push(Declaration { name: p, value: parse_style_value(value_trimmed) });

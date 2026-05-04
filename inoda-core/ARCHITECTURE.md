@@ -32,7 +32,7 @@ render::draw_layout_tree()  -- iterative stack-based traversal (no recursion),
                                draw_glyphs (text content)
 ```
 
-JavaScript execution is separate from this pipeline. DOM nodes exposed to JS carry a `js_handles` reference count. QuickJS wrapper objects are tracked by a `FinalizationRegistry`; when GC'd, they decrement the `js_handles` count for the corresponding Rust arena node. Detached nodes are only wiped from the arena when no JS handles remain.
+JavaScript execution is separate from this pipeline. DOM nodes exposed to JS carry a `js_handles` reference count. QuickJS wrapper objects are tracked by a `FinalizationRegistry`; when GC'd, they decrement the `js_handles` count for the corresponding Rust arena node. `remove_child` proactively wipes detached subtrees that have zero JS handles; otherwise, detached nodes are reclaimed by the batched `collect_garbage()` sweep.
 
 JS mutations set `document.dirty = true`. The host application is responsible for checking `dirty` and re-running `compute_styles`, `compute_layout`, and `draw_layout_tree` after JS mutations. Timer callbacks registered via `setTimeout` or `setInterval` fire only when the host calls `JsEngine::pump()`. `pump()` runs the QuickJS job queue synchronously until empty. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue and reclaim memory from detached, unreferenced nodes.
 
@@ -179,7 +179,7 @@ Timers are stored in a `std::collections::BinaryHeap` ordered by `fire_at` (min-
 5. Assigns the resulting `ComputedStyle` directly to the node and marks `layout_dirty = true` if the style mathematically differed from its prior state.
 6. Pushes children onto the traversal stack alongside property heredity vectors.
 
-Inheritable properties (`color`, `font-size`, etc.) are resolved during the cascade and stored in the `ComputedStyle`. Combinator evaluation (`>` child, space descendant, `+` next-sibling, `~` subsequent-sibling) walks arena parent and sibling pointers rather than maintaining a separate ancestor stack. Attribute selectors (`[attr]`, `[attr=value]`) are matched against `ElementData::attributes`.
+Inheritable properties (`color`, `font-size`) are resolved during the cascade and stored in the `ComputedStyle`. Combinator evaluation (`>` child, space descendant, `+` next-sibling, `~` subsequent-sibling) walks arena parent and sibling pointers rather than maintaining a separate ancestor stack. Attribute selectors (`[attr]`, `[attr=value]`) are matched against `ElementData::attributes`.
 
 ## JavaScript bridge
 
@@ -189,7 +189,7 @@ JavaScript object identity (`===`) is enforced via a `_wrapNode` WeakRef cache. 
 
 `JsEngine::pump()` executes pending JavaScript jobs (microtasks/promises) until the queue is empty. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue.
 
-`NodeHandle` does not implement `Drop`. Nodes created by JavaScript persist in the arena until explicitly removed via `removeChild()`. This prevents QuickJS garbage collection from triggering arena mutations on nodes that are still part of the tree.
+`NodeHandle` does not implement `Drop`. Nodes created by JavaScript persist in the arena until explicitly removed via `removeChild()`. When `removeChild()` detaches a subtree with zero JS handles, the subtree is wiped immediately rather than deferred to `collect_garbage()`. This prevents QuickJS garbage collection from triggering arena mutations on nodes that are still part of the tree.
 
 ## Text measurement
 

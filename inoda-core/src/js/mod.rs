@@ -993,10 +993,14 @@ impl JsEngine {
         })
     }
 
+    /// Maximum number of pending JS jobs executed per `pump()` call.
+    /// Prevents microtask starvation from infinite Promise chains.
+    const MAX_JOBS_PER_PUMP: usize = 1024;
+
     /// Pump the timer queue. Fires all expired timers whose delay has elapsed.
-    /// Returns the number of timers that fired.
+    /// Returns (number of timers fired, whether pending JS jobs remain).
     /// The host application should call this on each iteration of its event loop.
-    pub fn pump(&self) -> u32 {
+    pub fn pump(&self) -> (u32, bool) {
         let now = Instant::now();
         let mut expired = Vec::new();
         let mut rescheduled = Vec::new();
@@ -1068,10 +1072,18 @@ impl JsEngine {
         }
 
         self.last_start_time.set(Some(Instant::now()));
-        while let Ok(true) = self.runtime.execute_pending_job() {}
+        let mut job_count = 0usize;
+        let mut has_more = false;
+        while let Ok(true) = self.runtime.execute_pending_job() {
+            job_count += 1;
+            if job_count >= Self::MAX_JOBS_PER_PUMP {
+                has_more = true;
+                break;
+            }
+        }
         self.last_start_time.set(None);
 
-        count
+        (count, has_more)
     }
 
     /// Returns true if there are pending timers that haven't fired yet.

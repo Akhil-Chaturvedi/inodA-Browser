@@ -34,7 +34,7 @@ render::draw_layout_tree()  -- iterative stack-based traversal (no recursion),
 
 JavaScript execution is separate from this pipeline. DOM nodes exposed to JS carry a `js_handles` reference count. QuickJS wrapper objects are tracked by a `FinalizationRegistry`; when GC'd, they decrement the `js_handles` count for the corresponding Rust arena node. `remove_child` proactively wipes detached subtrees that have zero JS handles; otherwise, detached nodes are reclaimed by the batched `collect_garbage()` sweep.
 
-JS mutations set `document.dirty = true`. The host application is responsible for checking `dirty` and re-running `compute_styles`, `compute_layout`, and `draw_layout_tree` after JS mutations. Timer callbacks registered via `setTimeout` or `setInterval` fire only when the host calls `JsEngine::pump()`. `pump()` runs the QuickJS job queue synchronously until empty. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue and reclaim memory from detached, unreferenced nodes.
+JS mutations set `document.dirty = true`. The host application is responsible for checking `dirty` and re-running `compute_styles`, `compute_layout`, and `draw_layout_tree` after JS mutations. Timer callbacks registered via `setTimeout` or `setInterval` fire only when the host calls `JsEngine::pump()`. `pump()` runs the QuickJS job queue with a cap of `MAX_JOBS_PER_PUMP = 1024` to prevent microtask starvation from infinite Promise chains. It returns `(u32, bool)`: the number of timers fired and whether pending jobs remain. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue and reclaim memory from detached, unreferenced nodes.
 
 ## Data structures
 
@@ -175,7 +175,7 @@ Timers are stored in a `std::collections::BinaryHeap` ordered by `fire_at` (min-
 1. Looks up matching rules from `document.stylesheet` buckets (by ID, class, tag, universal). The `lists` collection is scoped as `SmallVec<[&[IndexedRule]; 8]>` to eliminate heap allocations per element while gathering static `stylesheet` bucket slices arrays. It maps classes by directly splitting `data.classes.split_whitespace()`.
 2. Merges matched rules using a k-way specificity-ordered pointer walk.
 3. Applies inline `style` attribute declarations last (highest priority).
-4. Resolves the final property set against a fixed-size `[Option<StyleValue>; 36]` array using property bitmasks.
+4. Resolves the final property set against a fixed-size `[Option<StyleValue>; 41]` array using property bitmasks.
 5. Assigns the resulting `ComputedStyle` directly to the node and marks `layout_dirty = true` if the style mathematically differed from its prior state.
 6. Pushes children onto the traversal stack alongside property heredity vectors.
 
@@ -187,9 +187,15 @@ Inheritable properties (`color`, `font-size`) are resolved during the cascade an
 
 JavaScript object identity (`===`) is enforced via a `_wrapNode` WeakRef cache. Rust traversals (e.g. `parentNode`, `firstChild`) and properties like `tagName` are patched onto the `NodeHandle` prototype as getters using closures that proxy through this cache and the arena. `__nodeRegistry` and `__ephemeralRegistry` are both `FinalizationRegistry` instances keyed by the raw `[u32 index, u64 generation]` array: canonical wrappers use the former (delete WeakRef map entry, then `_garbageCollectNodeRaw`); ephemeral duplicate raw wrappers created on cache hits use the latter (only `_garbageCollectNodeRaw`), pairing each `js_handles += 1` from raw getters with exactly one GC callback. `NodeHandle` itself contains no heap-allocated strings, only raw arena identifiers.
 
-`JsEngine::pump()` executes pending JavaScript jobs (microtasks/promises) until the queue is empty. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue.
+`JsEngine::pump()` executes pending JavaScript jobs (microtasks/promises) with a cap of `MAX_JOBS_PER_PUMP = 1024` to prevent infinite Promise chains from starving the host event loop. It returns `(u32, bool)`: the number of timers fired and whether pending jobs remain (the host should call `pump()` again if `has_more` is true). Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue.
 
 `NodeHandle` does not implement `Drop`. Nodes created by JavaScript persist in the arena until explicitly removed via `removeChild()`. When `removeChild()` detaches a subtree with zero JS handles, the subtree is wiped immediately rather than deferred to `collect_garbage()`. This prevents QuickJS garbage collection from triggering arena mutations on nodes that are still part of the tree.
+
+## Positioning
+
+The engine supports `position: static` (default), `position: relative`, and `position: absolute` with `top`, `right`, `bottom`, `left` inset properties. Both CSS `static` and `relative` map to Taffy's `Position::Relative`; the distinction is handled by only applying inset values when position is not `static`. Absolute positioning removes the element from normal flow.
+
+**Containing block limitation:** Taffy positions absolute children relative to their **direct parent** in the Taffy tree, not the nearest positioned ancestor per the CSS spec. For HMI layouts where positioned parents are direct parents, this is correct. Do not attempt to work around this — it is a Taffy architectural constraint.
 
 ## Text measurement
 

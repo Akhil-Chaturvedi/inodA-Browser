@@ -326,7 +326,7 @@ pub fn parse_style_value(val: &str) -> crate::dom::StyleValue {
     let known_keywords = [
         "auto", "none", "block", "inline", "inline-block", "list-item", "flex", "grid",
         "row", "column", "inherit",
-        "absolute", "relative", "fixed", "sticky",
+        "absolute", "relative", "static", "fixed", "sticky",
         "hidden", "visible", "scroll", "clip",
         "center", "start", "end", "flex-start", "flex-end", "baseline", "stretch", 
         "space-between", "space-around", "space-evenly",
@@ -968,6 +968,17 @@ pub fn compute_styles(document: &mut crate::dom::Document, base_stylesheet: &Sty
                             33 => next_computed.max_width = val.clone(),
                             34 => next_computed.min_height = val.clone(),
                             35 => next_computed.max_height = val.clone(),
+                            36 => if let crate::dom::StyleValue::Keyword(v) = val {
+                                next_computed.position = match &**v {
+                                    "absolute" => crate::dom::PositionKeyword::Absolute,
+                                    "relative" => crate::dom::PositionKeyword::Relative,
+                                    _ => crate::dom::PositionKeyword::Static,
+                                };
+                            },
+                            37 => next_computed.inset[0] = val.clone(),
+                            38 => next_computed.inset[1] = val.clone(),
+                            39 => next_computed.inset[2] = val.clone(),
+                            40 => next_computed.inset[3] = val.clone(),
                             _ => {}
                         }
                     }

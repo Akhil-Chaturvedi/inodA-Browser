@@ -432,6 +432,30 @@ fn build_taffy_node(
             style.border.left = dim;
         }
 
+        // Position mapping: Static and Relative both map to Taffy::Relative (Taffy has no Static).
+        // The distinction is handled by whether inset values are applied.
+        style.position = match computed.position {
+            crate::dom::PositionKeyword::Absolute => taffy::style::Position::Absolute,
+            _ => taffy::style::Position::Relative,
+        };
+
+        // Inset mapping — only apply for non-static positioning.
+        // For Static, inset has no effect per CSS spec.
+        if computed.position != crate::dom::PositionKeyword::Static {
+            if let Some(dim) = parse_length_percentage_auto(&computed.inset[0], vw, vh, font_size, root_font_size) {
+                style.inset.top = dim;
+            }
+            if let Some(dim) = parse_length_percentage_auto(&computed.inset[1], vw, vh, font_size, root_font_size) {
+                style.inset.right = dim;
+            }
+            if let Some(dim) = parse_length_percentage_auto(&computed.inset[2], vw, vh, font_size, root_font_size) {
+                style.inset.bottom = dim;
+            }
+            if let Some(dim) = parse_length_percentage_auto(&computed.inset[3], vw, vh, font_size, root_font_size) {
+                style.inset.left = dim;
+            }
+        }
+
         let mut aspect_ratio = None;
         if let Some(crate::dom::Node::Element(d)) = document.nodes.get(node_id) {
             if &*d.tag_name == "img" {

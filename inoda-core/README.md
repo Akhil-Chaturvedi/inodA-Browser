@@ -94,11 +94,15 @@ Supported CSS properties mapped to Taffy:
 - `align-items`, `justify-content`, `flex-wrap`, `flex-grow`, `flex-shrink`
 - `row-gap`, `column-gap`
 - `min-width`, `max-width`, `min-height`, `max-height`
+- `position`: static, relative, absolute
+- `top`, `right`, `bottom`, `left` (length, percentage, auto)
 - `<img>` intrinsic sizing via `width`/`height` HTML attributes and Taffy `aspect_ratio`
 
 Non-flex elements default to `flex-direction: column` to approximate block stacking.
 
-Properties not wired: `position`, `overflow`, `z-index`, `float`.
+**Containing block limitation:** `position: absolute` is relative to the direct parent, not the nearest positioned ancestor per CSS spec. This is a Taffy constraint acceptable for HMI layouts.
+
+Properties not wired: `overflow`, `z-index`, `float`.
 
 ### render
 
@@ -143,7 +147,7 @@ JavaScript object identity (`===`) is enforced via a `_wrapNode` WeakRef cache i
 
 Timer callbacks are stored as `rquickjs::Persistent<Function>`. Pending timers are in a `BinaryHeap` sorted by `fire_at`. To prevent memory drift from cancelled timers, the heap is compacted when it expands beyond 128 items. Cancelled timer IDs are tracked in a `HashSet<u32>`; `pump()` skips popped timers whose IDs appear in the set. When an interval timer fires, a new `PendingTimer` is pushed with the next scheduled time. Rescheduled interval timers are collected into a separate local `Vec` before being pushed back to the heap; this prevents `setInterval(cb, 0)` from re-appearing at the top of the heap within the same `pump()` call and locking the loop.
 
-`JsEngine::pump()` executes pending JavaScript jobs (microtasks/promises) until the queue is empty before returning control to the host event loop. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue.
+`JsEngine::pump()` executes pending JavaScript jobs (microtasks/promises) with a cap of `MAX_JOBS_PER_PUMP = 1024` to prevent infinite Promise chains from starving the host event loop. Returns `(u32, bool)`: the number of timers fired and whether pending jobs remain. Every 60 ticks, `document.collect_garbage()` is called to clear the batched deletion queue.
 
 ## Building
 
@@ -179,7 +183,7 @@ This list is not exhaustive. The engine is a working skeleton, not a production 
 - Inline formatting context is incomplete (no baseline alignment or float interaction).
 - Font loading and fallback are backend-specific and must be provided by the host.
 - `display: inline` and `inline-block` are parsed but treated identically to block.
-- Layout properties `position`, `overflow`, `z-index`, `float` are not wired to Taffy.
+- Layout properties `overflow`, `z-index`, `float` are not wired to Taffy. `position: absolute` is relative to the direct parent (Taffy constraint).
 - No `@media`, `@import`, `@keyframes`, CSS variables, or `calc()`.
 - Selector matching supports `>` (child), space (descendant), `+` (next-sibling), `~` (subsequent-sibling) combinators and `[attr]`/`[attr=value]` attribute selectors, but not `:pseudo-class()` with arguments.
 - Event dispatching uses flat hit-testing on layout geometry; there is no DOM event bubbling or capture phase.

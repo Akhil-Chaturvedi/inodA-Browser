@@ -141,9 +141,14 @@ pub enum PropertyName {
     MaxWidth,
     MinHeight,
     MaxHeight,
+    Position,
+    Top,
+    Right,
+    Bottom,
+    Left,
 }
 
-pub const NUM_PROPERTIES: usize = 36;
+pub const NUM_PROPERTIES: usize = 41;
 
 impl PropertyName {
     pub fn to_index(self) -> usize {
@@ -184,6 +189,11 @@ impl PropertyName {
             PropertyName::MaxWidth => 33,
             PropertyName::MinHeight => 34,
             PropertyName::MaxHeight => 35,
+            PropertyName::Position => 36,
+            PropertyName::Top => 37,
+            PropertyName::Right => 38,
+            PropertyName::Bottom => 39,
+            PropertyName::Left => 40,
         }
     }
 
@@ -225,6 +235,11 @@ impl PropertyName {
             "max-width" => PropertyName::MaxWidth,
             "min-height" => PropertyName::MinHeight,
             "max-height" => PropertyName::MaxHeight,
+            "position" => PropertyName::Position,
+            "top" => PropertyName::Top,
+            "right" => PropertyName::Right,
+            "bottom" => PropertyName::Bottom,
+            "left" => PropertyName::Left,
             _ => return None,
         })
     }
@@ -283,6 +298,11 @@ impl PropertyName {
             PropertyName::MaxWidth => "max-width",
             PropertyName::MinHeight => "min-height",
             PropertyName::MaxHeight => "max-height",
+            PropertyName::Position => "position",
+            PropertyName::Top => "top",
+            PropertyName::Right => "right",
+            PropertyName::Bottom => "bottom",
+            PropertyName::Left => "left",
         }
     }
 }
@@ -407,6 +427,9 @@ pub enum JustifyContentKeyword { FlexStart, FlexEnd, Center, SpaceBetween, Space
 #[derive(Debug, Clone, PartialEq)]
 pub enum FlexWrapKeyword { Wrap, WrapReverse, NoWrap }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PositionKeyword { Static, Relative, Absolute }
+
 /// Pre-calculated native CSS properties to eliminate O(N) tuple lookups during Layout and Rendering loops.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComputedStyle {
@@ -433,6 +456,9 @@ pub struct ComputedStyle {
     pub color: (u8, u8, u8, u8),
     pub flex_grow: f32,
     pub flex_shrink: f32,
+    pub position: PositionKeyword,
+    /// Top, Right, Bottom, Left inset values.
+    pub inset: [StyleValue; 4],
 }
 
 impl Eq for ComputedStyle {}
@@ -477,6 +503,8 @@ impl Default for ComputedStyle {
             color: (0, 0, 0, 255),
             flex_grow: 0.0,
             flex_shrink: 1.0,
+            position: PositionKeyword::Static,
+            inset: [StyleValue::Auto, StyleValue::Auto, StyleValue::Auto, StyleValue::Auto],
         }
     }
 }

@@ -500,4 +500,76 @@ mod tests {
                 "Truncated string should be valid UTF-8, got bytes: {:?}", &data.classes.as_bytes()[data.classes.len().saturating_sub(10)..]);
         }
     }
+
+    #[test]
+    fn test_js_pump_job_limit() {
+        // Without MAX_JOBS_PER_PUMP, this infinite Promise loop would hang the test runner.
+        let doc = html::parse_html("<html><body></body></html>");
+        let engine = js::JsEngine::try_new(doc).expect("try_new");
+        engine
+            .execute_script("function loop() { Promise.resolve().then(loop); } loop();")
+            .unwrap();
+        let (_fired, has_more) = engine.pump();
+        assert!(has_more, "pump() should report pending jobs after hitting MAX_JOBS_PER_PUMP");
+        // Engine is dropped here, cleaning up the pending job queue.
+    }
+
+    #[test]
+    fn test_absolute_positioning() {
+        use cosmic_text::{Buffer, FontSystem};
+        use std::collections::HashMap;
+
+        let html = r#"<div style="position: relative; width: 100px; height: 100px;">
+            <div id="child" style="position: absolute; top: 10px; left: 10px; width: 10px; height: 10px;"></div>
+        </div>"#;
+        let mut doc = crate::html::parse_html(html);
+        let stylesheet = crate::css::StyleSheet::default();
+        crate::css::compute_styles(&mut doc, &stylesheet);
+
+        let mut font_system = FontSystem::new();
+        let mut buffer_cache: HashMap<crate::dom::NodeId, Buffer> = HashMap::new();
+        crate::layout::compute_layout(&mut doc, 800.0, 600.0, &mut font_system, &mut buffer_cache);
+
+        // Resolve child: id_map -> DOM NodeId -> element.taffy_node -> Taffy NodeId
+        let child_dom_id = *doc.id_map.get("child").expect("child not found");
+        let child_taffy_id = match doc.nodes.get(child_dom_id) {
+            Some(crate::dom::Node::Element(d)) => d.taffy_node.expect("child has no taffy node"),
+            _ => panic!("child is not an element"),
+        };
+        let child_layout = doc.taffy_tree.layout(child_taffy_id).unwrap();
+        assert!(
+            (child_layout.location.x - 10.0).abs() < 0.01,
+            "child x should be ~10.0, got {}",
+            child_layout.location.x
+        );
+        assert!(
+            (child_layout.location.y - 10.0).abs() < 0.01,
+            "child y should be ~10.0, got {}",
+            child_layout.location.y
+        );
+        assert!(
+            (child_layout.size.width - 10.0).abs() < 0.01,
+            "child width should be ~10.0, got {}",
+            child_layout.size.width
+        );
+        assert!(
+            (child_layout.size.height - 10.0).abs() < 0.01,
+            "child height should be ~10.0, got {}",
+            child_layout.size.height
+        );
+
+        // Absolute children must NOT affect parent sizing.
+        // Resolve parent: root -> first_child -> element.taffy_node -> Taffy NodeId
+        let parent_dom_id = doc.first_child_of(doc.root_id).expect("parent div");
+        let parent_taffy_id = match doc.nodes.get(parent_dom_id) {
+            Some(crate::dom::Node::Element(d)) => d.taffy_node.expect("parent has no taffy node"),
+            _ => panic!("parent is not an element"),
+        };
+        let parent_layout = doc.taffy_tree.layout(parent_taffy_id).unwrap();
+        assert!(
+            (parent_layout.size.width - 100.0).abs() < 0.01,
+            "parent width should be ~100.0 (absolute child does not affect parent sizing), got {}",
+            parent_layout.size.width
+        );
+    }
 }

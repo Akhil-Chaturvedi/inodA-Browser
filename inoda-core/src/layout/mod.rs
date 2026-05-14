@@ -90,6 +90,8 @@ pub fn compute_layout(
 
             let width_constraint = match available_space.width {
                 AvailableSpace::Definite(w) if w.is_finite() && w > 0.0 => w,
+                AvailableSpace::MinContent => ctx.min_intrinsic_width.max(1.0),
+                AvailableSpace::MaxContent => ctx.max_intrinsic_width.max(1.0),
                 _ => viewport_width.max(1.0),
             };
 

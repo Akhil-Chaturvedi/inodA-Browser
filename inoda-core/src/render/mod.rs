@@ -59,6 +59,11 @@ pub fn draw_layout_tree<R: RendererBackend>(
 
             match document.nodes.get(node_id) {
                 Some(crate::dom::Node::Element(data)) => {
+                    // Skip display:none elements and their entire subtree
+                    if data.computed.display == crate::dom::DisplayKeyword::None {
+                        continue;
+                    }
+
                     if let Some((r, g, b, a)) = data.computed.bg_color {
                         renderer.fill_rect(
                             abs_x,
@@ -109,7 +114,7 @@ pub fn draw_layout_tree<R: RendererBackend>(
                     }
                 }
                 Some(crate::dom::Node::Text(data)) => {
-                    let buffer = buffer_cache.get(&node_id).unwrap();
+                    let Some(buffer) = buffer_cache.get(&node_id) else { continue; };
                     let color = Color {
                         r: data.computed.color.0,
                         g: data.computed.color.1,

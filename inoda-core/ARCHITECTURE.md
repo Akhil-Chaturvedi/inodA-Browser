@@ -66,6 +66,7 @@ ElementData {
     prev_sibling: Option<NodeId>,
     next_sibling: Option<NodeId>,
     computed: ComputedStyle,           // stored inline for cache locality
+    taffy_node: Option<taffy::NodeId>, // cached Taffy node, cleaned up on node removal
     js_handles: usize,                // reference count for JS engine
     layout_dirty: bool,               // triggers text buffer re-shaping
     styles_dirty: bool,               // triggers subtree style invalidation in the cascade
@@ -76,7 +77,8 @@ TextData {
     parent:       Option<NodeId>,
     prev_sibling: Option<NodeId>,
     next_sibling: Option<NodeId>,
-    computed: ComputedStyle,           // stored inline
+    computed: TextComputedStyle,       // lightweight: only font_size and color
+    taffy_node: Option<taffy::NodeId>, // cached Taffy node, cleaned up on node removal
     js_handles: usize,
     layout_dirty: bool,
     styles_dirty: bool,

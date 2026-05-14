@@ -606,6 +606,16 @@ impl Document {
             }
 
             if let Some(node) = self.nodes.remove(current_id) {
+                // Clean up the corresponding Taffy node to prevent unbounded leak
+                let taffy_id = match &node {
+                    Node::Element(d) => d.taffy_node,
+                    Node::Text(d) => d.taffy_node,
+                    Node::Root(d) => d.taffy_node,
+                };
+                if let Some(tid) = taffy_id {
+                    let _ = self.taffy_tree.remove(tid);
+                }
+
                 if let Node::Element(data) = &node {
                     if let Some((_, id_val)) = data.attributes.iter().find(|(k, _)| &**k == "id") {
                         if self.id_map.get(id_val) == Some(&current_id) {
